@@ -966,6 +966,35 @@ fn a_sourced_by_caller_and_a_source_caller_that_agree_give_one_resolution() {
 }
 
 #[test]
+fn a_named_import_holds_unless_a_caller_defines_the_name() {
+    // `import::from()` attaches `onlya` in a named environment. With a
+    // caller the `sourced-by` directive hides, each caller's view keeps it,
+    // unless the caller defines `onlya` itself (the global environment comes
+    // before the search path).
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"source(\"kid.R\")\n");
+    write(&ws, "b.R", b"source(\"kid.R\")\n");
+    write(
+        &ws,
+        "kid.R",
+        b"# raven: sourced-by a.R\nimport::from(ravenpkga, onlya)\nonlya()\n",
+    );
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "onlya", 2), package("ravenpkga"));
+
+    write(&ws, "b.R", b"onlya <- function() 2\nsource(\"kid.R\")\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(
+        *resolution_of(&docs[0], "onlya", 2),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": package("ravenpkga")},
+            {"path": "b.R", "resolution": {"kind": "workspace", "path": "b.R", "range":
+                {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}},
+        ]})
+    );
+}
+
+#[test]
 fn package_data_says_which_sources_loaded() {
     let (tmp, ws) = package_workspace();
     write(&ws, "main.R", b"library(ravendbonly)\ndbfn()\n");

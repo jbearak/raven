@@ -644,6 +644,10 @@ impl<'w> FileResolver<'w> {
         // Whether the callers' views were read, or this file's own frames
         // bind the name, so that no caller can change it.
         let mut settled = true;
+        // A named search-path binding (`import::from()`) this file or a file
+        // it sources made: it comes after a caller's definitions, before the
+        // packages it attached earlier.
+        let mut own_import = None;
         let resolution = match found {
             Some((symbol, ScopeLayer::Function)) => Some(self.local_or_classify(&symbol, name)),
             Some((symbol, _)) if is_default_attached(&symbol) => {
@@ -656,12 +660,21 @@ impl<'w> FileResolver<'w> {
                 let packages = stream.package_snapshot();
                 let uri = self.names.uri.clone();
                 let loaded = self.search_order(&uri, &packages, line, column).loaded;
-                Some(self.decided_by_callers(name, merged, &loaded, line, column))
+                Some(self.decided_by_callers(name, merged, &loaded, None, line, column))
             }
-            Some((symbol, layer)) => {
-                settled = layer != ScopeLayer::SearchPath;
-                Some(self.classify(&symbol, name))
+            Some((symbol, ScopeLayer::SearchPath)) => {
+                settled = false;
+                let resolution = self.classify(&symbol, name);
+                if !self
+                    .callers
+                    .iter()
+                    .any(|(caller, ..)| *caller == symbol.source_uri)
+                {
+                    own_import = Some(resolution.clone());
+                }
+                Some(resolution)
             }
+            Some((symbol, _)) => Some(self.classify(&symbol, name)),
             None => {
                 settled = false;
                 None
@@ -696,7 +709,7 @@ impl<'w> FileResolver<'w> {
         let uri = self.names.uri.clone();
         let loaded = self.search_order(&uri, &packages, line, column).loaded;
         let merged = resolution.unwrap_or_else(|| Resolution::unresolved("not_found"));
-        match self.decided_by_callers(name, merged, &loaded, line, column) {
+        match self.decided_by_callers(name, merged, &loaded, own_import.as_ref(), line, column) {
             resolution @ Resolution::Package { .. } => Some(resolution),
             _ if query.value => None,
             resolution => Some(resolution),
@@ -792,7 +805,7 @@ impl<'w> FileResolver<'w> {
         Some(match attached {
             Attached::Here => (found, attached),
             Attached::Callers => (
-                self.decided_by_callers(name, found, &loaded, line, column),
+                self.decided_by_callers(name, found, &loaded, None, line, column),
                 attached,
             ),
         })
@@ -916,12 +929,14 @@ impl<'w> FileResolver<'w> {
     /// it, unless the file has callers, whose own views then decide. Callers
     /// that disagree give `ambiguous`; callers that agree on what an
     /// unresolved `merged` leaves unresolved keep its reason. `loaded` is the
-    /// file's own [`SearchOrder::loaded`].
+    /// file's own [`SearchOrder::loaded`], and `own_import` its own named
+    /// search-path binding of `name`, if any.
     fn decided_by_callers(
         &mut self,
         name: &str,
         merged: Resolution,
         loaded: &[String],
+        own_import: Option<&Resolution>,
         line: u32,
         column: u32,
     ) -> Resolution {
@@ -932,7 +947,7 @@ impl<'w> FileResolver<'w> {
         let mut candidates: Vec<Candidate> = (0..self.callers.len())
             .map(|index| Candidate {
                 path: self.display(&self.callers[index].0),
-                resolution: self.caller_view(index, late, name, loaded),
+                resolution: self.caller_view(index, late, name, loaded, own_import),
             })
             .collect();
         if candidates
@@ -951,7 +966,8 @@ impl<'w> FileResolver<'w> {
     }
 
     /// What `name` resolves to in this file as caller `index` alone would
-    /// leave it: the caller's definition, else the first package that exports
+    /// leave it: the caller's definition, else the file's own named
+    /// search-path binding (`own_import`), else the first package that exports
     /// the name among the file's own attachments the caller hadn't made
     /// (`loaded`, most recent first) and then the caller's attachments at its
     /// call site, else the default-attached packages and R's builtins.
@@ -961,6 +977,7 @@ impl<'w> FileResolver<'w> {
         late: bool,
         name: &str,
         loaded: &[String],
+        own_import: Option<&Resolution>,
     ) -> Resolution {
         let names = self.names;
         let (caller, line, column) = if late {
@@ -981,6 +998,10 @@ impl<'w> FileResolver<'w> {
         if let Some(symbol) = bound.as_ref().filter(|symbol| !is_default_attached(symbol)) {
             self.caller_scopes.insert((index, late), scope);
             return self.classify(symbol, name);
+        }
+        if let Some(own_import) = own_import {
+            self.caller_scopes.insert((index, late), scope);
+            return own_import.clone();
         }
         let mut order: Vec<String> = loaded
             .iter()
