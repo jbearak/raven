@@ -9,10 +9,34 @@ use serde_json::{Value, json};
 use super::document::{document_for_file, document_from_text};
 use super::*;
 
+const NO_PACKAGE_DATA: crate::cli::check::PackageData = crate::cli::check::PackageData {
+    enabled: false,
+    r_found: false,
+    names_db: false,
+    frozen: false,
+};
+
+fn file_doc(path: &Path, printed: &str) -> Value {
+    serde_json::to_value(document_for_file(
+        path,
+        printed.into(),
+        NO_PACKAGE_DATA,
+        &mut |_| Box::new(resolve::NoScope),
+    ))
+    .unwrap()
+}
+
 fn doc_of_bytes(bytes: &[u8]) -> Value {
     let detected = crate::state::detect_source_encoding(bytes);
     let text = crate::state::decode_source(bytes.to_vec()).unwrap();
-    serde_json::to_value(document_from_text("t.R".into(), detected, &text)).unwrap()
+    serde_json::to_value(document_from_text(
+        "t.R".into(),
+        detected,
+        &text,
+        NO_PACKAGE_DATA,
+        &resolve::NoScope,
+    ))
+    .unwrap()
 }
 
 fn doc(text: &str) -> Value {
@@ -887,7 +911,8 @@ fn pipes_placeholders_and_operators_as_written() {
     assert_eq!(
         shape(&nodes[0]),
         json!({"kind": "pipe", "op": "|>", "left": ident("x"),
-               "right": {"kind": "call", "function": ident("f"), "arguments": [
+               "right": {"kind": "call", "function": ident("f"),
+                         "resolution": {"kind": "unresolved"}, "arguments": [
                    {"name": ident("y"), "value": {"kind": "placeholder", "text": "_"}}]}})
     );
     assert_eq!(
@@ -907,6 +932,7 @@ fn pipes_placeholders_and_operators_as_written() {
     assert_eq!(
         shape(nested),
         json!({"kind": "call", "function": ident("g"),
+               "resolution": {"kind": "unresolved"},
                "arguments": [{"name": null, "value": ident(".")}]})
     );
     // `->` and `->>` keep their direction: the value is on the left.
@@ -1079,9 +1105,19 @@ fn any_expression_can_be_called() {
     assert_eq!(
         shape(&nodes[0]),
         json!({"kind": "call",
-               "function": {"kind": "call", "function": ident("f"), "arguments": []},
+               "function": {"kind": "call", "function": ident("f"),
+                            "resolution": {"kind": "unresolved"}, "arguments": []},
+               "resolution": {"kind": "dynamic"},
                "arguments": [{"name": null, "value": ident("x")}]})
     );
+    // Only a name or a namespace access in the function position resolves;
+    // `pkg::f` is `pkg`'s, as written, whatever the workspace holds.
+    assert_eq!(nodes[1]["resolution"], json!({"kind": "dynamic"}));
+    assert_eq!(
+        nodes[2]["resolution"],
+        json!({"kind": "package", "package": "pkg"})
+    );
+    assert_eq!(nodes[3]["resolution"], json!({"kind": "dynamic"}));
     let head = &nodes[1]["function"];
     assert_eq!(head["kind"], "parenthesized");
     assert_eq!(head["body"]["kind"], "function");
@@ -1139,11 +1175,7 @@ fn child_ranges_lie_inside_their_parents_in_every_fixture() {
 #[test]
 fn unreadable_and_undecodable_files_get_the_error_document() {
     let dir = tempfile::tempdir().unwrap();
-    let missing = serde_json::to_value(document_for_file(
-        &dir.path().join("gone.R"),
-        "gone.R".into(),
-    ))
-    .unwrap();
+    let missing = file_doc(&dir.path().join("gone.R"), "gone.R");
     assert_eq!(missing["path"], "gone.R");
     assert_eq!(missing["schema_version"], SCHEMA_VERSION);
     assert!(missing.get("statements").is_none());
@@ -1151,7 +1183,7 @@ fn unreadable_and_undecodable_files_get_the_error_document() {
 
     let latin1 = dir.path().join("latin1.R");
     std::fs::write(&latin1, b"x <- \"caf\xe9\"\n").unwrap();
-    let bad = serde_json::to_value(document_for_file(&latin1, "latin1.R".into())).unwrap();
+    let bad = file_doc(&latin1, "latin1.R");
     assert_eq!(
         bad["error"]["message"],
         "not valid UTF-8: first invalid byte 0xe9 at offset 9"

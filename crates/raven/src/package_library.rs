@@ -3277,6 +3277,10 @@ pub struct PackageLibraryOutcome {
     /// present-but-failed. `Absent` on the `Disabled` early-return and the
     /// Tier-1-only capture path, which never open the shipped DB.
     pub shipped_db_load: ShippedDbLoad,
+    /// Whether a non-empty Tier 2 `.raven/packages.json` loaded and is wired
+    /// as a provider. `false` on the `Disabled` early-return and the
+    /// Tier-1-only capture path, which never open it.
+    pub repo_db_loaded: bool,
 }
 
 impl PackageLibraryOutcome {
@@ -3383,6 +3387,7 @@ pub async fn build_package_library(
             status: PackageLibraryStatus::InitFailed(error.to_string()),
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         },
     }
 }
@@ -3391,6 +3396,7 @@ struct ProviderLoadArtifact {
     providers: Vec<Arc<dyn crate::package_db::PackageMetadataProvider>>,
     notes: Vec<String>,
     shipped_db_load: ShippedDbLoad,
+    repo_db_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3763,6 +3769,7 @@ pub(crate) async fn try_build_package_library(
             status: PackageLibraryStatus::Disabled,
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         });
     }
 
@@ -3805,6 +3812,7 @@ pub(crate) async fn try_build_package_library(
                 let mut providers: Vec<Arc<dyn crate::package_db::PackageMetadataProvider>> =
                     Vec::new();
                 let mut notes: Vec<String> = Vec::new();
+                let mut repo_db_loaded = false;
                 // Tier 2 first (repo DB), then Tier 3 (shipped DB).
                 //
                 // A valid-but-empty DB (zero packages) resolves nothing, so it is NOT
@@ -3817,8 +3825,11 @@ pub(crate) async fn try_build_package_library(
                         &path,
                         physical_deadline,
                     ) {
-                        Ok(Some(p)) if !p.is_empty() => providers.push(Arc::new(p)),
-                        Ok(_) => {}                          // Absent or empty -> silent
+                        Ok(Some(p)) if !p.is_empty() => {
+                            providers.push(Arc::new(p));
+                            repo_db_loaded = true;
+                        }
+                        Ok(_) => {} // Absent or empty -> silent
                         Err(crate::package_db::json_db::RepoDbError::DeadlineExpired) => {
                             return Err(Arc::new(ProviderLoadFailure(
                                 "package metadata provider load exceeded the original routing deadline"
@@ -3868,6 +3879,7 @@ pub(crate) async fn try_build_package_library(
                     providers,
                     notes,
                     shipped_db_load,
+                    repo_db_loaded,
                 });
                 #[cfg(test)]
                 pause_provider_load_for_test(&physical_key);
@@ -3888,6 +3900,7 @@ pub(crate) async fn try_build_package_library(
         status,
         load_notes: artifact.notes.clone(),
         shipped_db_load: artifact.shipped_db_load,
+        repo_db_loaded: artifact.repo_db_loaded,
     })
 }
 
@@ -3943,6 +3956,7 @@ pub async fn build_package_library_tier1_only(
         status,
         load_notes: Vec::new(),
         shipped_db_load: ShippedDbLoad::Absent,
+        repo_db_loaded: false,
     }
 }
 
@@ -4104,6 +4118,7 @@ pub(crate) mod tests {
             providers: Vec::new(),
             notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         })
     }
 
@@ -4319,6 +4334,7 @@ pub(crate) mod tests {
                         providers: Vec::new(),
                         notes: vec![version],
                         shipped_db_load: ShippedDbLoad::Absent,
+                        repo_db_loaded: false,
                     }))
                 })
             },
@@ -4350,6 +4366,7 @@ pub(crate) mod tests {
                         providers: Vec::new(),
                         notes: vec![version],
                         shipped_db_load: ShippedDbLoad::Absent,
+                        repo_db_loaded: false,
                     }))
                 })
             },
@@ -4879,6 +4896,7 @@ pub(crate) mod tests {
             status: PackageLibraryStatus::RNotFound,
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         };
 
         assert!(!outcome.consumer_ready());
@@ -4893,6 +4911,7 @@ pub(crate) mod tests {
             status: PackageLibraryStatus::RNotFound,
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         };
 
         assert!(outcome.consumer_ready());
@@ -4916,6 +4935,7 @@ pub(crate) mod tests {
             status: PackageLibraryStatus::RNotFound,
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         };
 
         assert!(outcome.consumer_ready());
@@ -4928,6 +4948,7 @@ pub(crate) mod tests {
             status: PackageLibraryStatus::Ready,
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
+            repo_db_loaded: false,
         };
 
         assert!(outcome.consumer_ready());

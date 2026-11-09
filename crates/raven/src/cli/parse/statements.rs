@@ -87,6 +87,9 @@ pub(super) struct Builder<'a> {
     /// The byte span of each `error`-severity entry in `errors`: the
     /// statements that hold them are `unparsed` (see `tree`).
     pub(super) error_spans: Vec<(usize, usize)>,
+    /// Each call's resolution, and each value name's that resolves to a
+    /// package object (see `resolve`).
+    pub(super) resolutions: super::resolve::Resolutions,
 }
 
 /// The parsed body of a document: top-level statements, file-level comments,
@@ -94,8 +97,12 @@ pub(super) struct Builder<'a> {
 pub(crate) type Body = (Vec<Statement>, Vec<Comment>, Vec<ParseError>);
 
 /// Parse `text` and build the document's top-level statements, file-level
-/// comments, and errors.
-pub(crate) fn build_document_body(text: &str, lines: &LineIndex<'_>) -> Body {
+/// comments, and errors, resolving names with `names`.
+pub(crate) fn build_document_body(
+    text: &str,
+    lines: &LineIndex<'_>,
+    names: &dyn super::resolve::NameResolver,
+) -> Body {
     // The grammar treats a lone `\r` as whitespace, so a comment before one
     // would run on through the next line. R ends a line there, so parse a copy
     // with each lone `\r` read as `\n`: same length, so every byte offset holds.
@@ -116,6 +123,8 @@ pub(crate) fn build_document_body(text: &str, lines: &LineIndex<'_>) -> Body {
         lines,
         directives: super::directives::directives_by_comment(&parse_text, lines, &comments),
         error_spans,
+        // The original text: the scope counts lines by `\n` alone.
+        resolutions: super::resolve::resolve_tree(root, text, names),
     };
     let (statements, file_comments) = builder.sequence(&sequence_children(root), comments, None);
     (statements, file_comments, errors)

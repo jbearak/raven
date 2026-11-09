@@ -412,7 +412,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 
 ## `raven parse`
 
-Print what Raven parsed in each R file as JSON: every statement with its exact source text, range, and syntax tree, and every comment. A downstream tool, such as one that translates R code into another language, can use it to read the code as R parses it and keep its comments and layout.
+Print what Raven parsed in each R file as JSON: every statement with its exact source text, range, and syntax tree, every comment, and what each call's function resolves to. A downstream tool, such as one that translates R code into another language, can use it to read the code as R parses it, keep its comments and layout, and know that `filter()` after `library(dplyr)` is dplyr's.
 
 ```text
 raven parse [FILES...] [--workspace DIR] [--config FILE | --no-config] [--format json]
@@ -423,10 +423,8 @@ raven parse [FILES...] [--workspace DIR] [--config FILE | --no-config] [--format
 <!-- example: parse-json -->
 ```console
 $ raven parse clean.R
-{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"directive":null}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}},"directive":null}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[],"errors":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"package_data":{"enabled":false,"r_found":false,"names_db":false,"frozen":false},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"directive":null}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}},"directive":null}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[],"errors":[]}
 ```
-
-The command is new, and its output is growing. The package each call resolves to is being added. It will arrive as new fields and values under the versioning rule below, so code written against this page keeps working.
 
 ### Parse options
 
@@ -448,7 +446,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 <!-- example: parse-unreadable -->
 ```console
 $ raven parse clean.R gone.R
-{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[],"errors":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"package_data":{"enabled":false,"r_found":false,"names_db":false,"frozen":false},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[],"errors":[]}
 {"schema_version":1,"raven_version":"0.23.7","path":"gone.R","error":{"message":"No such file or directory (os error 2)"}}
 ```
 
@@ -458,7 +456,7 @@ That run exits `3`.
 
 Every document has `schema_version` (currently `1`) and `raven_version`. Removing or renaming a field, changing a field's type, or changing what a field or a value means increments `schema_version`. Adding a field, a node kind, or a value to any enum-like field doesn't. The rule applies from the first release that includes `raven parse`.
 
-Every enum-like field is open: node `kind`, operator `op`, literal `type`, name `form`, comment `kind`, the encoding `name`, `line_endings`, a directive's `kind`, `prefix`, `reason`, `call_type`, `family`, and `scope`, an error's `source`, `code`, and `severity`, and the resolution kinds still to come. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
+Every enum-like field is open: node `kind`, operator `op`, literal `type`, name `form`, comment `kind`, the encoding `name`, `line_endings`, a directive's `kind`, `prefix`, `reason`, `call_type`, `family`, and `scope`, an error's `source`, `code`, and `severity`, and a resolution's `kind` and `reason`. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
 
 ### Parse positions
 
@@ -468,10 +466,11 @@ Every `range` has a `start` and an `end` position, and the end is exclusive. A p
 
 ### Parse documents
 
-A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `line_count`, `statements`, `comments`, and `errors`.
+A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `package_data`, `line_count`, `statements`, `comments`, and `errors`.
 
 - `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root.
 - `encoding`: `name` (`UTF-8`, `UTF-16LE`, or `UTF-16BE`), `bom` (whether a byte-order mark was present and stripped), and `line_endings` (`lf`, `crlf`, `cr`, `mixed`, or `none` for a file without one). Raven reads files as `raven check` does, as described in [File encoding](#file-encoding). A file that isn't valid in its encoding gets the error document, with a message naming the first invalid byte's offset. Raven never substitutes replacement characters.
+- `package_data`: which sources of package export names the run had. See [Package data](#package-data).
 - `line_count`: the number of lines. A final line ending doesn't start another line, so `a\nb\n` has 2 lines and an empty file has 0.
 - `statements`: the file's top-level statements. See [Statements and comments](#statements-and-comments).
 - `comments`: the comments no statement owns: every comment in a file without statements, and own-line comments after the last top-level statement.
@@ -508,7 +507,7 @@ Leaves have a `text`: the source as written, which slicing the file by the node'
 
 | `kind` | What it is | Fields |
 |---|---|---|
-| `identifier` | A name | `text`, `name`, `form` |
+| `identifier` | A name | `text`, `name`, `form`, and `resolution` for a name that resolves to a package object |
 | `placeholder` | The pipe placeholder `_` | `text` |
 | `number` | A number literal | `text`, `type`, `value` |
 | `string` | A string literal | `text`, `value`, `quote`, `raw`, `delimiters` |
@@ -520,7 +519,7 @@ The other nodes:
 
 | `kind` | What it is | Fields |
 |---|---|---|
-| `call` | `f(...)`, where the function is any expression | `function`, `arguments` |
+| `call` | `f(...)`, where the function is any expression | `function`, `resolution`, `arguments` |
 | `index` | `x[...]` or `x[[...]]` | `op` (`[` or `[[`), `target`, `arguments` |
 | `extract` | `x$name` or `x@name` | `op` (`$` or `@`), `left`, `right` (an `identifier`) |
 | `namespace` | `pkg::name` or `pkg:::name` | `op` (`::` or `:::`), `left`, `right` (both `identifier`) |
@@ -637,6 +636,108 @@ The fields:
 
 An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and `@lsp-` blocks pair with each other, and `# nolint start` and `# nolint end` with each other.
 
+### Name resolution
+
+Every `call` node has a `resolution`: what the call's function resolves to at the call. Calls nested anywhere have one too, inside other calls' arguments, inside formulas, and inside function bodies, so a missing `resolution` never stands for "not resolved". An `identifier` used as a value has a `resolution` only when it resolves to a package object, such as `T`, `F`, `pi`, `letters`, or `mean` in `lapply(x, mean)`. Other names, such as `x` in `filter(d, x > 1)`, have none, and that isn't an error.
+
+```json
+{"kind": "package", "package": "dplyr"}
+```
+
+`kind` is an open enum, so read a value you don't know as "other":
+
+| `kind` | What the name is | Fields |
+|---|---|---|
+| `package` | A package's object. For `pkg::f` and `pkg:::f`, the package as written | `package` |
+| `workspace` | A definition in a workspace file: this one, a file it sources, or a file that sources it | `path`, `range` |
+| `local` | A parameter or a variable of an enclosing function | `range` |
+| `declared` | A `# raven: func` or `# raven: var` declaration, or an `exists()` call Raven reads as one | `path`, `line` |
+| `unresolved` | Nothing Raven can see binds it | `reason`, and `packages` for `no_package_data` |
+| `dynamic` | The function isn't a name or a namespace access: `f()(x)`, `(\(x) x)(1)`, `x$f(1)` | None |
+| `ambiguous` | The file's callers disagree | `candidates` |
+
+- `path` is the defining file's [path](#parse-documents), and `range` is the defined name's range in it, as go-to-definition highlights it. A `local` binding's `range` is in this file.
+- `line` is the declaration's 0-based line.
+- `reason` is `not_found` (defined nowhere Raven can see), `defined_later` (defined only later at this file's top level), or `no_package_data`. That last one means a package attached here, listed in `packages`, is one Raven has no export names for, so it may define the name. See [Package data](#package-data).
+- Each of the `candidates` has a caller's `path` and the `resolution` the name has with that caller alone.
+
+For a package attached through another, as `dplyr` is through `library(tidyverse)`, `package` names the package that exports the name. Raven doesn't report where a re-exported object comes from.
+
+<!-- example: parse-resolution file=resolve.R -->
+```r
+helper <- function(x) x + 1
+helper(T)
+f()(1)
+```
+
+<!-- example: parse-resolution -->
+```console
+$ raven parse resolve.R
+{"schema_version":1,"raven_version":"0.23.7","path":"resolve.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"package_data":{"enabled":false,"r_found":false,"names_db":false,"frozen":false},"line_count":3,"statements":[{"text":"helper <- function(x) x + 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":27}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":27}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"text":"helper","name":"helper","form":"plain"},"value":{"kind":"function","range":{"start":{"line":0,"character":10},"end":{"line":0,"character":27}},"keyword":"function","parameters":[{"range":{"start":{"line":0,"character":19},"end":{"line":0,"character":20}},"name":{"kind":"identifier","range":{"start":{"line":0,"character":19},"end":{"line":0,"character":20}},"text":"x","name":"x","form":"plain"},"default":null}],"body":{"kind":"binary","range":{"start":{"line":0,"character":22},"end":{"line":0,"character":27}},"op":"+","left":{"kind":"identifier","range":{"start":{"line":0,"character":22},"end":{"line":0,"character":23}},"text":"x","name":"x","form":"plain"},"right":{"kind":"number","range":{"start":{"line":0,"character":26},"end":{"line":0,"character":27}},"text":"1","type":"double","value":1}}}}},{"text":"helper(T)","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"call","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}},"function":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"text":"helper","name":"helper","form":"plain"},"resolution":{"kind":"workspace","path":"resolve.R","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}}},"arguments":[{"range":{"start":{"line":1,"character":7},"end":{"line":1,"character":8}},"name":null,"value":{"kind":"identifier","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":8}},"text":"T","name":"T","form":"plain","resolution":{"kind":"package","package":"base"}}}]}},{"text":"f()(1)","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"call","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":6}},"function":{"kind":"call","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":3}},"function":{"kind":"identifier","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":1}},"text":"f","name":"f","form":"plain"},"resolution":{"kind":"unresolved","reason":"not_found"},"arguments":[]},"resolution":{"kind":"dynamic"},"arguments":[{"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":5}},"name":null,"value":{"kind":"number","range":{"start":{"line":2,"character":4},"end":{"line":2,"character":5}},"text":"1","type":"double","value":1}}]}}],"comments":[],"errors":[]}
+```
+
+`helper(T)` resolves to the definition on line 0 and its `T` to base. The outer call of `f()(1)` is `dynamic`, and the inner `f()` is a call of its own, defined nowhere.
+
+#### How a name resolves
+
+Raven resolves a name with the scope `raven check` uses for its undefined-variable findings, so the two agree on what is defined where. It looks in R's order, and the first match wins:
+
+1. An enclosing function's parameters and variables, as `local`.
+2. The global environment, as `workspace`: definitions in this file before the call, in the files it sources before it, and in its callers before their `source()` call.
+3. Attached packages, the most recently attached first, so a later `library()` masks an earlier one. Attaching a package again doesn't move it, as in R. Packages a caller attached before its `source()` call come after this file's own.
+4. The packages R attaches at startup: base, stats, graphics, grDevices, utils, datasets, and methods. So `filter()` is stats' until `library(dplyr)` and dplyr's after it.
+5. R's builtin functions and `T` and `F`, which Raven knows without any package data.
+
+Every loader `raven check` reads counts as an attach; see [Package awareness](cross-file.md#package-awareness). A namespace access such as `dplyr::filter()` is the package as written, whatever is attached.
+
+#### `library()` in a function or a branch
+
+Resolution follows `raven check`'s scope, which reads a `library()` call by where it stands:
+
+- **In a function body**, a package is attached from the call to the end of that function. It isn't attached after the function at the top level, even after a call to it.
+- **In a branch of a top-level `if`**, a package is attached after the branch, whether or not the branch runs.
+- **A function body sees its file's whole top level**, as R does when the function runs later: every top-level `library()` call and definition, later ones included. It also sees its callers' whole top level. This follows [global symbol hoisting](cross-file.md#global-symbol-hoisting), which is on by default.
+
+#### Callers that disagree
+
+A caller is a file that sources this one, through a `source()` call or a directive. When a caller's definition or attachment decides a name and the file has callers, Raven resolves the name as each caller alone would leave it, reading that caller at its `source()` call. If they agree, that is the resolution. Otherwise it is `ambiguous`, with one candidate per caller, sorted by path:
+
+```json
+{"kind": "ambiguous", "candidates": [
+  {"path": "a.R", "resolution": {"kind": "package", "package": "dplyr"}},
+  {"path": "b.R", "resolution": {"kind": "package", "package": "stats"}}]}
+```
+
+#### Resolution limits
+
+- **Only the exports Raven has data for.** A name that a package without data might export resolves as if the package didn't, so check `package_data` and the `no_package_data` reason.
+- **Data columns.** In a data-masking argument such as `filter(d, x > 1)`, a name may be a column of the data. A resolved name there, such as `T`, is what R finds when the data has no column of that name.
+- **Sourced files' packages.** A package attached by a file that a sourced file sources ranks as attached before this file's own packages.
+- **Lone `\r` line endings.** In a file whose lines end in a lone `\r`, a definition's `range` counts lines by `\n` alone.
+
+### Package data
+
+`package_data` says which sources of package export names the run had, so you can tell `unresolved` because no database knows a package from `unresolved` because nothing defines the name:
+
+```json
+{"enabled": true, "r_found": false, "names_db": false, "frozen": true}
+```
+
+- `enabled`: package awareness is on (`[packages].enabled`). When it's off, Raven reads no package data, and only R's builtins resolve to packages.
+- `r_found`: Raven found R and read the installed packages from its library.
+- `names_db`: the names database from `raven packages update` loaded.
+- `frozen`: a `.raven/packages.json` from `raven packages freeze` or `raven packages fetch` loaded.
+
+[Package database](package-database.md) explains each source. In CI without R, commit a frozen `.raven/packages.json` or run `raven packages update` before `raven parse`.
+
+### Joining with `raven graph`
+
+`raven graph --format json` stays the dependency graph, and `raven parse` repeats none of it. Run with the same workspace and configuration, the two join as follows, with every line 0-based in both:
+
+- **Files.** A document's `path` equals the graph's `files[].path`. Join an edge's `caller` or `target` to its document by path.
+- **Calls.** An edge whose `call_site.basis` is `call` came from a `source()` or `sys.source()` call, and its `call_site.position` is that `call` node's `range.start` in the `caller`'s document. A call in the graph's `dropped` list follows the same rule with its `position`.
+- **Directives.** An edge made by a directive has `directive.file` and `directive.line`. The directive's comment in that file's document has a `directive`, and its `range.start.line` equals `directive.line`.
+
 ### Parse errors
 
 `errors` lists what R's parser would reject or warn about, in source order. A file with errors still gets a full document and exit code `0`. Each entry has `source`, `code`, `severity`, `message`, and `range`. `source` is `parser` or `lexer`, and `severity` is `error`, `warning`, `information`, or `hint`.
@@ -670,7 +771,7 @@ y <- 1.0L
 <!-- example: parse-errors -->
 ```console
 $ raven parse broken.R
-{"schema_version":1,"raven_version":"0.23.7","path":"broken.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":3,"statements":[{"text":"x <- c(1 2)","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# raven: source helpers.R","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":25}},"blank_line_before":false,"directive":{"kind":"forward","prefix":"raven","keyword":"source","honored":true,"reason":null,"call_type":"source","path":"helpers.R","line":null}}],"trailing":[{"kind":"comment","text":"# raven: ignore","range":{"start":{"line":1,"character":12},"end":{"line":1,"character":27}},"directive":{"kind":"suppression","prefix":"raven","keyword":"ignore","honored":true,"reason":null,"family":"ignore","scope":"line","codes":[],"target":{"start":{"line":1,"character":0},"end":{"line":1,"character":27}}}}],"interior":[]},"expression":{"kind":"unparsed","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"text":"x <- c(1 2)"}},{"text":"y <- 1.0L","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":1}},"text":"y","name":"y","form":"plain"},"value":{"kind":"number","range":{"start":{"line":2,"character":5},"end":{"line":2,"character":9}},"text":"1.0L","type":"integer","value":1}}}],"comments":[],"errors":[{"source":"parser","code":"syntax-error","severity":"error","message":"R code could not be parsed here","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":8}}},{"source":"lexer","code":"integer-literal-unnecessary-decimal","severity":"warning","message":"integer literal 1.0L contains unnecessary decimal point","range":{"start":{"line":2,"character":5},"end":{"line":2,"character":9}}}]}
+{"schema_version":1,"raven_version":"0.23.7","path":"broken.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"package_data":{"enabled":false,"r_found":false,"names_db":false,"frozen":false},"line_count":3,"statements":[{"text":"x <- c(1 2)","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# raven: source helpers.R","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":25}},"blank_line_before":false,"directive":{"kind":"forward","prefix":"raven","keyword":"source","honored":true,"reason":null,"call_type":"source","path":"helpers.R","line":null}}],"trailing":[{"kind":"comment","text":"# raven: ignore","range":{"start":{"line":1,"character":12},"end":{"line":1,"character":27}},"directive":{"kind":"suppression","prefix":"raven","keyword":"ignore","honored":true,"reason":null,"family":"ignore","scope":"line","codes":[],"target":{"start":{"line":1,"character":0},"end":{"line":1,"character":27}}}}],"interior":[]},"expression":{"kind":"unparsed","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"text":"x <- c(1 2)"}},{"text":"y <- 1.0L","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":1}},"text":"y","name":"y","form":"plain"},"value":{"kind":"number","range":{"start":{"line":2,"character":5},"end":{"line":2,"character":9}},"text":"1.0L","type":"integer","value":1}}}],"comments":[],"errors":[{"source":"parser","code":"syntax-error","severity":"error","message":"R code could not be parsed here","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":8}}},{"source":"lexer","code":"integer-literal-unnecessary-decimal","severity":"warning","message":"integer literal 1.0L contains unnecessary decimal point","range":{"start":{"line":2,"character":5},"end":{"line":2,"character":9}}}]}
 ```
 
 ## `raven console`

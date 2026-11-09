@@ -109,6 +109,10 @@ fn json_number(value: f64) -> serde_json::Value {
     }
 }
 
+fn resolution_field(resolution: &super::resolve::Resolution) -> Field {
+    Field::Value(serde_json::to_value(resolution).expect("a resolution serializes"))
+}
+
 fn value(value: impl Into<serde_json::Value>) -> Field {
     Field::Value(value.into())
 }
@@ -312,7 +316,15 @@ impl Builder<'_> {
         let kind: &'static str;
         let mut fields: Vec<(&'static str, Field)> = Vec::new();
         match node.kind() {
-            "identifier" | "dots" | "dot_dot_i" => return self.identifier(node),
+            "identifier" | "dots" | "dot_dot_i" => {
+                let mut identifier = self.identifier(node);
+                if let Some(resolution) = self.resolutions.value(node) {
+                    identifier
+                        .fields
+                        .push(("resolution", resolution_field(resolution)));
+                }
+                return identifier;
+            }
             "integer" | "float" | "complex" => return self.number(node),
             "string" => return self.string(node),
             "true" | "false" | "null" | "inf" | "nan" | "na" => return self.constant(node),
@@ -336,6 +348,13 @@ impl Builder<'_> {
             "call" => {
                 kind = "call";
                 fields.push(("function", self.optional(field("function"), pool)));
+                let resolution = self.resolutions.call(node).cloned().unwrap_or(
+                    super::resolve::Resolution::Unresolved {
+                        reason: None,
+                        packages: Vec::new(),
+                    },
+                );
+                fields.push(("resolution", resolution_field(&resolution)));
                 fields.push(("arguments", self.arguments(field("arguments"), pool)));
             }
             "subset" | "subset2" => {

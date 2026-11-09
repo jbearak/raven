@@ -12,7 +12,9 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::errors::ParseError;
+use super::resolve::NameResolver;
 use super::statements::{Comment, Statement, build_document_body};
+use crate::cli::check::PackageData;
 
 /// JSON schema version. Removing or renaming a field, changing a field's
 /// type, or changing what a field or value means increments it; adding a
@@ -52,6 +54,8 @@ pub(crate) struct ParsedDocument {
     pub(crate) raven_version: &'static str,
     pub(crate) path: String,
     pub(crate) encoding: Encoding,
+    /// Which sources of package export names the run had.
+    pub(crate) package_data: PackageData,
     pub(crate) line_count: u32,
     pub(crate) statements: Vec<Statement>,
     /// Comments no statement or block owns: every comment in a file without
@@ -95,15 +99,24 @@ pub(crate) fn error_document(path: String, message: String) -> Document {
 
 /// Read, decode and parse the file at `fs_path`, printed as `path`. A file that
 /// can't be opened or isn't valid in its encoding gets the error document; no
-/// replacement decoding.
-pub(crate) fn document_for_file(fs_path: &Path, path: String) -> Document {
+/// replacement decoding. `names_for` gives the name resolver for the decoded
+/// text.
+pub(crate) fn document_for_file(
+    fs_path: &Path,
+    path: String,
+    package_data: PackageData,
+    names_for: &mut dyn FnMut(&str) -> Box<dyn NameResolver>,
+) -> Document {
     let bytes = match std::fs::read(fs_path) {
         Ok(bytes) => bytes,
         Err(e) => return error_document(path, e.to_string()),
     };
     let detected = crate::state::detect_source_encoding(&bytes);
     match crate::state::decode_source(bytes) {
-        Ok(text) => document_from_text(path, detected, &text),
+        Ok(text) => {
+            let names = names_for(&text);
+            document_from_text(path, detected, &text, package_data, names.as_ref())
+        }
         Err(e) => error_document(path, e.to_string()),
     }
 }
@@ -113,6 +126,8 @@ pub(crate) fn document_from_text(
     path: String,
     detected: crate::state::SourceEncoding,
     text: &str,
+    package_data: PackageData,
+    names: &dyn NameResolver,
 ) -> Document {
     use crate::state::SourceEncoding as E;
     let (name, bom) = match detected {
@@ -122,7 +137,7 @@ pub(crate) fn document_from_text(
         E::Utf16Be => ("UTF-16BE", true),
     };
     let lines = LineIndex::new(text);
-    let (statements, comments, errors) = build_document_body(text, &lines);
+    let (statements, comments, errors) = build_document_body(text, &lines, names);
     Document::Parsed(Box::new(ParsedDocument {
         schema_version: SCHEMA_VERSION,
         raven_version: env!("CARGO_PKG_VERSION"),
@@ -132,6 +147,7 @@ pub(crate) fn document_from_text(
             bom,
             line_endings: line_endings(text),
         },
+        package_data,
         line_count: lines.line_count(),
         statements,
         comments,

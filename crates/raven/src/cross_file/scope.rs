@@ -9906,6 +9906,24 @@ fn merge_tar_batch_into_frame(frame: &mut ScopeFrame, contribution: ChildSourceC
     }
 }
 
+/// Which layer of a [`ScopeStream`] bound a name (see
+/// [`ScopeStream::symbol_with_layer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeLayer {
+    /// An enclosing function's frame: its parameters, its local bindings, and
+    /// what it attaches or sources.
+    Function,
+    /// The file's top level: its own definitions, what it attaches or
+    /// sources, and the default-attached packages' exports.
+    Global,
+    /// What the file's callers lend it (the parent prefix).
+    Prefix,
+    /// Package-mode and test-preamble contributions.
+    Contributions,
+    /// A named search-path environment (`import::from()`-style attachments).
+    SearchPath,
+}
+
 /// Streaming scope state.
 ///
 /// Walks the queried URI's `artifacts.timeline` once in document
@@ -11247,6 +11265,18 @@ where
     /// Takes `&mut self` because in-function queries with hoisting build
     /// `global_late_frame` lazily on first need.
     pub fn snapshot(&mut self) -> ScopeAtPosition {
+        self.materialize(true)
+    }
+
+    /// [`Self::snapshot`]'s package view (`loaded_packages`,
+    /// `inherited_packages`, `attached_packages`, `package_origins`) without
+    /// copying the symbol maps, which dominate its cost. Its `symbols` hold
+    /// at most the package-mode contributions.
+    pub(crate) fn package_snapshot(&mut self) -> ScopeAtPosition {
+        self.materialize(false)
+    }
+
+    fn materialize(&mut self, with_symbols: bool) -> ScopeAtPosition {
         self.ensure_r6_methods();
         if self.query_inside_function() {
             self.ensure_global_late_frame();
@@ -11267,12 +11297,20 @@ where
             self.cursor.1,
         );
         let mut scope = ScopeAtPosition {
-            symbols: prefix.symbols.clone(),
+            symbols: if with_symbols {
+                prefix.symbols.clone()
+            } else {
+                HashMap::new()
+            },
             contributions_deferred: false,
             named_search_path: prefix.named_search_path.clone(),
             removed_names: HashSet::new(),
             chain,
-            parent_prefix_symbol_names: prefix.symbols.keys().cloned().collect(),
+            parent_prefix_symbol_names: if with_symbols {
+                prefix.symbols.keys().cloned().collect()
+            } else {
+                HashSet::new()
+            },
             visible_positions,
             depth_exceeded: prefix.depth_exceeded.clone(),
             inherited_packages: prefix.inherited_packages.clone(),
@@ -11302,8 +11340,10 @@ where
         //     overwrites parent contributions.
         // The net precedence is: local Defs > base exports > prefix symbols.
         let global = self.choose_global_frame();
-        for (name, symbol) in &global.symbols {
-            scope.symbols.insert(name.clone(), symbol.clone());
+        if with_symbols {
+            for (name, symbol) in &global.symbols {
+                scope.symbols.insert(name.clone(), symbol.clone());
+            }
         }
         for (name, alias) in &global.namespace_import_aliases {
             scope
@@ -11331,11 +11371,13 @@ where
 
         // Layer each function frame, outermost-to-innermost so innermost wins.
         for (_iv, frame) in &self.function_stack {
-            if let Some(parent) = &frame.r6_parent {
+            if with_symbols && let Some(parent) = &frame.r6_parent {
                 parent.apply(&mut scope.symbols);
             }
-            for (name, symbol) in &frame.symbols {
-                scope.symbols.insert(name.clone(), symbol.clone());
+            if with_symbols {
+                for (name, symbol) in &frame.symbols {
+                    scope.symbols.insert(name.clone(), symbol.clone());
+                }
             }
             for (name, alias) in &frame.namespace_import_aliases {
                 scope
@@ -11471,12 +11513,17 @@ where
     /// Walk order matches `is_visible` and `snapshot`: innermost function
     /// frame wins, then global frame, then prefix.
     pub fn symbol_for(&mut self, name: &str) -> Option<ScopedSymbol> {
+        self.symbol_with_layer(name).map(|(symbol, _)| symbol)
+    }
+
+    /// [`Self::symbol_for`], with the layer that bound the name.
+    pub(crate) fn symbol_with_layer(&mut self, name: &str) -> Option<(ScopedSymbol, ScopeLayer)> {
         self.ensure_r6_methods();
         if let Some(symbol) = self
             .captured_r6_base()
             .filter(|symbol| symbol.name.as_ref() == name)
         {
-            return Some(symbol.clone());
+            return Some((symbol.clone(), ScopeLayer::Function));
         }
         if self.query_inside_function() {
             self.ensure_global_late_frame();
@@ -11485,14 +11532,14 @@ where
         let instance_member = self.is_r6_member(name);
         for (_iv, frame) in self.function_stack.iter().rev() {
             if let Some(sym) = frame.symbols.get(name) {
-                return Some(sym.clone());
+                return Some((sym.clone(), ScopeLayer::Function));
             }
             if let Some(symbol) = frame
                 .r6_parent
                 .as_ref()
                 .and_then(|parent| parent.symbol_for(name))
             {
-                return Some(symbol);
+                return Some((symbol, ScopeLayer::Function));
             }
             if frame.removed_names.contains(name) && !instance_member {
                 removed = true;
@@ -11502,7 +11549,7 @@ where
         if !removed {
             let global = self.choose_global_frame();
             if let Some(sym) = global.symbols.get(name) {
-                return Some(sym.clone());
+                return Some((sym.clone(), ScopeLayer::Global));
             }
             if global.removed_names.contains(name) {
                 removed = true;
@@ -11511,24 +11558,28 @@ where
         if !removed {
             let prefix = self.choose_prefix();
             if let Some(sym) = prefix.symbols.get(name).cloned() {
-                return Some(sym);
+                return Some((sym, ScopeLayer::Prefix));
             }
         }
         if let Some(symbol) = self.contributions.symbol_for(
             name,
             ScopePhase::from_deferred(self.query_inside_function()),
         ) {
-            return Some(symbol);
+            return Some((symbol, ScopeLayer::Contributions));
         }
         for (_iv, frame) in self.function_stack.iter().rev() {
             if let Some(symbol) = frame.named_search_path.get(name) {
-                return Some(symbol.clone());
+                return Some((symbol.clone(), ScopeLayer::SearchPath));
             }
         }
         if let Some(symbol) = self.choose_global_frame().named_search_path.get(name) {
-            return Some(symbol.clone());
+            return Some((symbol.clone(), ScopeLayer::SearchPath));
         }
-        self.choose_prefix().named_search_path.get(name).cloned()
+        self.choose_prefix()
+            .named_search_path
+            .get(name)
+            .cloned()
+            .map(|symbol| (symbol, ScopeLayer::SearchPath))
     }
 
     /// Removing a method-local binding reveals its instance parent. Existing

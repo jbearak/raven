@@ -190,7 +190,7 @@ Exit codes:
 /// Single source of truth for both `run`'s report loop and the
 /// `collect_diagnostics_blocking` test helper, so production and test exercise
 /// identical disk-fallback behavior.
-fn open_disk_fallback_target(
+pub(crate) fn open_disk_fallback_target(
     state: &mut crate::state::WorldState,
     uri: &Url,
     path: &Path,
@@ -283,9 +283,9 @@ fn open_disk_fallback_target(
 }
 
 #[derive(Debug, Default)]
-struct CliContextualProviderPlan {
-    extras: std::collections::HashSet<Url>,
-    divergence: bool,
+pub(crate) struct CliContextualProviderPlan {
+    pub(crate) extras: std::collections::HashSet<Url>,
+    pub(crate) divergence: bool,
 }
 
 /// Materialize and select context-sensitive tar providers for one CLI target.
@@ -295,7 +295,7 @@ struct CliContextualProviderPlan {
 /// the pure traversal is repeated so their own finalized forward closure can
 /// be discovered. The returned extras supplement only snapshot content
 /// collection; no occurrence node or alternate graph edge is created.
-fn prepare_cli_contextual_providers(
+pub(crate) fn prepare_cli_contextual_providers(
     state: &mut crate::state::WorldState,
     uri: &Url,
 ) -> CliContextualProviderPlan {
@@ -487,6 +487,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
         db_load_notes,
         shipped_db_load,
         scan: _,
+        package_data: _,
     } = match prepare_workspace(WorkspaceSetup {
         command: "raven check",
         root: &root,
@@ -732,6 +733,26 @@ pub(crate) struct PreparedWorkspace {
     pub(crate) shipped_db_load: crate::package_library::ShippedDbLoad,
     /// What the workspace scan discovered beyond its index entries.
     pub(crate) scan: crate::state::WorkspaceScanReport,
+    /// Which package data the run has, for `raven parse`'s `package_data`.
+    pub(crate) package_data: PackageData,
+}
+
+/// Which sources of package export names a run has: the input a consumer
+/// needs to tell "unresolved because no database knows the package" from
+/// "defined nowhere".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PackageData {
+    /// Package awareness is on (`packages.enabled`, default true). When off,
+    /// Raven looks for no R and loads no database.
+    pub(crate) enabled: bool,
+    /// An R installation was found, so installed packages are read from its
+    /// library.
+    pub(crate) r_found: bool,
+    /// A non-empty names database (`names.db`, from `raven packages update`)
+    /// loaded.
+    pub(crate) names_db: bool,
+    /// A non-empty frozen `.raven/packages.json` loaded.
+    pub(crate) frozen: bool,
 }
 
 /// The setup `raven check` and `raven graph` share: load the project config,
@@ -750,7 +771,8 @@ pub(crate) async fn prepare_workspace(setup: WorkspaceSetup<'_>) -> Result<Prepa
     // one-line note. The returned verdict feeds `check`'s
     // missing-export-metadata warning; the load notes (present-but-unusable
     // package DB) ride its footer.
-    let (shipped_db_load, db_load_notes, degraded_note) = init_r(&mut state, setup.root).await;
+    let (shipped_db_load, db_load_notes, degraded_note, package_data) =
+        init_r(&mut state, setup.root).await;
     if let Some(note) = degraded_note {
         startup_notes.push(format!("{}: {note}", setup.command));
     }
@@ -766,6 +788,7 @@ pub(crate) async fn prepare_workspace(setup: WorkspaceSetup<'_>) -> Result<Prepa
         db_load_notes,
         shipped_db_load,
         scan,
+        package_data,
     })
 }
 
@@ -1033,7 +1056,7 @@ async fn maybe_init_r(
     state: &mut crate::state::WorldState,
     root: &Path,
 ) -> (crate::package_library::ShippedDbLoad, Vec<String>) {
-    let (shipped_db_load, load_notes, degraded_note) = init_r(state, root).await;
+    let (shipped_db_load, load_notes, degraded_note, _) = init_r(state, root).await;
     if let Some(note) = degraded_note {
         eprintln!("raven check: {note}");
     }
@@ -1041,7 +1064,7 @@ async fn maybe_init_r(
 }
 
 /// Initialize R and the package library, returning the degraded-environment
-/// note (unprefixed) instead of printing it.
+/// note (unprefixed) instead of printing it, and which package data loaded.
 async fn init_r(
     state: &mut crate::state::WorldState,
     root: &Path,
@@ -1049,6 +1072,7 @@ async fn init_r(
     crate::package_library::ShippedDbLoad,
     Vec<String>,
     Option<String>,
+    PackageData,
 ) {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
@@ -1085,6 +1109,12 @@ async fn init_r(
     state.package_library_ready = outcome.consumer_ready();
     let status = outcome.status;
     let shipped_db_load = outcome.shipped_db_load;
+    let package_data = PackageData {
+        enabled,
+        r_found: outcome.library.r_subprocess().is_some(),
+        names_db: shipped_db_load == crate::package_library::ShippedDbLoad::Loaded,
+        frozen: outcome.repo_db_loaded,
+    };
     state.package_library = outcome.library;
     // A freshly built `PackageLibrary` starts with a `None` local-dev overlay, so
     // replacing `state.package_library` here drops the overlay that
@@ -1103,7 +1133,7 @@ async fn init_r(
     // build classifies `Ready`). `has_providers()` is the coverage gate: offline
     // Tier 2/3 data resolves package symbols without R, so the note is suppressed.
     let degraded_note = degraded_env_note(&status, state.package_library.has_providers());
-    (shipped_db_load, load_notes, degraded_note)
+    (shipped_db_load, load_notes, degraded_note, package_data)
 }
 
 /// Shared tail of the degraded-environment startup notes: the consequence
@@ -1159,7 +1189,7 @@ fn degraded_env_note(
 /// Must run after [`init_r`] (needs the library's R subprocess) and
 /// before diagnostics. Fail-soft: no R, no `.rda`, or a load failure leaves
 /// the AST-scan result in place.
-async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
+pub(crate) async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
     if !crate::backend::sysdata_r_fallback_needed(state) {
         return;
     }
@@ -1212,7 +1242,10 @@ async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
 /// here, so calls relying on those stay conservatively suppressed — a narrower
 /// gap than before, noted in `docs/cli.md`. No-op when the library isn't ready
 /// (e.g. R absent with no configured library paths).
-async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &[PathBuf]) {
+pub(crate) async fn prefetch_reported_packages(
+    state: &crate::state::WorldState,
+    targets: &[PathBuf],
+) {
     if !state.package_library_ready {
         return;
     }

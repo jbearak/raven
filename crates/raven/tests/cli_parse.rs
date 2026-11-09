@@ -210,3 +210,658 @@ fn paths_equal_the_graph_files_paths() {
         .collect();
     assert_eq!(paths(&documents(&output)), in_root);
 }
+
+// ---------------------------------------------------------------------------
+// Name resolution
+// ---------------------------------------------------------------------------
+
+/// A workspace with no R and frozen package data: `.raven/packages.json`
+/// lists `packages` (name and exports), and `packages.rPath` points at no R.
+/// `ravenpkga` and `ravenpkgb` both export `clash`.
+fn package_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    write(
+        &ws,
+        "raven.toml",
+        b"[packages]\nenabled = true\nrPath = \"/nonexistent/raven-test/R\"\n",
+    );
+    let packages: &[(&str, &[&str])] = &[
+        (
+            "dplyr",
+            &["case_when", "filter", "lag", "mutate", "n", "summarise"],
+        ),
+        ("ravenpkga", &["clash", "onlya"]),
+        ("ravenpkgb", &["clash", "onlyb"]),
+    ];
+    let records: Vec<Value> = packages
+        .iter()
+        .map(|(name, exports)| {
+            serde_json::json!({"name": name, "version": "1.0.0", "exports": exports,
+                               "depends": [], "lazy_data": []})
+        })
+        .collect();
+    let db = serde_json::json!({
+        "schema_version": 1,
+        "provenance": {"raven_version": "0", "r_version": "0", "generated_unix": 0},
+        "packages": records,
+    });
+    write(&ws, ".raven/packages.json", db.to_string().as_bytes());
+    (tmp, ws)
+}
+
+/// `raven parse` with no names database: `RAVEN_NAMES_DB` empty and the
+/// user-data directory pointed into the temp dir, or at `names_db`.
+fn parse_isolated(ws: &Path, files: &[&str], names_db: Option<&Path>) -> Vec<Value> {
+    let user_data = ws.parent().unwrap().join("user-data");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_raven"));
+    command
+        .args(["parse", "--workspace", ws.to_str().unwrap()])
+        .args(files)
+        .env(
+            "RAVEN_NAMES_DB",
+            names_db.map_or("".as_ref(), Path::as_os_str),
+        )
+        .env("XDG_DATA_HOME", &user_data)
+        .env("LOCALAPPDATA", &user_data);
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    documents(&output)
+}
+
+/// Every `call` node in a document, depth first.
+fn calls(value: &Value) -> Vec<&Value> {
+    fn walk<'v>(value: &'v Value, out: &mut Vec<&'v Value>) {
+        match value {
+            Value::Object(map) => {
+                if map.get("kind").and_then(Value::as_str) == Some("call") {
+                    out.push(value);
+                }
+                map.values().for_each(|child| walk(child, out));
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out);
+    out
+}
+
+/// Every identifier node named `name` on 0-based `line`.
+fn identifiers<'d>(doc: &'d Value, name: &str, line: u64) -> Vec<&'d Value> {
+    fn walk<'v>(value: &'v Value, name: &str, line: u64, out: &mut Vec<&'v Value>) {
+        match value {
+            Value::Object(map) => {
+                if map.get("kind").and_then(Value::as_str) == Some("identifier")
+                    && map.get("name").and_then(Value::as_str) == Some(name)
+                    && value["range"]["start"]["line"] == line
+                {
+                    out.push(value);
+                }
+                map.values().for_each(|child| walk(child, name, line, out));
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, name, line, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, name, line, &mut out);
+    out
+}
+
+/// The resolution of the one call on 0-based `line` whose function is the
+/// plain name `function`.
+fn resolution_of<'d>(doc: &'d Value, function: &str, line: u64) -> &'d Value {
+    let found: Vec<&Value> = calls(doc)
+        .into_iter()
+        .filter(|call| {
+            call["function"]["name"] == function && call["range"]["start"]["line"] == line
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one `{function}()` call on line {line}");
+    &found[0]["resolution"]
+}
+
+fn package(name: &str) -> Value {
+    serde_json::json!({"kind": "package", "package": name})
+}
+
+fn by_path<'d>(docs: &'d [Value], path: &str) -> &'d Value {
+    docs.iter()
+        .find(|doc| doc["path"] == path)
+        .unwrap_or_else(|| panic!("no document for {path}"))
+}
+
+#[test]
+fn every_call_has_a_resolution_and_values_only_package_ones() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"library(dplyr)\nf <- function(x) g(h(x), k = function() m(1))\ny <- x ~ s(z)\n",
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let all = calls(&docs[0]);
+    assert_eq!(all.len(), 5);
+    for call in all {
+        assert!(call["resolution"]["kind"].is_string(), "{call}");
+    }
+    // `x`, `y`, `z` and `f` resolve to no package object: no resolution.
+    for (name, line) in [("x", 1), ("x", 2), ("z", 2), ("f", 1)] {
+        for identifier in identifiers(&docs[0], name, line) {
+            assert!(identifier.get("resolution").is_none(), "{identifier}");
+        }
+    }
+}
+
+#[test]
+fn filter_is_stats_until_dplyr_is_attached() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"filter(d, x > 1)\nlibrary(dplyr)\nfilter(d, x > 1)\nstats::filter(d)\ndplyr::filter(d)\n",
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    assert_eq!(*resolution_of(doc, "filter", 0), package("stats"));
+    assert_eq!(*resolution_of(doc, "library", 1), package("base"));
+    assert_eq!(*resolution_of(doc, "filter", 2), package("dplyr"));
+    // A namespace access is the package as written.
+    let qualified: Vec<&Value> = calls(doc)
+        .into_iter()
+        .filter(|call| call["function"]["kind"] == "namespace")
+        .map(|call| &call["resolution"])
+        .collect();
+    assert_eq!(qualified, [&package("stats"), &package("dplyr")]);
+}
+
+#[test]
+fn a_later_attach_masks_an_earlier_one() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "ab.R",
+        b"library(ravenpkga)\nlibrary(ravenpkgb)\nclash()\nonlya()\n",
+    );
+    write(
+        &ws,
+        "ba.R",
+        b"library(ravenpkgb)\nlibrary(ravenpkga)\nclash()\n",
+    );
+    // Attaching an attached package again doesn't move it.
+    write(
+        &ws,
+        "again.R",
+        b"library(ravenpkga)\nlibrary(ravenpkgb)\nlibrary(ravenpkga)\nclash()\n",
+    );
+    let docs = parse_isolated(&ws, &["ab.R", "ba.R", "again.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 2), package("ravenpkgb"));
+    assert_eq!(*resolution_of(&docs[0], "onlya", 3), package("ravenpkga"));
+    assert_eq!(*resolution_of(&docs[1], "clash", 2), package("ravenpkga"));
+    assert_eq!(*resolution_of(&docs[2], "clash", 3), package("ravenpkgb"));
+}
+
+#[test]
+fn a_sourced_file_attaches_in_its_own_order() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "main.R", b"source(\"setup.R\")\nclash()\n");
+    write(&ws, "setup.R", b"library(ravenpkga)\nlibrary(ravenpkgb)\n");
+    write(&ws, "rev.R", b"source(\"setup_rev.R\")\nclash()\n");
+    write(
+        &ws,
+        "setup_rev.R",
+        b"library(ravenpkgb)\nlibrary(ravenpkga)\n",
+    );
+    let docs = parse_isolated(&ws, &["main.R", "rev.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkgb"));
+    assert_eq!(*resolution_of(&docs[1], "clash", 1), package("ravenpkga"));
+}
+
+#[test]
+fn attaching_a_caller_attached_package_again_doesnt_move_it() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"library(ravenpkga)\nlibrary(ravenpkgb)\nsource(\"kid.R\")\n",
+    );
+    write(&ws, "kid.R", b"library(ravenpkga)\nclash()\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkgb"));
+}
+
+/// Each caller's view includes the file's own attachments: `kid.R`'s
+/// `library(ravenpkga)` doesn't move `one.R`'s, and masks `two.R`'s
+/// `ravenpkgb`, so both callers agree.
+#[test]
+fn each_caller_sees_the_files_own_attachments() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "one.R", b"library(ravenpkga)\nsource(\"kid.R\")\n");
+    write(&ws, "two.R", b"library(ravenpkgb)\nsource(\"kid.R\")\n");
+    write(&ws, "kid.R", b"library(ravenpkga)\nclash()\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkga"));
+}
+
+#[test]
+fn nested_calls_formulas_and_t_and_f_resolve() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "library(dplyr)\n",
+            "d |> summarise(m = mean(x, na.rm = T), k = n(), z = case_when(is.na(x) ~ 0))\n",
+            "y <- F\n",
+            "T <- FALSE\n",
+            "w <- T\n",
+        )
+        .as_bytes(),
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    assert_eq!(*resolution_of(doc, "summarise", 1), package("dplyr"));
+    assert_eq!(*resolution_of(doc, "mean", 1), package("base"));
+    assert_eq!(*resolution_of(doc, "n", 1), package("dplyr"));
+    assert_eq!(*resolution_of(doc, "case_when", 1), package("dplyr"));
+    // Inside a formula inside a data-masking argument.
+    assert_eq!(*resolution_of(doc, "is.na", 1), package("base"));
+    // `T` and `F` are base's, inside a data-masking argument too, until
+    // reassigned.
+    let t = identifiers(doc, "T", 1);
+    assert_eq!(t[0]["resolution"], package("base"));
+    assert_eq!(identifiers(doc, "F", 2)[0]["resolution"], package("base"));
+    assert!(identifiers(doc, "T", 4)[0].get("resolution").is_none());
+    // `x` inside the data-masking arguments has none.
+    for x in identifiers(doc, "x", 1) {
+        assert!(x.get("resolution").is_none());
+    }
+}
+
+#[test]
+fn workspace_local_and_dynamic_calls() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "helper <- function(a) a + 1\n",
+            "helper(2)\n",
+            "source(\"R/tools.R\")\n",
+            "tool(1)\n",
+            "apply_it <- function(fn, v) { inner <- function() 1; inner(); fn(v) }\n",
+            "f()(x)\n",
+            "(\\(x) x)(1)\n",
+            "x$f(1)\n",
+        )
+        .as_bytes(),
+    );
+    write(&ws, "R/tools.R", b"# Tools.\ntool <- function(v) v\n");
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    let range = |line: u64, start: u64, end: u64| {
+        serde_json::json!({"start": {"line": line, "character": start},
+                           "end": {"line": line, "character": end}})
+    };
+    assert_eq!(
+        *resolution_of(doc, "helper", 1),
+        serde_json::json!({"kind": "workspace", "path": "main.R", "range": range(0, 0, 6)})
+    );
+    assert_eq!(
+        *resolution_of(doc, "tool", 3),
+        serde_json::json!({"kind": "workspace", "path": "R/tools.R", "range": range(1, 0, 4)})
+    );
+    assert_eq!(
+        *resolution_of(doc, "inner", 4),
+        serde_json::json!({"kind": "local", "range": range(4, 30, 35)})
+    );
+    assert_eq!(
+        *resolution_of(doc, "fn", 4),
+        serde_json::json!({"kind": "local", "range": range(4, 21, 23)})
+    );
+    let dynamic = serde_json::json!({"kind": "dynamic"});
+    let outer: Vec<&Value> = calls(doc)
+        .into_iter()
+        .filter(|call| call["function"]["kind"] != "identifier")
+        .map(|call| &call["resolution"])
+        .collect();
+    assert_eq!(outer, [&dynamic, &dynamic, &dynamic]);
+    // `f()` inside `f()(x)` is a call of its own, resolved by name.
+    assert_eq!(
+        *resolution_of(doc, "f", 5),
+        serde_json::json!({"kind": "unresolved", "reason": "not_found"})
+    );
+}
+
+#[test]
+fn unresolved_says_why() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"nowhere()\nlater()\nlater <- function() 1\nlibrary(ravennodata)\nnodata()\nmutate(d)\n",
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    let unresolved = |reason: &str| serde_json::json!({"kind": "unresolved", "reason": reason});
+    assert_eq!(*resolution_of(doc, "nowhere", 0), unresolved("not_found"));
+    assert_eq!(*resolution_of(doc, "later", 1), unresolved("defined_later"));
+    let no_data = serde_json::json!({"kind": "unresolved", "reason": "no_package_data",
+                                     "packages": ["ravennodata"]});
+    assert_eq!(*resolution_of(doc, "nodata", 4), no_data);
+    // A package Raven has data for doesn't count: `mutate` would be dplyr's.
+    assert_eq!(*resolution_of(doc, "mutate", 5), no_data);
+}
+
+/// The `library()` rules `docs/cli.md` states, as `raven check`'s scope
+/// applies them.
+#[test]
+fn library_in_a_function_or_a_branch() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "f <- function() {\n",         // 0
+            "  onlya()\n",                 // 1
+            "  library(ravenpkga)\n",      // 2
+            "  onlya()\n",                 // 3
+            "}\n",                         // 4
+            "onlya()\n",                   // 5
+            "if (cond) {\n",               // 6
+            "  library(ravenpkgb)\n",      // 7
+            "}\n",                         // 8
+            "onlyb()\n",                   // 9
+            "g <- function() mutate(d)\n", // 10
+            "mutate(d)\n",                 // 11
+            "library(dplyr)\n",            // 12
+        )
+        .as_bytes(),
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    let not_found = serde_json::json!({"kind": "unresolved", "reason": "not_found"});
+    // Inside a function: from the call to the end of that body only.
+    assert_eq!(*resolution_of(doc, "onlya", 1), not_found);
+    assert_eq!(*resolution_of(doc, "onlya", 3), package("ravenpkga"));
+    assert_eq!(*resolution_of(doc, "onlya", 5), not_found);
+    // In a branch: attached after it, whether or not the branch runs.
+    assert_eq!(*resolution_of(doc, "onlyb", 9), package("ravenpkgb"));
+    // A function body sees every top-level attach in the file, later ones
+    // included; top-level code only the earlier ones.
+    assert_eq!(*resolution_of(doc, "mutate", 10), package("dplyr"));
+    assert_eq!(*resolution_of(doc, "mutate", 11), not_found);
+}
+
+#[test]
+fn a_caller_attachment_counts_before_its_source_call() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"library(dplyr)\nsource(\"kid.R\")\nlibrary(ravenpkga)\n",
+    );
+    write(
+        &ws,
+        "kid.R",
+        b"filter(d)\nmutate(d)\nonlya()\nk <- function() onlya()\n",
+    );
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    let doc = &docs[0];
+    // The caller's attachment outranks the default-attached packages.
+    assert_eq!(*resolution_of(doc, "filter", 0), package("dplyr"));
+    assert_eq!(*resolution_of(doc, "mutate", 1), package("dplyr"));
+    // Attached after the `source()` call: not yet, at top level...
+    assert_eq!(
+        *resolution_of(doc, "onlya", 2),
+        serde_json::json!({"kind": "unresolved", "reason": "not_found"})
+    );
+    // ...but a function body sees the caller's whole top level.
+    assert_eq!(*resolution_of(doc, "onlya", 3), package("ravenpkga"));
+}
+
+#[test]
+fn disagreeing_callers_are_ambiguous() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "a.R",
+        b"library(dplyr)\nhelper <- function() 1\nsource(\"kid.R\")\n",
+    );
+    write(&ws, "b.R", b"source(\"kid.R\")\n");
+    write(&ws, "kid.R", b"mutate(d)\nfilter(d)\nhelper()\nmean(1)\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    let doc = &docs[0];
+    let ambiguous = |first: Value, second: Value| {
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": first},
+            {"path": "b.R", "resolution": second},
+        ]})
+    };
+    let not_found = serde_json::json!({"kind": "unresolved", "reason": "not_found"});
+    assert_eq!(
+        *resolution_of(doc, "mutate", 0),
+        ambiguous(package("dplyr"), not_found.clone())
+    );
+    assert_eq!(
+        *resolution_of(doc, "filter", 1),
+        ambiguous(package("dplyr"), package("stats"))
+    );
+    let helper = serde_json::json!({"kind": "workspace", "path": "a.R", "range":
+        {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}}});
+    assert_eq!(
+        *resolution_of(doc, "helper", 2),
+        ambiguous(helper, not_found)
+    );
+    // Callers that agree give one resolution.
+    assert_eq!(*resolution_of(doc, "mean", 3), package("base"));
+}
+
+#[test]
+fn ambiguous_candidates_sort_by_printed_path() {
+    // `ü.R`'s URI percent-encodes the `ü` (`%C3%BC.R`), which sorts before
+    // `b.R`; its printed path sorts after it in byte order. Candidates follow
+    // the printed path, as docs/cli.md says.
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "ü.R", b"library(dplyr)\nsource(\"kid.R\")\n");
+    write(&ws, "b.R", b"source(\"kid.R\")\n");
+    write(&ws, "kid.R", b"mutate(d)\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    let not_found = serde_json::json!({"kind": "unresolved", "reason": "not_found"});
+    assert_eq!(
+        *resolution_of(&docs[0], "mutate", 0),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "b.R", "resolution": not_found},
+            {"path": "ü.R", "resolution": package("dplyr")},
+        ]})
+    );
+}
+
+#[test]
+fn package_data_says_which_sources_loaded() {
+    let (tmp, ws) = package_workspace();
+    write(&ws, "main.R", b"library(ravendbonly)\ndbfn()\n");
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    assert_eq!(
+        docs[0]["package_data"],
+        serde_json::json!({"enabled": true, "r_found": false, "names_db": false,
+                           "frozen": true})
+    );
+    // Without the names database, its package is one Raven has no data for.
+    assert_eq!(
+        *resolution_of(&docs[0], "dbfn", 1),
+        serde_json::json!({"kind": "unresolved", "reason": "no_package_data",
+                           "packages": ["ravendbonly"]})
+    );
+
+    let names_db = tmp.path().join("names.db");
+    raven::package_db::binary_db::write_shipped_db(
+        &names_db,
+        &[raven::package_db::model::PackageRecord {
+            name: "ravendbonly".into(),
+            version: "1.0.0".into(),
+            exports: vec!["dbfn".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }],
+        raven::package_db::binary_db::ShippedDbProvenance {
+            source: "test".into(),
+            snapshot_date: "2026-11-08".into(),
+            package_count: 1,
+            raven_version: "0".into(),
+        },
+    )
+    .unwrap();
+    let docs = parse_isolated(&ws, &["main.R"], Some(&names_db));
+    assert_eq!(docs[0]["package_data"]["names_db"], true);
+    assert_eq!(*resolution_of(&docs[0], "dbfn", 1), package("ravendbonly"));
+
+    // Package awareness off: no source of package data at all.
+    let (_tmp, ws) = workspace();
+    write(&ws, "main.R", b"library(dplyr)\nmutate(d)\nfilter(d)\n");
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    assert_eq!(
+        docs[0]["package_data"],
+        serde_json::json!({"enabled": false, "r_found": false, "names_db": false,
+                           "frozen": false})
+    );
+    assert_eq!(
+        *resolution_of(&docs[0], "mutate", 1),
+        serde_json::json!({"kind": "unresolved", "reason": "no_package_data",
+                           "packages": ["dplyr"]})
+    );
+    // R's builtins are known without package data.
+    assert_eq!(*resolution_of(&docs[0], "filter", 2), package("stats"));
+}
+
+// ---------------------------------------------------------------------------
+// Joining a parsed document to `raven graph`
+// ---------------------------------------------------------------------------
+
+fn graph_of(ws: &Path) -> Value {
+    let graph = raven(&[
+        "graph",
+        "--workspace",
+        ws.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(graph.status.code(), Some(0), "{graph:?}");
+    serde_json::from_slice(&graph.stdout).unwrap()
+}
+
+/// Each `source()` call that made an edge starts at its edge's
+/// `call_site.position`; a dropped one at its `dropped` `position`; each
+/// directive comment starts on its edge's `directive.line`.
+#[test]
+fn source_calls_and_directives_join_the_graph() {
+    let (_tmp, ws) = workspace();
+    write(
+        &ws,
+        "raven.toml",
+        b"[packages]\nenabled = false\n[workspace]\nexclude = [\"vendor/**\"]\n",
+    );
+    write(
+        &ws,
+        "main.R",
+        b"x <- 1\n  source(\"R/a.R\")\ny <- sys.source(\"R/d.R\", envir = globalenv())\nsource(\"vendor/v.R\")\n",
+    );
+    write(
+        &ws,
+        "R/a.R",
+        b"# raven: sourced-by ../main.R\nlocal({\n  source(\"R/b.R\")\n})\n# raven: source R/c.R\n",
+    );
+    write(&ws, "R/b.R", b"b <- 1\n");
+    write(&ws, "R/c.R", b"c1 <- 1\n");
+    write(&ws, "R/d.R", b"d <- 1\n");
+    write(&ws, "vendor/v.R", b"v <- 1\n");
+
+    let graph = graph_of(&ws);
+    let docs = documents(&parse_in(&ws, &["main.R", "R/a.R"]));
+    let source_calls = |path: &str| -> Vec<Value> {
+        calls(by_path(&docs, path))
+            .into_iter()
+            .filter(|call| {
+                matches!(
+                    call["function"]["name"].as_str(),
+                    Some("source" | "sys.source")
+                )
+            })
+            .map(|call| call["range"]["start"].clone())
+            .collect()
+    };
+
+    let mut joined = Vec::new();
+    for edge in graph["edges"].as_array().unwrap() {
+        if edge["call_site"]["basis"] == "call" {
+            let caller = edge["caller"].as_str().unwrap();
+            let position = &edge["call_site"]["position"];
+            assert!(
+                source_calls(caller).contains(position),
+                "no source() call in {caller} starts at {position}"
+            );
+            joined.push((caller.to_string(), position.clone()));
+        }
+        if !edge["directive"].is_null() {
+            let file = edge["directive"]["file"].as_str().unwrap();
+            let line = &edge["directive"]["line"];
+            let doc = by_path(&docs, file);
+            let directives: Vec<&Value> = comments_of(doc)
+                .into_iter()
+                .filter(|comment| !comment["directive"].is_null())
+                .filter(|comment| comment["range"]["start"]["line"] == *line)
+                .collect();
+            assert_eq!(directives.len(), 1, "no directive on {file} line {line}");
+        }
+    }
+    let dropped = graph["dropped"].as_array().unwrap();
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["reason"], "excluded");
+    let caller = dropped[0]["caller"].as_str().unwrap();
+    assert!(source_calls(caller).contains(&dropped[0]["position"]));
+    joined.push((caller.to_string(), dropped[0]["position"].clone()));
+
+    // Every source() call in the two files is accounted for, the indented
+    // one and the nested one inside `local({ ... })` included.
+    let mut all: Vec<(String, Value)> = ["main.R", "R/a.R"]
+        .into_iter()
+        .flat_map(|path| {
+            source_calls(path)
+                .into_iter()
+                .map(move |start| (path.to_string(), start))
+        })
+        .collect();
+    let key = |entry: &(String, Value)| entry.0.clone() + &entry.1.to_string();
+    all.sort_by_key(key);
+    joined.sort_by_key(key);
+    assert_eq!(all, joined);
+    assert_eq!(all.len(), 4);
+    let directive_edges = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| !edge["directive"].is_null())
+        .count();
+    assert_eq!(directive_edges, 2);
+}
+
+/// Every comment in a parsed document, in any list.
+fn comments_of(doc: &Value) -> Vec<&Value> {
+    fn walk<'v>(value: &'v Value, out: &mut Vec<&'v Value>) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("directive") && map.contains_key("text") {
+                    out.push(value);
+                }
+                map.values().for_each(|child| walk(child, out));
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, &mut out);
+    out
+}
