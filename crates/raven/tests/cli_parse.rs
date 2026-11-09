@@ -217,7 +217,8 @@ fn paths_equal_the_graph_files_paths() {
 
 /// A workspace with no R and frozen package data: `.raven/packages.json`
 /// lists `packages` (name and exports), and `packages.rPath` points at no R.
-/// `ravenpkga` and `ravenpkgb` both export `clash`.
+/// `ravenpkga` and `ravenpkgb` both export `clash`; `magrittr` exports
+/// `%>%` and `data.table` exports `:=`.
 fn package_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
@@ -233,6 +234,8 @@ fn package_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
         ),
         ("ravenpkga", &["clash", "onlya"]),
         ("ravenpkgb", &["clash", "onlyb"]),
+        ("magrittr", &["%>%"]),
+        ("data.table", &[":=", "data.table"]),
     ];
     let records: Vec<Value> = packages
         .iter()
@@ -1049,6 +1052,113 @@ fn package_data_says_which_sources_loaded() {
     );
     // R's builtins are known without package data.
     assert_eq!(*resolution_of(&docs[0], "filter", 2), package("stats"));
+}
+
+/// Every expression node on 0-based `line` whose `op` is `op`.
+fn operators<'d>(doc: &'d Value, op: &str, line: u64) -> Vec<&'d Value> {
+    fn walk<'v>(value: &'v Value, op: &str, line: u64, out: &mut Vec<&'v Value>) {
+        match value {
+            Value::Object(map) => {
+                if map.get("op").and_then(Value::as_str) == Some(op)
+                    && value["range"]["start"]["line"] == line
+                {
+                    out.push(value);
+                }
+                map.values().for_each(|child| walk(child, op, line, out));
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, op, line, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, op, line, &mut out);
+    out
+}
+
+/// The resolution of the one `op` operator node on 0-based `line`.
+fn operator_resolution<'d>(doc: &'d Value, op: &str, line: u64) -> &'d Value {
+    let found = operators(doc, op, line);
+    assert_eq!(found.len(), 1, "one `{op}` on line {line}");
+    &found[0]["resolution"]
+}
+
+/// `%op%` operators and `:=` name functions R looks up like a call's: they
+/// resolve by the same rules. Fixed operators (`+`, `<-`, `|>`, `~`) don't.
+#[test]
+fn user_definable_operators_resolve_like_calls() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "a %+% b\n",                                                // 0
+            "`%+%` <- function(a, b) paste(a, b)\n",                    // 1
+            "a %+% b\n",                                                // 2
+            "x %in% y\n",                                               // 3
+            "x %foo% y\n",                                              // 4
+            "dt[, z := 1]\n",                                           // 5
+            "x %>% f\n",                                                // 6
+            "library(magrittr)\n",                                      // 7
+            "x %>% f\n",                                                // 8
+            "library(data.table)\n",                                    // 9
+            "dt[, z := 1]\n",                                           // 10
+            "x <- 1 + 2 |> f() ~ g\n",                                  // 11
+            "g <- function() { `%-%` <- function(a, b) 1; a %-% b }\n", // 12
+        )
+        .as_bytes(),
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    let unresolved = |reason: &str| serde_json::json!({"kind": "unresolved", "reason": reason});
+    let range = |line: u64, start: u64, end: u64| {
+        serde_json::json!({"start": {"line": line, "character": start},
+                           "end": {"line": line, "character": end}})
+    };
+    assert_eq!(
+        *operator_resolution(doc, "%+%", 0),
+        unresolved("defined_later")
+    );
+    assert_eq!(
+        *operator_resolution(doc, "%+%", 2),
+        serde_json::json!({"kind": "workspace", "path": "main.R", "range": range(1, 0, 5)})
+    );
+    assert_eq!(*operator_resolution(doc, "%in%", 3), package("base"));
+    assert_eq!(
+        *operator_resolution(doc, "%foo%", 4),
+        unresolved("not_found")
+    );
+    // `:=` is an `assignment` node; base R doesn't define it.
+    assert_eq!(operators(doc, ":=", 5)[0]["kind"], "assignment");
+    assert_eq!(*operator_resolution(doc, ":=", 5), unresolved("not_found"));
+    assert_eq!(*operator_resolution(doc, "%>%", 6), unresolved("not_found"));
+    assert_eq!(*operator_resolution(doc, "%>%", 8), package("magrittr"));
+    assert_eq!(*operator_resolution(doc, ":=", 10), package("data.table"));
+    // A function's own definition of an operator is a local binding.
+    assert_eq!(
+        *operator_resolution(doc, "%-%", 12),
+        serde_json::json!({"kind": "local", "range": range(12, 18, 23)})
+    );
+    for op in ["<-", "+", "|>", "~"] {
+        for node in operators(doc, op, 11) {
+            assert!(node.get("resolution").is_none(), "{node}");
+        }
+    }
+}
+
+#[test]
+fn an_operator_callers_disagree_on_is_ambiguous() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"library(magrittr)\nsource(\"kid.R\")\n");
+    write(&ws, "b.R", b"source(\"kid.R\")\n");
+    write(&ws, "kid.R", b"x %>% f\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(
+        *operator_resolution(&docs[0], "%>%", 0),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": package("magrittr")},
+            {"path": "b.R", "resolution": {"kind": "unresolved", "reason": "not_found"}},
+        ]})
+    );
 }
 
 // ---------------------------------------------------------------------------

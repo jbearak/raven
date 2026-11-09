@@ -380,6 +380,10 @@ impl Builder<'_> {
                 let operator = field("operator").map_or("", |op| op.kind());
                 let (lhs, rhs) = (field("lhs"), field("rhs"));
                 fields.push(("op", op()));
+                // `%op%` and `:=`: the function the operator calls.
+                if let Some(resolution) = self.resolutions.operator(node) {
+                    fields.push(("resolution", resolution_field(resolution)));
+                }
                 match operator {
                     "<-" | "<<-" | "=" | ":=" => {
                         kind = "assignment";

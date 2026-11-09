@@ -977,15 +977,20 @@ fn every_operator_is_reported_as_written() {
     ];
     let text: Vec<String> = binary.iter().map(|op| format!("a {op} b")).collect();
     for (node, op) in expressions(&text.join("; ")).iter().zip(binary) {
-        assert_eq!(
-            shape(node),
-            json!({"kind": "binary", "op": op, "left": ident("a"), "right": ident("b")})
-        );
+        let mut expected =
+            json!({"kind": "binary", "op": op, "left": ident("a"), "right": ident("b")});
+        // A `%...%` operator names a function, so it has a resolution
+        // (`NoScope`'s here); the fixed operators don't.
+        if op.starts_with('%') {
+            expected["resolution"] = json!({"kind": "unresolved"});
+        }
+        assert_eq!(shape(node), expected);
     }
     let nodes = expressions("x <- 1; x <<- 1; x = 1; x := 1; ~ y; y ~ x; ?a; +a; -a; !a");
     for (node, op) in nodes[..4].iter().zip(["<-", "<<-", "=", ":="]) {
         assert_eq!(node["kind"], "assignment");
         assert_eq!(node["op"], op);
+        assert_eq!(node.get("resolution").is_some(), op == ":=");
         assert_eq!(shape(&node["target"]), ident("x"));
     }
     assert_eq!(
@@ -1042,6 +1047,7 @@ fn arguments_keep_order_and_empty_arguments() {
     assert_eq!(
         shape(&nodes[1]["arguments"]),
         json!([empty, {"name": null, "value": {"kind": "assignment", "op": ":=",
+                                               "resolution": {"kind": "unresolved"},
                                                "target": ident("y"), "value": ident("e")}}])
     );
     assert_eq!(
