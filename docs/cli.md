@@ -713,7 +713,6 @@ A caller is a file that sources this one, through a `source()` call or a directi
 - **Only the exports Raven has data for.** A name that a package without data might export resolves as if the package didn't, so check `package_data` and the `no_package_data` reason.
 - **Data columns.** In a data-masking argument such as `filter(d, x > 1)`, a name may be a column of the data. A resolved name there, such as `T`, is what R finds when the data has no column of that name.
 - **Sourced files' packages.** A package attached by a file that a sourced file sources ranks as attached before this file's own packages.
-- **Lone `\r` line endings.** In a file whose lines end in a lone `\r`, a definition's `range` counts lines by `\n` alone.
 
 ### Package data
 

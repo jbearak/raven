@@ -535,6 +535,111 @@ fn workspace_local_and_dynamic_calls() {
     );
 }
 
+/// The `target` range of top-level statement `index`'s assignment.
+fn target_range(doc: &Value, index: usize) -> &Value {
+    &doc["statements"][index]["expression"]["target"]["range"]
+}
+
+/// A definition's `range` counts lines as the rest of the document does,
+/// in the file that holds the definition, whatever its line endings.
+#[test]
+fn definition_ranges_count_lone_cr_line_endings() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"x <- 1\rhelper <- function(x) x\rhelper(1)\r",
+    );
+    write(
+        &ws,
+        "local.R",
+        b"f <- function(a) {\r  inner <- function() 1\r  inner()\r}\r",
+    );
+    // A lone-CR file sourcing an LF file, and an LF file sourcing a lone-CR one.
+    write(
+        &ws,
+        "cr_sources_lf.R",
+        b"x <- 1\rsource(\"lf.R\")\rlf_tool(1)\r",
+    );
+    write(&ws, "lf.R", b"\n\nlf_tool <- function() 1\n");
+    write(&ws, "lf_sources_cr.R", b"source(\"cr.R\")\ncr_tool(1)\n");
+    write(&ws, "cr.R", b"x <- 1\r\r cr_tool <- function() 1\r");
+    // A caller with lone-CR line endings lends a definition.
+    write(
+        &ws,
+        "caller.R",
+        b"a <- 1\rcaller_fn <- function() 1\rsource(\"child.R\")\r",
+    );
+    write(&ws, "child.R", b"caller_fn(1)\n");
+    // A CRLF file keeps its ranges.
+    write(
+        &ws,
+        "crlf.R",
+        b"x <- 1\r\nhelper2 <- function(x) x\r\nhelper2(1)\r\n",
+    );
+    let docs = parse_isolated(
+        &ws,
+        &[
+            "main.R",
+            "local.R",
+            "cr_sources_lf.R",
+            "lf_sources_cr.R",
+            "child.R",
+            "crlf.R",
+        ],
+        None,
+    );
+    let range = |line: u64, start: u64, end: u64| {
+        serde_json::json!({"start": {"line": line, "character": start},
+                           "end": {"line": line, "character": end}})
+    };
+    let workspace = |path: &str, line: u64, start: u64, end: u64| serde_json::json!({"kind": "workspace", "path": path, "range": range(line, start, end)});
+
+    let main = by_path(&docs, "main.R");
+    assert_eq!(main["encoding"]["line_endings"], "cr");
+    assert_eq!(
+        *resolution_of(main, "helper", 2),
+        workspace("main.R", 1, 0, 6)
+    );
+    assert_eq!(
+        resolution_of(main, "helper", 2)["range"],
+        *target_range(main, 1)
+    );
+
+    let local = by_path(&docs, "local.R");
+    assert_eq!(
+        *resolution_of(local, "inner", 2),
+        serde_json::json!({"kind": "local", "range": range(1, 2, 7)})
+    );
+
+    let cr_sources_lf = by_path(&docs, "cr_sources_lf.R");
+    assert_eq!(
+        *resolution_of(cr_sources_lf, "lf_tool", 2),
+        workspace("lf.R", 2, 0, 7)
+    );
+    let lf_sources_cr = by_path(&docs, "lf_sources_cr.R");
+    assert_eq!(
+        *resolution_of(lf_sources_cr, "cr_tool", 1),
+        workspace("cr.R", 2, 1, 8)
+    );
+
+    let child = by_path(&docs, "child.R");
+    assert_eq!(
+        *resolution_of(child, "caller_fn", 0),
+        workspace("caller.R", 1, 0, 9)
+    );
+
+    let crlf = by_path(&docs, "crlf.R");
+    assert_eq!(
+        *resolution_of(crlf, "helper2", 2),
+        workspace("crlf.R", 1, 0, 7)
+    );
+    assert_eq!(
+        resolution_of(crlf, "helper2", 2)["range"],
+        *target_range(crlf, 1)
+    );
+}
+
 #[test]
 fn unresolved_says_why() {
     let (_tmp, ws) = package_workspace();
