@@ -25,12 +25,17 @@
 //! disagree give `ambiguous`. `docs/cli.md` (`raven parse`, "Name
 //! resolution") is the contract.
 //!
-//! The positions the scope uses count lines by `\n` only; [`ScopePoints`]
-//! converts. They differ from the document's only in a file with a lone `\r`
-//! line ending, where a definition's `range` is in the scope's lines.
+//! The positions the scope uses count lines by `\n` only, and the document's
+//! also end a line at a lone `\r`. [`ScopePoints`] converts both ways: a
+//! query's position into the scope's lines, and a definition's position back
+//! into the document lines of the file that holds the definition, so a
+//! `workspace` or `local` range counts lines as every other range does.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use serde::Serialize;
 use tower_lsp::lsp_types::Url;
@@ -258,28 +263,106 @@ fn is_value(node: TsNode<'_>, text: &str) -> bool {
     }
 }
 
-/// Converts byte offsets into the positions the scope uses: lines counted by
-/// `\n`, columns in UTF-16 units from the line's start.
+/// Converts between a file's byte offsets, the positions the scope uses, and
+/// the document's positions.
+///
+/// The scope counts lines by `\n` only, with columns in UTF-16 units from that
+/// line's start ([`Self::at`]). The document also ends a line at a lone `\r`
+/// (`LineIndex`), so a definition's scope position is converted back
+/// ([`Self::document_position`]) using the text of the file that holds it.
+/// Without a lone `\r` the two agree and the conversion is the identity.
 struct ScopePoints<'t> {
-    text: &'t str,
+    text: Cow<'t, str>,
+    /// Byte offset of each `\n`.
     newlines: Vec<usize>,
+    /// Byte offset of each `\r` not followed by `\n`.
+    lone_crs: Vec<usize>,
 }
 
 impl<'t> ScopePoints<'t> {
-    fn new(text: &'t str) -> Self {
-        let newlines = text.match_indices('\n').map(|(i, _)| i).collect();
-        ScopePoints { text, newlines }
+    fn new(text: impl Into<Cow<'t, str>>) -> Self {
+        let text = text.into();
+        let bytes = text.as_bytes();
+        let mut newlines = Vec::new();
+        let mut lone_crs = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'\n' => newlines.push(i),
+                b'\r' if bytes.get(i + 1) != Some(&b'\n') => lone_crs.push(i),
+                _ => {}
+            }
+        }
+        ScopePoints {
+            text,
+            newlines,
+            lone_crs,
+        }
     }
 
+    /// The scope's position of byte `offset`.
     fn at(&self, offset: usize) -> (u32, u32) {
         let line = self.newlines.partition_point(|&nl| nl < offset);
-        let start = if line == 0 {
+        let start = self.line_start(line);
+        let column = self.text[start..offset].encode_utf16().count();
+        (line as u32, column as u32)
+    }
+
+    /// Byte offset where the scope's `line` starts.
+    fn line_start(&self, line: usize) -> usize {
+        if line == 0 {
             0
         } else {
             self.newlines[line - 1] + 1
+        }
+    }
+
+    /// The document position of the scope's `line` and UTF-16 `column`. A
+    /// line past the text's last is returned unchanged.
+    fn document_position(&self, line: u32, column: u32) -> Position {
+        let unchanged = Position {
+            line,
+            character: column,
         };
-        let column = self.text[start..offset].encode_utf16().count();
-        (line as u32, column as u32)
+        let scope_line = line as usize;
+        if self.lone_crs.is_empty() || scope_line > self.newlines.len() {
+            return unchanged;
+        }
+        let start = self.line_start(scope_line);
+        let end = self
+            .newlines
+            .get(scope_line)
+            .copied()
+            .unwrap_or(self.text.len());
+        let line_text = &self.text[start..end];
+        let line_text = line_text.strip_suffix('\r').unwrap_or(line_text);
+        let offset = start + crate::utf16::utf16_column_to_byte_offset(line_text, column);
+        // Every `\n` before `offset` is on an earlier scope line; every lone
+        // `\r` before it ends one more document line.
+        let crs = self.lone_crs.partition_point(|&cr| cr < offset);
+        let document_start = match crs {
+            0 => start,
+            _ => start.max(self.lone_crs[crs - 1] + 1),
+        };
+        Position {
+            line: line + crs as u32,
+            character: self.text[document_start..offset].encode_utf16().count() as u32,
+        }
+    }
+
+    /// A symbol's defined-name range in document positions. The name is on
+    /// one line, so the end keeps the start's line and the name's width.
+    fn symbol_range(&self, symbol: &ScopedSymbol) -> Range {
+        let start = self.document_position(symbol.defined_line, symbol.defined_column);
+        let width = symbol
+            .defined_end_column
+            .saturating_sub(symbol.defined_column);
+        Range {
+            start,
+            end: Position {
+                line: start.line,
+                character: start.character + width,
+            },
+        }
     }
 }
 
@@ -309,7 +392,7 @@ impl NameResolver for WorkspaceNames {
         order.sort_by_key(|&i| positions[i]);
         let mut out: Vec<Option<Resolution>> = vec![None; queries.len()];
         let cancel = DiagCancelToken::never();
-        let mut file = FileResolver::new(self, &cancel);
+        let mut file = FileResolver::new(self, &cancel, &points);
         self.snapshot
             .with_scope_stream(&self.uri, &cancel, |stream| {
                 let Some(stream) = stream else {
@@ -336,6 +419,11 @@ impl NameResolver for WorkspaceNames {
 struct FileResolver<'w> {
     names: &'w WorkspaceNames,
     cancel: &'w DiagCancelToken,
+    /// This file's text, for its definitions' document positions.
+    points: &'w ScopePoints<'w>,
+    /// Other files' texts, read once, for their definitions' document
+    /// positions. `None` for a file that can't be read.
+    other_points: RefCell<HashMap<Url, Option<Rc<ScopePoints<'static>>>>>,
     /// The earliest lending call site of each distinct caller, sorted by
     /// caller URI.
     callers: Vec<(Url, u32, u32)>,
@@ -386,7 +474,11 @@ enum Attached {
 }
 
 impl<'w> FileResolver<'w> {
-    fn new(names: &'w WorkspaceNames, cancel: &'w DiagCancelToken) -> Self {
+    fn new(
+        names: &'w WorkspaceNames,
+        cancel: &'w DiagCancelToken,
+        points: &'w ScopePoints<'w>,
+    ) -> Self {
         let snapshot = &names.snapshot;
         let mut earliest: HashMap<Url, (u32, u32)> = HashMap::new();
         for edge in snapshot.cross_file_graph.get_dependents(&names.uri) {
@@ -425,6 +517,8 @@ impl<'w> FileResolver<'w> {
         FileResolver {
             names,
             cancel,
+            points,
+            other_points: RefCell::new(HashMap::new()),
             callers,
             caller_scopes: HashMap::new(),
             top_level_defs: None,
@@ -469,6 +563,31 @@ impl<'w> FileResolver<'w> {
             }
             AttachSites { loads, sources }
         })
+    }
+
+    /// `symbol`'s defined-name range in the document positions of the file
+    /// that defines it: that file's own line endings decide. Another file's
+    /// text is read as `raven parse` reads it; one that can't be read keeps
+    /// the scope's positions.
+    fn symbol_range(&self, symbol: &ScopedSymbol) -> Range {
+        let uri = &symbol.source_uri;
+        if *uri == self.names.uri {
+            return self.points.symbol_range(symbol);
+        }
+        let points = self
+            .other_points
+            .borrow_mut()
+            .entry(uri.clone())
+            .or_insert_with(|| {
+                let bytes = std::fs::read(uri.to_file_path().ok()?).ok()?;
+                let text = crate::state::decode_source(bytes).ok()?;
+                Some(Rc::new(ScopePoints::new(text)))
+            })
+            .clone();
+        match points {
+            Some(points) => points.symbol_range(symbol),
+            None => ScopePoints::new("").symbol_range(symbol),
+        }
     }
 
     fn snapshot(&self) -> &'w DiagnosticsSnapshot {
@@ -532,7 +651,7 @@ impl<'w> FileResolver<'w> {
             && scope::package_name_from_uri(&symbol.source_uri).is_none()
         {
             return Resolution::Local {
-                range: symbol_range(symbol),
+                range: self.symbol_range(symbol),
             };
         }
         self.classify(symbol, name)
@@ -564,7 +683,7 @@ impl<'w> FileResolver<'w> {
         }
         Resolution::Workspace {
             path: self.display(&symbol.source_uri),
-            range: symbol_range(symbol),
+            range: self.symbol_range(symbol),
         }
     }
 
@@ -951,20 +1070,6 @@ fn default_owner(library: &crate::package_library::PackageLibrary, name: &str) -
         .map_or(owner, |package| package.name.to_string())
 }
 
-/// A symbol's defined-name range.
-fn symbol_range(symbol: &ScopedSymbol) -> Range {
-    Range {
-        start: Position {
-            line: symbol.defined_line,
-            character: symbol.defined_column,
-        },
-        end: Position {
-            line: symbol.defined_line,
-            character: symbol.defined_end_column,
-        },
-    }
-}
-
 /// Resolves nothing: every call is `unresolved` and no value has a
 /// resolution. For a file Raven has no scope for (a path that isn't a file
 /// URL), and for unit tests of the rest of the document.
@@ -1059,5 +1164,33 @@ mod tests {
         // A lone `\r` doesn't end a line for the scope.
         assert_eq!(points.at(text.find('d').unwrap()), (1, 5));
         assert_eq!(points.at(text.find('e').unwrap()), (2, 0));
+    }
+
+    #[test]
+    fn scope_positions_convert_back_to_document_positions() {
+        let text = "a\r\nb😀c\rd\ne";
+        let points = ScopePoints::new(text);
+        let document = super::super::document::LineIndex::new(text);
+        // Every character a name can start at: not a line ending.
+        for (offset, _) in text
+            .char_indices()
+            .filter(|(_, ch)| !matches!(ch, '\r' | '\n'))
+        {
+            let (line, column) = points.at(offset);
+            assert_eq!(
+                points.document_position(line, column),
+                document.position(offset),
+                "offset {offset}"
+            );
+        }
+        // Without a lone `\r` the positions are the scope's.
+        let crlf = ScopePoints::new("a\r\nb\nc");
+        assert_eq!(
+            crlf.document_position(1, 0),
+            Position {
+                line: 1,
+                character: 0
+            }
+        );
     }
 }
