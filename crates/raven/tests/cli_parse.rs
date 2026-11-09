@@ -887,6 +887,114 @@ fn ambiguous_candidates_sort_by_printed_path() {
 }
 
 #[test]
+fn a_sourced_by_directive_doesnt_hide_other_callers() {
+    // `kid.R` names `a.R` as its caller with a backward directive, and `b.R`
+    // sources it too. R runs `kid.R` from both, so both are callers, as for
+    // a file with several `source()` callers.
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "a.R",
+        b"library(dplyr)\nhelper <- function() 1\nsource(\"kid.R\")\n",
+    );
+    write(
+        &ws,
+        "b.R",
+        b"library(ravenpkgb)\nhelper <- function() 2\nsource(\"kid.R\")\n",
+    );
+    write(
+        &ws,
+        "kid.R",
+        concat!(
+            "# raven: sourced-by a.R\n", // 0
+            "mutate(d)\n",               // 1
+            "filter(d)\n",               // 2
+            "helper()\n",                // 3
+            "onlyb()\n",                 // 4
+            "mean(1)\n",                 // 5
+            "later()\n",                 // 6
+            "later <- function() 1\n",   // 7
+        )
+        .as_bytes(),
+    );
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    let doc = &docs[0];
+    let ambiguous = |first: Value, second: Value| {
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": first},
+            {"path": "b.R", "resolution": second},
+        ]})
+    };
+    let not_found = serde_json::json!({"kind": "unresolved", "reason": "not_found"});
+    assert_eq!(
+        *resolution_of(doc, "mutate", 1),
+        ambiguous(package("dplyr"), not_found.clone())
+    );
+    assert_eq!(
+        *resolution_of(doc, "filter", 2),
+        ambiguous(package("dplyr"), package("stats"))
+    );
+    let helper = |path: &str| {
+        serde_json::json!({"kind": "workspace", "path": path, "range":
+            {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}}})
+    };
+    assert_eq!(
+        *resolution_of(doc, "helper", 3),
+        ambiguous(helper("a.R"), helper("b.R"))
+    );
+    // Only the caller the directive doesn't name attaches it.
+    assert_eq!(
+        *resolution_of(doc, "onlyb", 4),
+        ambiguous(not_found, package("ravenpkgb"))
+    );
+    assert_eq!(*resolution_of(doc, "mean", 5), package("base"));
+    // Callers that agree leave the file's own reason.
+    assert_eq!(
+        *resolution_of(doc, "later", 6),
+        serde_json::json!({"kind": "unresolved", "reason": "defined_later"})
+    );
+}
+
+#[test]
+fn a_sourced_by_caller_and_a_source_caller_that_agree_give_one_resolution() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"library(dplyr)\nsource(\"kid.R\")\n");
+    write(&ws, "b.R", b"library(dplyr)\nsource(\"kid.R\")\n");
+    write(&ws, "kid.R", b"# raven: sourced-by a.R\nmutate(d)\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mutate", 1), package("dplyr"));
+}
+
+#[test]
+fn a_named_import_holds_unless_a_caller_defines_the_name() {
+    // `import::from()` attaches `onlya` in a named environment. With a
+    // caller the `sourced-by` directive hides, each caller's view keeps it,
+    // unless the caller defines `onlya` itself (the global environment comes
+    // before the search path).
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"source(\"kid.R\")\n");
+    write(&ws, "b.R", b"source(\"kid.R\")\n");
+    write(
+        &ws,
+        "kid.R",
+        b"# raven: sourced-by a.R\nimport::from(ravenpkga, onlya)\nonlya()\n",
+    );
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "onlya", 2), package("ravenpkga"));
+
+    write(&ws, "b.R", b"onlya <- function() 2\nsource(\"kid.R\")\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(
+        *resolution_of(&docs[0], "onlya", 2),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": package("ravenpkga")},
+            {"path": "b.R", "resolution": {"kind": "workspace", "path": "b.R", "range":
+                {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}},
+        ]})
+    );
+}
+
+#[test]
 fn package_data_says_which_sources_loaded() {
     let (tmp, ws) = package_workspace();
     write(&ws, "main.R", b"library(ravendbonly)\ndbfn()\n");

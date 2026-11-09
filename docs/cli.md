@@ -700,7 +700,7 @@ Resolution follows `raven check`'s scope, which reads a `library()` call by wher
 
 #### Callers that disagree
 
-A caller is a file that sources this one, through a `source()` call or a directive. When a caller's definition or attachment decides a name and the file has callers, Raven resolves the name as each caller alone would leave it, reading that caller at its `source()` call. If they agree, that is the resolution. Otherwise it is `ambiguous`, with one candidate per caller, sorted by path:
+A caller is a file that sources this one, through a `source()` call or a directive. A `# raven: sourced-by` directive doesn't hide the file's other callers here, though `raven check` reads only the directive's callers for that file (see [Backward dependency modes](cross-file.md#backward-dependency-modes)). When a caller's definition or attachment decides a name and the file has callers, Raven resolves the name as each caller alone would leave it, reading that caller at its `source()` call. If they agree, that is the resolution. Otherwise it is `ambiguous`, with one candidate per caller, sorted by path:
 
 ```json
 {"kind": "ambiguous", "candidates": [
