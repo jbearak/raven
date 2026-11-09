@@ -700,6 +700,108 @@ fn library_in_a_function_or_a_branch() {
     assert_eq!(*resolution_of(doc, "mutate", 11), not_found);
 }
 
+/// A file whose function bodies use names it defines later at top level,
+/// directly or in a file it sources after the function.
+fn later_definitions_workspace(raven_toml_extra: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, ws) = package_workspace();
+    let config = std::fs::read_to_string(ws.join("raven.toml")).unwrap();
+    write(
+        &ws,
+        "raven.toml",
+        format!("{config}{raven_toml_extra}").as_bytes(),
+    );
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "library(dplyr)\n",                  // 0
+            "f <- function() g()\n",             // 1
+            "h <- function() {\n",               // 2
+            "  k <- function() mutate(n, pi)\n", // 3
+            "  k()\n",                           // 4
+            "}\n",                               // 5
+            "y <- local(late())\n",              // 6
+            "g(pi)\n",                           // 7
+            "s <- function() fromkid()\n",       // 8
+            "source(\"kid.R\")\n",               // 9
+            "g <- function() 1\n",               // 10
+            "mutate <- function(...) 1\n",       // 11
+            "n <- 2\n",                          // 12
+            "pi <- 3\n",                         // 13
+            "late <- function() 1\n",            // 14
+        )
+        .as_bytes(),
+    );
+    write(&ws, "kid.R", b"fromkid <- function() 1\n");
+    (tmp, ws)
+}
+
+fn range_json(line: u64, start: u64, end: u64) -> Value {
+    serde_json::json!({"start": {"line": line, "character": start},
+                       "end": {"line": line, "character": end}})
+}
+
+/// The single identifier `name` on `line`'s resolution, if it has one.
+fn value_resolution<'d>(doc: &'d Value, name: &str, line: u64) -> Option<&'d Value> {
+    let found = identifiers(doc, name, line);
+    assert_eq!(found.len(), 1, "one `{name}` on line {line}");
+    found[0].get("resolution")
+}
+
+/// docs/cli.md: "A function body sees its file's whole top level, as R does
+/// when the function runs later: every top-level `library()` call and
+/// definition, later ones included." The global environment comes before
+/// the attached packages, so a later top-level definition also masks a
+/// package export of the same name inside a body.
+#[test]
+fn a_function_body_sees_later_top_level_definitions() {
+    let (_tmp, ws) = later_definitions_workspace("");
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    let workspace = |path: &str, range: Value| serde_json::json!({"kind": "workspace", "path": path, "range": range});
+    let defined_later = serde_json::json!({"kind": "unresolved", "reason": "defined_later"});
+    assert_eq!(
+        *resolution_of(doc, "g", 1),
+        workspace("main.R", range_json(10, 0, 1))
+    );
+    // A nested function too, and the later definition masks dplyr's export.
+    assert_eq!(
+        *resolution_of(doc, "mutate", 3),
+        workspace("main.R", range_json(11, 0, 6))
+    );
+    // Values: the later global `n` masks `dplyr::n`, and `pi <- 3` masks
+    // base's `pi`, so neither is a package object.
+    assert_eq!(value_resolution(doc, "n", 3), None);
+    assert_eq!(value_resolution(doc, "pi", 3), None);
+    // A definition in a file sourced after the function.
+    assert_eq!(
+        *resolution_of(doc, "fromkid", 8),
+        workspace("kid.R", range_json(0, 0, 7))
+    );
+    // Top-level code, and an immediate `local()` body, run where they stand.
+    assert_eq!(*resolution_of(doc, "late", 6), defined_later);
+    assert_eq!(*resolution_of(doc, "g", 7), defined_later);
+    assert_eq!(value_resolution(doc, "pi", 7), Some(&package("base")));
+}
+
+/// With `hoistGlobalsInFunctions` off, a body sees only what is defined
+/// before it, as top-level code does.
+#[test]
+fn without_hoisting_a_function_body_sees_only_earlier_definitions() {
+    let (_tmp, ws) = later_definitions_workspace("[crossFile]\nhoistGlobalsInFunctions = false\n");
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    let doc = &docs[0];
+    let defined_later = serde_json::json!({"kind": "unresolved", "reason": "defined_later"});
+    assert_eq!(*resolution_of(doc, "g", 1), defined_later);
+    assert_eq!(*resolution_of(doc, "mutate", 3), package("dplyr"));
+    assert_eq!(value_resolution(doc, "n", 3), Some(&package("dplyr")));
+    assert_eq!(value_resolution(doc, "pi", 3), Some(&package("base")));
+    assert_eq!(
+        *resolution_of(doc, "fromkid", 8),
+        serde_json::json!({"kind": "unresolved", "reason": "not_found"})
+    );
+}
+
 #[test]
 fn a_caller_attachment_counts_before_its_source_call() {
     let (_tmp, ws) = package_workspace();

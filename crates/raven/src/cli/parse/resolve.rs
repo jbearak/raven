@@ -13,6 +13,9 @@
 //! 1. An enclosing function's binding (`ScopeLayer::Function`).
 //! 2. The global environment: this file's and its sourced files' definitions,
 //!    then its callers' (the scope's layers above the default exports).
+//!    Inside a function body, with `hoistGlobalsInFunctions` on, that is the
+//!    file's whole top level, later definitions included, as `raven check`
+//!    reads it.
 //! 3. Attached packages, most recently attached first ([`FileResolver::search_order`]):
 //!    the scope keeps the loaded packages as a set, so the order comes from
 //!    the file's own package-load events and `source()` call sites. Packages
@@ -607,12 +610,16 @@ impl<'w> FileResolver<'w> {
     ) -> Option<Resolution> {
         let name = query.name.as_str();
         let uri = &self.names.uri;
-        let found = stream.symbol_with_layer(name).filter(|(symbol, _)| {
+        let found = stream.symbol_with_layer(name);
+        let found = found.filter(|(symbol, layer)| {
             // As the undefined-variable collector: a same-file binding made
-            // later is no binding here, unless R binds it late (a global read
-            // from inside a function body).
+            // later is no binding here, unless R binds it late: a global read
+            // from inside a function body, which with hoisting on sees the
+            // file's whole top level (the stream's global layer there is the
+            // completed one), or an R6 instance member.
             stream.is_deferred_binding(symbol)
                 || !crate::handlers::is_forward_reference_in_same_file(symbol, uri, line, column)
+                || (*layer == ScopeLayer::Global && self.inside_late_binding_function(line, column))
         });
         let mut default_export = None;
         let resolution = match found {
