@@ -735,7 +735,7 @@ A caller is a file that sources this one, through a `source()` call or a directi
 `raven graph --format json` stays the dependency graph, and `raven parse` repeats none of it. Run with the same workspace and configuration, the two join as follows, with every line 0-based in both:
 
 - **Files.** A document's `path` equals the graph's `files[].path`. Join an edge's `caller` or `target` to its document by path.
-- **Calls.** An edge whose `call_site.basis` is `call` came from a `source()` or `sys.source()` call, and its `call_site.position` is that `call` node's `range.start` in the `caller`'s document. A call in the graph's `dropped` list follows the same rule with its `position`.
+- **Calls.** An edge whose `call_site.basis` is `call` came from a `source()` or `sys.source()` call (bare, or qualified with `base::` or `base:::`), and its `call_site.position` is that `call` node's `range.start` in the `caller`'s document. A call in the graph's `dropped` list follows the same rule with its `position`.
 - **Directives.** An edge made by a directive has `directive.file` and `directive.line`. The directive's comment in that file's document has a `directive`, and its `range.start.line` equals `directive.line`.
 
 ### Parse errors

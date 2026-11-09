@@ -354,19 +354,15 @@ fn source_file_argument_from_call<'tree>(
     })
 }
 
-fn classify_bare_source_call(call_node: Node, content: &str) -> Option<bool> {
-    classify_bare_source_function(call_node.child_by_field_name("function")?, content)
+/// Classify a call as `source` (`Some(false)`) or `sys.source` (`Some(true)`)
+/// with the graph's own callee check, so path completion and navigation accept
+/// exactly the calls the graph follows (bare, `base::`, `base:::`).
+fn classify_source_call(call_node: Node, content: &str) -> Option<bool> {
+    classify_source_function(call_node.child_by_field_name("function")?, content)
 }
 
-fn classify_bare_source_function(function: Node, content: &str) -> Option<bool> {
-    if function.kind() != "identifier" {
-        return None;
-    }
-    match node_text(function, content) {
-        "source" => Some(false),
-        "sys.source" => Some(true),
-        _ => None,
-    }
+fn classify_source_function(function: Node, content: &str) -> Option<bool> {
+    crate::cross_file::source_detect::classify_source_callee(function, content)
 }
 
 fn recover_source_file_argument_from_error<'tree>(
@@ -377,7 +373,7 @@ fn recover_source_file_argument_from_error<'tree>(
 ) -> Option<SourceFileArgumentAtCursor<'tree>> {
     let error = find_enclosing_error(node)?;
     let function = previous_non_extra_sibling(error)?;
-    let is_sys_source = classify_bare_source_function(function, content)?;
+    let is_sys_source = classify_source_function(function, content)?;
     if !content
         .get(function.end_byte()..error.start_byte())?
         .trim()
@@ -427,7 +423,7 @@ fn recover_source_file_argument_from_error<'tree>(
         crate::parser_pool::with_parser(|parser| parser.parse(&completed_call, None))?;
     let recovered_root = recovered_tree.root_node();
     let recovered_call = recovered_root.named_child(0)?;
-    if classify_bare_source_call(recovered_call, &completed_call)? != is_sys_source {
+    if classify_source_call(recovered_call, &completed_call)? != is_sys_source {
         return None;
     }
     let recovered_args = recovered_call.child_by_field_name("arguments")?;
@@ -633,7 +629,7 @@ fn find_enclosing_source_call<'tree>(
     let mut current = Some(node);
     while let Some(node) = current {
         if node.kind() == "call"
-            && let Some(is_sys_source) = classify_bare_source_call(node, content)
+            && let Some(is_sys_source) = classify_source_call(node, content)
         {
             return Some((node, is_sys_source));
         }
@@ -1989,6 +1985,36 @@ mod tests {
         assert!(is_sys);
     }
 
+    /// `base::`/`base:::`-qualified calls are the same function as the bare
+    /// ones, so path completion and navigation treat them alike; the graph
+    /// follows them too (`classify_source_callee`). Another namespace's
+    /// `source()` is a different function and gets neither.
+    #[test]
+    fn test_base_qualified_source_calls() {
+        for (code, expected_sys_source) in [
+            (r#"base::source("utils.R")"#, false),
+            (r#"base:::source("utils.R")"#, false),
+            (r#"base::sys.source("utils.R", envir = globalenv())"#, true),
+        ] {
+            let tree = parse_r(code);
+            let quote = code.find('"').unwrap();
+            let position = Position::new(0, (quote + 4) as u32);
+            let (partial, _, is_sys) = is_source_call_string_context(&tree, code, position)
+                .unwrap_or_else(|| panic!("missing context for {code}"));
+            assert_eq!(partial, "uti", "{code}");
+            assert_eq!(is_sys, expected_sys_source, "{code}");
+            let (path, _, full_is_sys) = extract_full_source_call_path(&tree, code, position)
+                .unwrap_or_else(|| panic!("missing path for {code}"));
+            assert_eq!(path, "utils.R", "{code}");
+            assert_eq!(full_is_sys, expected_sys_source, "{code}");
+        }
+        let code = r#"otherpkg::source("utils.R")"#;
+        let tree = parse_r(code);
+        let position = Position::new(0, (code.find('"').unwrap() + 4) as u32);
+        assert!(is_source_call_string_context(&tree, code, position).is_none());
+        assert!(extract_full_source_call_path(&tree, code, position).is_none());
+    }
+
     #[test]
     fn test_source_call_named_file_argument() {
         let code = r#"source(file = "utils.R")"#;
@@ -2085,6 +2111,9 @@ mod tests {
             (r#"sys.source(envir = globalenv(), fil = "uti"#, "uti", true),
             (r#"sys.source(envir = globalenv(), "uti"#, "uti", true),
             (r#"prefix <- "😀"; source(fi = "é/uti"#, "é/uti", false),
+            (r#"base::source("uti"#, "uti", false),
+            (r#"base:::source(fi = "uti"#, "uti", false),
+            (r#"base::sys.source(envir = globalenv(), "uti"#, "uti", true),
         ] {
             let tree = parse_r(code);
             let position = Position::new(0, code.encode_utf16().count() as u32);
@@ -2204,7 +2233,8 @@ mod tests {
             r#"x <- "uti"#,
             r#"print("uti"#,
             r#"object$source("uti"#,
-            r#"base::source("uti"#,
+            r#"otherpkg::source("uti"#,
+            r#"otherpkg::sys.source("uti"#,
             r#"source(local = "uti"#,
             r#"source(file = "real.R", "uti"#,
             r#"source(file = "real.R", fi = "uti"#,

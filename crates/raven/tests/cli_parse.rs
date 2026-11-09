@@ -766,7 +766,7 @@ fn source_calls_and_directives_join_the_graph() {
     write(
         &ws,
         "main.R",
-        b"x <- 1\n  source(\"R/a.R\")\ny <- sys.source(\"R/d.R\", envir = globalenv())\nsource(\"vendor/v.R\")\n",
+        b"x <- 1\n  source(\"R/a.R\")\ny <- sys.source(\"R/d.R\", envir = globalenv())\nsource(\"vendor/v.R\")\nz <- base::source(\"R/e.R\")\notherpkg::source(\"R/e.R\")\n",
     );
     write(
         &ws,
@@ -777,6 +777,7 @@ fn source_calls_and_directives_join_the_graph() {
     write(&ws, "R/c.R", b"c1 <- 1\n");
     write(&ws, "R/d.R", b"d <- 1\n");
     write(&ws, "vendor/v.R", b"v <- 1\n");
+    write(&ws, "R/e.R", b"e <- 1\n");
 
     let graph = graph_of(&ws);
     let docs = documents(&parse_in(&ws, &["main.R", "R/a.R"]));
@@ -784,10 +785,16 @@ fn source_calls_and_directives_join_the_graph() {
         calls(by_path(&docs, path))
             .into_iter()
             .filter(|call| {
-                matches!(
-                    call["function"]["name"].as_str(),
-                    Some("source" | "sys.source")
-                )
+                // `base::source()` names its function through a namespace
+                // node; another package's `source()` isn't a source call.
+                let function = &call["function"];
+                let name = if function["kind"] == "namespace" && function["left"]["name"] == "base"
+                {
+                    &function["right"]["name"]
+                } else {
+                    &function["name"]
+                };
+                matches!(name.as_str(), Some("source" | "sys.source"))
             })
             .map(|call| call["range"]["start"].clone())
             .collect()
@@ -824,7 +831,8 @@ fn source_calls_and_directives_join_the_graph() {
     joined.push((caller.to_string(), dropped[0]["position"].clone()));
 
     // Every source() call in the two files is accounted for, the indented
-    // one and the nested one inside `local({ ... })` included.
+    // one, the `base::`-qualified one, and the nested one inside
+    // `local({ ... })` included.
     let mut all: Vec<(String, Value)> = ["main.R", "R/a.R"]
         .into_iter()
         .flat_map(|path| {
@@ -837,7 +845,7 @@ fn source_calls_and_directives_join_the_graph() {
     all.sort_by_key(key);
     joined.sort_by_key(key);
     assert_eq!(all, joined);
-    assert_eq!(all.len(), 4);
+    assert_eq!(all.len(), 5);
     let directive_edges = graph["edges"]
         .as_array()
         .unwrap()
