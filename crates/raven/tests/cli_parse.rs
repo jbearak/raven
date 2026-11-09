@@ -660,6 +660,26 @@ fn disagreeing_callers_are_ambiguous() {
 }
 
 #[test]
+fn ambiguous_candidates_sort_by_printed_path() {
+    // `ü.R`'s URI percent-encodes the `ü` (`%C3%BC.R`), which sorts before
+    // `b.R`; its printed path sorts after it in byte order. Candidates follow
+    // the printed path, as docs/cli.md says.
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "ü.R", b"library(dplyr)\nsource(\"kid.R\")\n");
+    write(&ws, "b.R", b"source(\"kid.R\")\n");
+    write(&ws, "kid.R", b"mutate(d)\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    let not_found = serde_json::json!({"kind": "unresolved", "reason": "not_found"});
+    assert_eq!(
+        *resolution_of(&docs[0], "mutate", 0),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "b.R", "resolution": not_found},
+            {"path": "ü.R", "resolution": package("dplyr")},
+        ]})
+    );
+}
+
+#[test]
 fn package_data_says_which_sources_loaded() {
     let (tmp, ws) = package_workspace();
     write(&ws, "main.R", b"library(ravendbonly)\ndbfn()\n");

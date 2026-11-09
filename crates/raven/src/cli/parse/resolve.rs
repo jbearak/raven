@@ -407,11 +407,21 @@ impl<'w> FileResolver<'w> {
                 .and_modify(|existing| *existing = (*existing).min(site))
                 .or_insert(site);
         }
-        let mut callers: Vec<(Url, u32, u32)> = earliest
+        // Sort by the printed path, the order docs/cli.md promises for
+        // `ambiguous` candidates. A URI's order differs for percent-encoded
+        // names and for callers outside the root.
+        let mut keyed: Vec<(String, Url, u32, u32)> = earliest
             .into_iter()
-            .map(|(uri, (line, column))| (uri, line, column))
+            .map(|(uri, (line, column))| {
+                let path = crate::cli::graph::display_path(&uri, &names.root);
+                (path, uri, line, column)
+            })
             .collect();
-        callers.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        let callers: Vec<(Url, u32, u32)> = keyed
+            .into_iter()
+            .map(|(_, uri, line, column)| (uri, line, column))
+            .collect();
         FileResolver {
             names,
             cancel,
