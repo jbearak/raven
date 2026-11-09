@@ -2203,7 +2203,7 @@ impl DiagnosticsSnapshot {
     /// Routes through `scope_at_position_with_graph_cached` so STEP 1 (the
     /// parent walk) is memoized across the snapshot's many per-identifier
     /// scope queries.
-    fn get_scope(
+    pub(crate) fn get_scope(
         &self,
         uri: &Url,
         line: u32,
@@ -2262,7 +2262,78 @@ impl DiagnosticsSnapshot {
             self.package_query_uri.as_ref(),
         )
     }
+
+    /// Run `f` over the streaming scope for `uri`: the scope the
+    /// undefined-variable collector walks, with the same providers as
+    /// [`Self::get_scope`]. `f` gets `None` when the snapshot holds no
+    /// artifacts for `uri`. The stream's cursor only moves forward, so `f`
+    /// queries positions in document order.
+    pub(crate) fn with_scope_stream<R>(
+        &self,
+        uri: &Url,
+        cancel: &DiagCancelToken,
+        f: impl FnOnce(Option<&mut SnapshotScopeStream<'_>>) -> R,
+    ) -> R {
+        let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+            self.artifacts_map.get(target_uri).cloned()
+        };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                self.metadata_map.get(target_uri).cloned()
+            };
+        let get_artifacts: &ArtifactsLookup<'_> = &get_artifacts;
+        let get_metadata: &MetadataLookup<'_> = &get_metadata;
+        let is_cancelled_fn = || cancel.is_cancelled();
+
+        // `data()` alias expansion provider (issue #429); see `get_scope`.
+        let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+            self.package_library.data_objects_for_stem_sync(pkg, stem)
+        };
+        let data_provider = (self.cross_file_config.packages_enabled && self.package_library_ready)
+            .then(|| scope::DataAliasProvider {
+                lookup: &data_lookup,
+                base_packages: self.package_library.base_packages(),
+            });
+        let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
+            &get_artifacts,
+            &get_metadata,
+            (self.cross_file_config.packages_enabled && self.package_library_ready)
+                .then_some(self.package_library.as_ref()),
+        );
+        let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
+
+        // The stream borrows the snapshot's shared `parent_prefix_cache` so
+        // child-source recursion benefits from the same Stage-1 caching.
+        let mut stream = scope::ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            uri,
+            &get_artifacts,
+            &get_metadata,
+            &self.cross_file_graph,
+            self.workspace_folders.first(),
+            self.cross_file_config.max_chain_depth,
+            &self.base_exports,
+            self.cross_file_config.hoist_globals_in_functions,
+            self.cross_file_config.backward_dependencies,
+            &is_cancelled_fn,
+            &self.parent_prefix_cache,
+            Some(&self.scope_contribution),
+            data_provider.as_ref(),
+            Some(&selective_import_provider),
+            self.standalone_ctx.clone(),
+            self.package_query_uri.as_ref(),
+        );
+        f(stream.as_mut())
+    }
 }
+
+/// How a [`DiagnosticsSnapshot`] finds a file's scope artifacts.
+pub(crate) type ArtifactsLookup<'a> = dyn Fn(&Url) -> Option<Arc<scope::ScopeArtifacts>> + 'a;
+/// How a [`DiagnosticsSnapshot`] finds a file's cross-file metadata.
+pub(crate) type MetadataLookup<'a> =
+    dyn Fn(&Url) -> Option<Arc<crate::cross_file::CrossFileMetadata>> + 'a;
+/// The streaming scope [`DiagnosticsSnapshot::with_scope_stream`] hands out.
+pub(crate) type SnapshotScopeStream<'a> =
+    scope::ScopeStream<'a, &'a ArtifactsLookup<'a>, &'a MetadataLookup<'a>>;
 
 /// Compute diagnostics from a pre-built snapshot (no lock held).
 ///
@@ -10013,440 +10084,407 @@ fn collect_undefined_variables_from_snapshot(
     // streaming `advance_to` invariant.
     used.sort_by_key(|(_, n)| (n.start_position().row, n.start_position().column));
 
-    // Build a single ScopeStream for the queried URI. The closures
-    // borrow the snapshot's pre-collected artifacts/metadata maps; the
-    // stream borrows the snapshot's shared `parent_prefix_cache` so
-    // child-source recursion benefits from the same Stage-1 caching.
-    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-        snapshot.artifacts_map.get(target_uri).cloned()
-    };
-    let get_metadata =
-        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-            snapshot.metadata_map.get(target_uri).cloned()
-        };
-    let is_cancelled_fn = || cancel.is_cancelled();
-
-    // `data()` alias expansion provider (issue #429); see `get_scope`.
-    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
-        snapshot
-            .package_library
-            .data_objects_for_stem_sync(pkg, stem)
-    };
-    let data_provider = (snapshot.cross_file_config.packages_enabled
-        && snapshot.package_library_ready)
-        .then(|| scope::DataAliasProvider {
-            lookup: &data_lookup,
-            base_packages: snapshot.package_library.base_packages(),
-        });
-    let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
-        &get_artifacts,
-        &get_metadata,
-        (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
-            .then_some(snapshot.package_library.as_ref()),
-    );
-    let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
-
-    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache_and_package_query_uri(
-        uri,
-        &get_artifacts,
-        &get_metadata,
-        &snapshot.cross_file_graph,
-        snapshot.workspace_folders.first(),
-        snapshot.cross_file_config.max_chain_depth,
-        &snapshot.base_exports,
-        snapshot.cross_file_config.hoist_globals_in_functions,
-        snapshot.cross_file_config.backward_dependencies,
-        &is_cancelled_fn,
-        &snapshot.parent_prefix_cache,
-        Some(&snapshot.scope_contribution),
-        data_provider.as_ref(),
-        Some(&selective_import_provider),
-        snapshot.standalone_ctx.clone(),
-        snapshot.package_query_uri.as_ref(),
-    );
-
-    // Reusable buffer for position-aware packages; avoids per-iteration allocation.
-    let mut position_aware_packages_buf: Vec<String> = Vec::new();
-    let active_library_call_positions =
-        if snapshot.cross_file_config.packages_enabled && !snapshot.package_library_ready {
-            let mut activation_cache = LibraryActivationCache::new();
-            snapshot
-                .directive_meta
-                .library_calls
-                .iter()
-                .filter(|call| {
-                    library_call_activation_satisfied(
-                        snapshot,
-                        Some(uri),
-                        call,
-                        cancel,
-                        &mut activation_cache,
-                    )
-                })
-                .map(|call| (call.line, call.column))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-    if cancel.is_cancelled() {
-        return;
-    }
-
-    for (idx, (name, usage_node)) in used.into_iter().enumerate() {
-        if idx & 63 == 0 && cancel.is_cancelled() {
+    // One streaming scope for the queried URI, shared with `raven parse`'s
+    // name resolution (see `DiagnosticsSnapshot::with_scope_stream`).
+    snapshot.with_scope_stream(uri, cancel, |mut stream_opt| {
+        // Reusable buffer for position-aware packages; avoids per-iteration allocation.
+        let mut position_aware_packages_buf: Vec<String> = Vec::new();
+        let active_library_call_positions =
+            if snapshot.cross_file_config.packages_enabled && !snapshot.package_library_ready {
+                let mut activation_cache = LibraryActivationCache::new();
+                snapshot
+                    .directive_meta
+                    .library_calls
+                    .iter()
+                    .filter(|call| {
+                        library_call_activation_satisfied(
+                            snapshot,
+                            Some(uri),
+                            call,
+                            cancel,
+                            &mut activation_cache,
+                        )
+                    })
+                    .map(|call| (call.line, call.column))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+        if cancel.is_cancelled() {
             return;
         }
 
-        if is_reserved_word(&name) {
-            continue;
-        }
+        for (idx, (name, usage_node)) in used.into_iter().enumerate() {
+            if idx & 63 == 0 && cancel.is_cancelled() {
+                return;
+            }
 
-        let usage_line = usage_node.start_position().row as u32;
-
-        // Whether this usage's line carries a suppression covering
-        // undefined-variable. Fast path skips immediately when not tracking
-        // unused suppressions; when tracking we proceed so a real suppressed
-        // diagnostic can be recorded at the would-be push site (F2 Step 3).
-        let suppressed_line = crate::cross_file::directive::is_line_ignored_for_code(
-            &snapshot.directive_meta,
-            usage_line,
-            Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
-        );
-        if suppressed_line && suppressed_out.is_none() {
-            continue;
-        }
-        let unquoted_usage_name = unquote_backtick_name(&name).map(str::to_string);
-        let replacement_function_name = replacement_function_name_for_lhs_call(&name, usage_node);
-        if replacement_function_name.as_deref().is_some_and(is_builtin) {
-            continue;
-        }
-
-        if is_builtin(&name) {
-            continue;
-        }
-        if is_implicit_search_path_binding(&name) {
-            continue;
-        }
-        if name == ".Random.seed"
-            && has_prior_token_end(
-                &random_seed_initializer_end_offsets,
-                usage_node.start_byte(),
-            )
-        {
-            continue;
-        }
-        if is_s3_method_special_variable_usage(usage_node, text, &name) {
-            continue;
-        }
-        if is_reference_class_method_special_variable_usage(usage_node, text, &name, &nse_analysis)
-        {
-            continue;
-        }
-
-        // knitr/Quarto-injected `params` (see `is_implicit_rmd_params`): the
-        // masked analysis text blanks the frontmatter, so a declared `params`
-        // would otherwise be flagged undefined. Plain .R files and Rmd docs
-        // without `params:` still flag legitimate uses.
-        if snapshot.is_implicit_rmd_params(&name) {
-            continue;
-        }
-
-        // Compute usage_col_utf16 once per iteration; subsequent checks
-        // share it.
-        let usage_line_text = get_line(usage_node.start_position().row);
-        let usage_col_utf16 =
-            byte_offset_to_utf16_column(usage_line_text, usage_node.start_position().column);
-
-        if hoist_globals
-            && let Some((ref exports, ref fn_tree)) = local_opt
-            && exports.contains(name.as_str())
-        {
-            // An immediate `local()` body runs where it stands, so it doesn't
-            // see later globals (`FunctionScopeTree::any_deferring`).
-            let inside_function = fn_tree.any_deferring(
-                &fn_tree.query_point(scope::Position::new(usage_line, usage_col_utf16)),
-            );
-            if inside_function {
+            if is_reserved_word(&name) {
                 continue;
             }
-        }
 
-        if parent_symbol_names.contains(name.as_str()) {
-            continue;
-        }
-        if unquoted_usage_name
-            .as_deref()
-            .is_some_and(|unquoted| parent_symbol_names.contains(unquoted))
-        {
-            continue;
-        }
+            let usage_line = usage_node.start_position().row as u32;
 
-        if default_expression_resolves_lazily(
-            usage_node,
-            text,
-            &name,
-            usage_line,
-            usage_col_utf16,
-            &top_level_defs_by_name,
-            local_opt.as_ref().map(|(exports, _)| exports),
-        ) {
-            continue;
-        }
-        if let Some((_, function_scope_tree)) = &local_opt
-            && nested_closure_late_binding_resolves(
-                &name,
+            // Whether this usage's line carries a suppression covering
+            // undefined-variable. Fast path skips immediately when not tracking
+            // unused suppressions; when tracking we proceed so a real suppressed
+            // diagnostic can be recorded at the would-be push site (F2 Step 3).
+            let suppressed_line = crate::cross_file::directive::is_line_ignored_for_code(
+                &snapshot.directive_meta,
                 usage_line,
-                usage_col_utf16,
-                function_scope_tree,
-                &function_defs_by_name,
-            )
-        {
-            continue;
-        }
+                Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+            );
+            if suppressed_line && suppressed_out.is_none() {
+                continue;
+            }
+            let unquoted_usage_name = unquote_backtick_name(&name).map(str::to_string);
+            let replacement_function_name =
+                replacement_function_name_for_lhs_call(&name, usage_node);
+            if replacement_function_name.as_deref().is_some_and(is_builtin) {
+                continue;
+            }
 
-        // Advance the stream cursor and query visibility. Fall back to
-        // the legacy snapshot.get_scope path if stream construction
-        // failed (no artifacts for the queried URI).
-        let scope = if let Some(stream) = stream_opt.as_mut() {
-            stream.advance_to(usage_line, usage_col_utf16);
-            // Fast path: if the symbol is visible AND not a forward
-            // reference in the same file, skip the diagnostic. The
-            // `symbol_for` walk is cheaper than materializing a full
-            // ScopeAtPosition because it short-circuits on the first
-            // matching frame.
-            let stream_symbol = stream.symbol_for(&name).or_else(|| {
-                unquoted_usage_name
-                    .as_deref()
-                    .and_then(|unquoted| stream.symbol_for(unquoted))
-            });
-            if let Some(sym) = stream_symbol
-                && (stream.is_deferred_binding(&sym)
-                    || !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16))
+            if is_builtin(&name) {
+                continue;
+            }
+            if is_implicit_search_path_binding(&name) {
+                continue;
+            }
+            if name == ".Random.seed"
+                && has_prior_token_end(
+                    &random_seed_initializer_end_offsets,
+                    usage_node.start_byte(),
+                )
             {
                 continue;
             }
-            // Slow path: name is undefined or forward-referenced. We
-            // need the full ScopeAtPosition for the package checks
-            // below. Materialize once via `snapshot()` and store in
-            // `scope_cache` so repeat lookups (rare; same usage twice)
-            // are free, AND so the out-of-scope collector can read the
-            // populated entry if it runs over the same positions.
-            let entry = scope_cache.entry((usage_line, usage_col_utf16));
-            entry.or_insert_with(|| stream.snapshot())
-        } else {
-            // No artifacts → fall back to the legacy path. This branch
-            // is rare (it happens only for files that aren't open or
-            // indexed), and matches the pre-Stage-2 behavior.
-            scope_cache
-                .entry((usage_line, usage_col_utf16))
-                .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col_utf16, cancel))
-        };
-
-        // For the no-stream fall-back path we still need to apply the
-        // forward-reference check (the stream path applied it above
-        // before the snapshot materialization).
-        if stream_opt.is_none()
-            && let Some(sym) = scope.symbols.get(name.as_str())
-            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
-        {
-            continue;
-        }
-        if stream_opt.is_none()
-            && let Some(sym) = unquoted_usage_name
-                .as_deref()
-                .and_then(|unquoted| scope.symbols.get(unquoted))
-            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
-        {
-            continue;
-        }
-        let replacement_backtick_name = replacement_function_name
-            .as_ref()
-            .map(|name| format!("`{name}`"));
-        let replacement_symbol = replacement_function_name
-            .as_deref()
-            .and_then(|name| scope.symbols.get(name))
-            .or_else(|| {
-                replacement_backtick_name
-                    .as_deref()
-                    .and_then(|name| scope.symbols.get(name))
-            });
-        if let Some(sym) = replacement_symbol
-            && (stream_opt
-                .as_ref()
-                .is_some_and(|stream| stream.is_deferred_binding(sym))
-                || !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16))
-        {
-            continue;
-        }
-
-        let defined_in_loaded_direct_source = direct_sources
-            .iter()
-            .filter(|(source_line, source_col, _)| {
-                *source_line < usage_line
-                    || (*source_line == usage_line && *source_col <= usage_col_utf16)
-            })
-            .any(|(_, _, source_uri)| {
-                let exported = source_exports_cache
-                    .entry(source_uri.clone())
-                    .or_insert_with(|| {
-                        // Use `live_top_level_exports` (timeline replay with
-                        // rm() applied), not `exported_interface.keys()`.
-                        if let Some(artifacts) = snapshot.artifacts_map.get(source_uri) {
-                            return crate::cross_file::scope::live_top_level_exports(artifacts);
-                        }
-                        HashSet::new()
-                    });
-                exported.contains(name.as_str())
-            });
-        if defined_in_loaded_direct_source {
-            continue;
-        }
-
-        if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
-            position_aware_packages_buf.clear();
-            position_aware_packages_buf.extend(
-                scope
-                    .inherited_packages
-                    .iter()
-                    .chain(scope.loaded_packages.iter())
-                    .chain(snapshot.scope_contribution.full_imports.iter())
-                    .cloned(),
-            );
-
-            if is_package_export(
+            if is_s3_method_special_variable_usage(usage_node, text, &name) {
+                continue;
+            }
+            if is_reference_class_method_special_variable_usage(
+                usage_node,
+                text,
                 &name,
-                &position_aware_packages_buf,
-                &snapshot.package_library,
+                &nse_analysis,
             ) {
                 continue;
             }
-            if attached_outside_active_renv_exports(snapshot, &name, &scope.attached_packages) {
+
+            // knitr/Quarto-injected `params` (see `is_implicit_rmd_params`): the
+            // masked analysis text blanks the frontmatter, so a declared `params`
+            // would otherwise be flagged undefined. Plain .R files and Rmd docs
+            // without `params:` still flag legitimate uses.
+            if snapshot.is_implicit_rmd_params(&name) {
                 continue;
             }
 
-            let has_prior_library_call = has_prior_package_loader_call(
-                &package_loader_call_end_offsets,
-                usage_node.start_byte(),
-            );
-            let has_cross_file_packages = !scope.inherited_packages.is_empty();
-            // A package is "pending" only when it is installed but its exports have
-            // not yet been loaded into cache — not when it is simply not installed.
-            // Using package_exists() guards against treating a permanently-missing
-            // package as one that will eventually be cached.
-            let package_cache_pending = position_aware_packages_buf.iter().any(|pkg| {
-                package_is_cache_pending(pkg, &snapshot.package_library, &mut package_exists_memo)
-            });
-            if (has_prior_library_call
-                || has_cross_file_packages
-                || !snapshot.scope_contribution.full_imports.is_empty())
-                && package_cache_pending
-                && is_function_call_identifier_textually(usage_node, text)
+            // Compute usage_col_utf16 once per iteration; subsequent checks
+            // share it.
+            let usage_line_text = get_line(usage_node.start_position().row);
+            let usage_col_utf16 =
+                byte_offset_to_utf16_column(usage_line_text, usage_node.start_position().column);
+
+            if hoist_globals
+                && let Some((ref exports, ref fn_tree)) = local_opt
+                && exports.contains(name.as_str())
+            {
+                // An immediate `local()` body runs where it stands, so it doesn't
+                // see later globals (`FunctionScopeTree::any_deferring`).
+                let inside_function = fn_tree.any_deferring(
+                    &fn_tree.query_point(scope::Position::new(usage_line, usage_col_utf16)),
+                );
+                if inside_function {
+                    continue;
+                }
+            }
+
+            if parent_symbol_names.contains(name.as_str()) {
+                continue;
+            }
+            if unquoted_usage_name
+                .as_deref()
+                .is_some_and(|unquoted| parent_symbol_names.contains(unquoted))
             {
                 continue;
             }
-        } else {
-            let has_prior_library_call =
-                active_library_call_positions.iter().any(|(line, column)| {
-                    *line < usage_line || (*line == usage_line && *column <= usage_col_utf16)
+
+            if default_expression_resolves_lazily(
+                usage_node,
+                text,
+                &name,
+                usage_line,
+                usage_col_utf16,
+                &top_level_defs_by_name,
+                local_opt.as_ref().map(|(exports, _)| exports),
+            ) {
+                continue;
+            }
+            if let Some((_, function_scope_tree)) = &local_opt
+                && nested_closure_late_binding_resolves(
+                    &name,
+                    usage_line,
+                    usage_col_utf16,
+                    function_scope_tree,
+                    &function_defs_by_name,
+                )
+            {
+                continue;
+            }
+
+            // Advance the stream cursor and query visibility. Fall back to
+            // the legacy snapshot.get_scope path if stream construction
+            // failed (no artifacts for the queried URI).
+            let scope = if let Some(stream) = stream_opt.as_mut() {
+                stream.advance_to(usage_line, usage_col_utf16);
+                // Fast path: if the symbol is visible AND not a forward
+                // reference in the same file, skip the diagnostic. The
+                // `symbol_for` walk is cheaper than materializing a full
+                // ScopeAtPosition because it short-circuits on the first
+                // matching frame.
+                let stream_symbol = stream.symbol_for(&name).or_else(|| {
+                    unquoted_usage_name
+                        .as_deref()
+                        .and_then(|unquoted| stream.symbol_for(unquoted))
                 });
-            let has_prior_library_call = has_prior_library_call
-                || has_prior_package_loader_call(
+                if let Some(sym) = stream_symbol
+                    && (stream.is_deferred_binding(&sym)
+                        || !is_forward_reference_in_same_file(
+                            &sym,
+                            uri,
+                            usage_line,
+                            usage_col_utf16,
+                        ))
+                {
+                    continue;
+                }
+                // Slow path: name is undefined or forward-referenced. We
+                // need the full ScopeAtPosition for the package checks
+                // below. Materialize once via `snapshot()` and store in
+                // `scope_cache` so repeat lookups (rare; same usage twice)
+                // are free, AND so the out-of-scope collector can read the
+                // populated entry if it runs over the same positions.
+                let entry = scope_cache.entry((usage_line, usage_col_utf16));
+                entry.or_insert_with(|| stream.snapshot())
+            } else {
+                // No artifacts → fall back to the legacy path. This branch
+                // is rare (it happens only for files that aren't open or
+                // indexed), and matches the pre-Stage-2 behavior.
+                scope_cache
+                    .entry((usage_line, usage_col_utf16))
+                    .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col_utf16, cancel))
+            };
+
+            // For the no-stream fall-back path we still need to apply the
+            // forward-reference check (the stream path applied it above
+            // before the snapshot materialization).
+            if stream_opt.is_none()
+                && let Some(sym) = scope.symbols.get(name.as_str())
+                && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+            {
+                continue;
+            }
+            if stream_opt.is_none()
+                && let Some(sym) = unquoted_usage_name
+                    .as_deref()
+                    .and_then(|unquoted| scope.symbols.get(unquoted))
+                && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+            {
+                continue;
+            }
+            let replacement_backtick_name = replacement_function_name
+                .as_ref()
+                .map(|name| format!("`{name}`"));
+            let replacement_symbol = replacement_function_name
+                .as_deref()
+                .and_then(|name| scope.symbols.get(name))
+                .or_else(|| {
+                    replacement_backtick_name
+                        .as_deref()
+                        .and_then(|name| scope.symbols.get(name))
+                });
+            if let Some(sym) = replacement_symbol
+                && (stream_opt
+                    .as_ref()
+                    .is_some_and(|stream| stream.is_deferred_binding(sym))
+                    || !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16))
+            {
+                continue;
+            }
+
+            let defined_in_loaded_direct_source = direct_sources
+                .iter()
+                .filter(|(source_line, source_col, _)| {
+                    *source_line < usage_line
+                        || (*source_line == usage_line && *source_col <= usage_col_utf16)
+                })
+                .any(|(_, _, source_uri)| {
+                    let exported = source_exports_cache
+                        .entry(source_uri.clone())
+                        .or_insert_with(|| {
+                            // Use `live_top_level_exports` (timeline replay with
+                            // rm() applied), not `exported_interface.keys()`.
+                            if let Some(artifacts) = snapshot.artifacts_map.get(source_uri) {
+                                return crate::cross_file::scope::live_top_level_exports(artifacts);
+                            }
+                            HashSet::new()
+                        });
+                    exported.contains(name.as_str())
+                });
+            if defined_in_loaded_direct_source {
+                continue;
+            }
+
+            if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
+                position_aware_packages_buf.clear();
+                position_aware_packages_buf.extend(
+                    scope
+                        .inherited_packages
+                        .iter()
+                        .chain(scope.loaded_packages.iter())
+                        .chain(snapshot.scope_contribution.full_imports.iter())
+                        .cloned(),
+                );
+
+                if is_package_export(
+                    &name,
+                    &position_aware_packages_buf,
+                    &snapshot.package_library,
+                ) {
+                    continue;
+                }
+                if attached_outside_active_renv_exports(snapshot, &name, &scope.attached_packages) {
+                    continue;
+                }
+
+                let has_prior_library_call = has_prior_package_loader_call(
                     &package_loader_call_end_offsets,
                     usage_node.start_byte(),
                 );
-            if snapshot.cross_file_config.packages_enabled
-                && !snapshot.package_library_ready
-                && is_function_call_identifier_textually(usage_node, text)
-                && (!scope.loaded_packages.is_empty()
-                    || !scope.inherited_packages.is_empty()
-                    || has_prior_library_call)
-            {
+                let has_cross_file_packages = !scope.inherited_packages.is_empty();
+                // A package is "pending" only when it is installed but its exports have
+                // not yet been loaded into cache — not when it is simply not installed.
+                // Using package_exists() guards against treating a permanently-missing
+                // package as one that will eventually be cached.
+                let package_cache_pending = position_aware_packages_buf.iter().any(|pkg| {
+                    package_is_cache_pending(
+                        pkg,
+                        &snapshot.package_library,
+                        &mut package_exists_memo,
+                    )
+                });
+                if (has_prior_library_call
+                    || has_cross_file_packages
+                    || !snapshot.scope_contribution.full_imports.is_empty())
+                    && package_cache_pending
+                    && is_function_call_identifier_textually(usage_node, text)
+                {
+                    continue;
+                }
+            } else {
+                let has_prior_library_call =
+                    active_library_call_positions.iter().any(|(line, column)| {
+                        *line < usage_line || (*line == usage_line && *column <= usage_col_utf16)
+                    });
+                let has_prior_library_call = has_prior_library_call
+                    || has_prior_package_loader_call(
+                        &package_loader_call_end_offsets,
+                        usage_node.start_byte(),
+                    );
+                if snapshot.cross_file_config.packages_enabled
+                    && !snapshot.package_library_ready
+                    && is_function_call_identifier_textually(usage_node, text)
+                    && (!scope.loaded_packages.is_empty()
+                        || !scope.inherited_packages.is_empty()
+                        || has_prior_library_call)
+                {
+                    continue;
+                }
+            }
+
+            let start_line_text = get_line(usage_node.start_position().row);
+            let end_line_text = get_line(usage_node.end_position().row);
+            let start_col =
+                byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
+            let end_col =
+                byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+
+            // If the name is defined later in this same file at top level, point
+            // the user at that line — R does not hoist top-level bindings, so the
+            // use is a forward reference rather than a truly undefined symbol.
+            // `top_level_defs_by_name` is sorted ascending, so the first position
+            // strictly greater than the usage is the earliest later definition.
+            let forward_ref_defined_line = top_level_defs_by_name
+                .get(name.as_str())
+                .and_then(|positions| {
+                    positions
+                        .iter()
+                        .find(|&&(line, col)| (line, col) > (usage_line, usage_col_utf16))
+                })
+                .map(|&(line, _col)| line);
+
+            // A suppressed diagnostic is discarded below, so compute the (cheap but
+            // non-trivial) NSE discoverability hint only after the suppression check.
+            if suppressed_line {
+                if let Some(out) = suppressed_out.as_deref_mut() {
+                    out.push((
+                        usage_line,
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ));
+                }
                 continue;
             }
-        }
 
-        let start_line_text = get_line(usage_node.start_position().row);
-        let end_line_text = get_line(usage_node.end_position().row);
-        let start_col =
-            byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
-        let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+            let message = match forward_ref_defined_line {
+                Some(line) => format!(
+                    "{} is used before it is defined (defined on line {})",
+                    name,
+                    line + 1
+                ),
+                None => format!("{} is not defined", name),
+            };
+            // The NSE-discoverability hint, when the flagged identifier sits inside
+            // a call argument that might be NSE-captured. It is NOT appended to the
+            // message: a per-finding "declare it with # raven: nse" suffix is
+            // verbose and easily misread as raven asserting the call IS NSE.
+            // Instead the hint rides `data` structurally; the `raven
+            // check` text report aggregates all of them into one reframed footer
+            // (see `format_nse_hint_footer`). The editor diagnostic is just the bare
+            // undefined-variable message — the NSE suggestion is `raven check`
+            // text-footer only. `dir` is the directive spelling (quotes a
+            // non-syntactic name) so the footer can copy it verbatim; `callee`
+            // retains the source spelling.
+            let nse_hint =
+                nse_hint_for_usage(usage_node, text, &nse_analysis).map(|(callee, formal)| {
+                    crate::diagnostic_code::NseHint {
+                        dir: callee_directive_form(&callee),
+                        callee,
+                        formal,
+                    }
+                });
 
-        // If the name is defined later in this same file at top level, point
-        // the user at that line — R does not hoist top-level bindings, so the
-        // use is a forward reference rather than a truly undefined symbol.
-        // `top_level_defs_by_name` is sorted ascending, so the first position
-        // strictly greater than the usage is the earliest later definition.
-        let forward_ref_defined_line = top_level_defs_by_name
-            .get(name.as_str())
-            .and_then(|positions| {
-                positions
-                    .iter()
-                    .find(|&&(line, col)| (line, col) > (usage_line, usage_col_utf16))
-            })
-            .map(|&(line, _col)| line);
-
-        // A suppressed diagnostic is discarded below, so compute the (cheap but
-        // non-trivial) NSE discoverability hint only after the suppression check.
-        if suppressed_line {
-            if let Some(out) = suppressed_out.as_deref_mut() {
-                out.push((
-                    usage_line,
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(usage_node.start_position().row as u32, start_col),
+                    end: Position::new(usage_node.end_position().row as u32, end_col),
+                },
+                severity: Some(severity),
+                message,
+                code: Some(NumberOrString::String(
                     crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
-                ));
-            }
-            continue;
-        }
-
-        let message = match forward_ref_defined_line {
-            Some(line) => format!(
-                "{} is used before it is defined (defined on line {})",
-                name,
-                line + 1
-            ),
-            None => format!("{} is not defined", name),
-        };
-        // The NSE-discoverability hint, when the flagged identifier sits inside
-        // a call argument that might be NSE-captured. It is NOT appended to the
-        // message: a per-finding "declare it with # raven: nse" suffix is
-        // verbose and easily misread as raven asserting the call IS NSE.
-        // Instead the hint rides `data` structurally; the `raven
-        // check` text report aggregates all of them into one reframed footer
-        // (see `format_nse_hint_footer`). The editor diagnostic is just the bare
-        // undefined-variable message — the NSE suggestion is `raven check`
-        // text-footer only. `dir` is the directive spelling (quotes a
-        // non-syntactic name) so the footer can copy it verbatim; `callee`
-        // retains the source spelling.
-        let nse_hint =
-            nse_hint_for_usage(usage_node, text, &nse_analysis).map(|(callee, formal)| {
-                crate::diagnostic_code::NseHint {
-                    dir: callee_directive_form(&callee),
-                    callee,
-                    formal,
-                }
+                )),
+                // A forward reference (symbol defined later in the same file) is a
+                // position variant, not a genuinely-missing symbol; tag it so the
+                // CLI metadata gate need not parse the message. The NSE hint (if
+                // any) rides the same `data` payload. A plain undefined usage with
+                // neither marker leaves `data` unset.
+                data: crate::diagnostic_code::undefined_variable_data(
+                    forward_ref_defined_line.is_some(),
+                    nse_hint.as_ref(),
+                ),
+                ..Default::default()
             });
-
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(usage_node.start_position().row as u32, start_col),
-                end: Position::new(usage_node.end_position().row as u32, end_col),
-            },
-            severity: Some(severity),
-            message,
-            code: Some(NumberOrString::String(
-                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
-            )),
-            // A forward reference (symbol defined later in the same file) is a
-            // position variant, not a genuinely-missing symbol; tag it so the
-            // CLI metadata gate need not parse the message. The NSE hint (if
-            // any) rides the same `data` payload. A plain undefined usage with
-            // neither marker leaves `data` unset.
-            data: crate::diagnostic_code::undefined_variable_data(
-                forward_ref_defined_line.is_some(),
-                nse_hint.as_ref(),
-            ),
-            ..Default::default()
-        });
-    }
+        }
+    })
 }
 
 /// Returns true when `node` is the *target* of an assignment — the LHS of
@@ -23340,7 +23378,7 @@ fn collect_usages_with_context<'a>(
 /// When a parent sources this file, the file's own exports flow into the parent's scope
 /// and back here via backward edges. For same-file symbols, we re-apply the position check
 /// so forward references are still caught.
-fn is_forward_reference_in_same_file(
+pub(crate) fn is_forward_reference_in_same_file(
     sym: &scope::ScopedSymbol,
     uri: &Url,
     usage_line: u32,
@@ -23355,7 +23393,7 @@ fn is_forward_reference_in_same_file(
 ///
 /// # Returns
 /// `true` if `name` is a recognized R builtin constant or function, `false` otherwise.
-fn is_builtin(name: &str) -> bool {
+pub(crate) fn is_builtin(name: &str) -> bool {
     // Check constants first
     if matches!(
         name,

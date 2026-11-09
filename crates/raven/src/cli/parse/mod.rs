@@ -13,6 +13,7 @@
 //! - `literals`: number types and values, string and name decoding, as R reads them.
 //! - `errors`: the `errors` list (syntax errors, literal errors and warnings).
 //! - `directives`: each comment's parsed directive.
+//! - `resolve`: what each call, and each value name, resolves to.
 //!
 //! `docs/cli.md` (`raven parse`) is the contract.
 
@@ -20,6 +21,7 @@ mod directives;
 mod document;
 mod errors;
 mod literals;
+mod resolve;
 mod statements;
 mod tree;
 
@@ -29,7 +31,8 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::Url;
 
 use crate::cli::check::{
-    PreparedWorkspace, WorkspaceSetup, prepare_workspace, resolve_workspace_root,
+    PreparedWorkspace, WorkspaceSetup, maybe_load_sysdata_fallback, prefetch_reported_packages,
+    prepare_workspace, resolve_workspace_root,
 };
 use crate::cli::graph::{display_fs_path, display_path};
 use crate::cli::shared::{
@@ -94,7 +97,8 @@ Usage: raven parse [OPTIONS] [FILES...]
 Indexes the workspace exactly as `raven check` does, then prints one JSON
 document per line for each requested `.R`/`.r` file, in the order requested:
 every statement with its source text, range, and syntax tree, every comment
-with the directive it carries, and what R's parser would reject or warn
+with the directive it carries, what each call's function resolves to (as
+`raven check`'s scope sees it), and what R's parser would reject or warn
 about. With no FILES, prints every R file in the workspace, sorted by path.
 Relative FILES resolve against the workspace root; a directory stands for the R
 files under it.
@@ -132,7 +136,7 @@ pub async fn run(args: ParseArgs) -> i32 {
             Ok(resolved) => resolved,
             Err(code) => return code,
         };
-    let prepared = match prepare_workspace(WorkspaceSetup {
+    let mut prepared = match prepare_workspace(WorkspaceSetup {
         command: "raven parse",
         root: &root,
         workspace_url: &workspace_url,
@@ -149,12 +153,31 @@ pub async fn run(args: ParseArgs) -> i32 {
     for note in &prepared.startup_notes {
         eprintln!("{note}");
     }
+    // The rest of `raven check`'s setup before it resolves names: package-mode
+    // data loaded through R, and the attached packages' exports warmed. Unlike
+    // `raven check`, which warms only the reported files' packages, warm every
+    // scanned file's: a requested file resolves names through what its callers
+    // attach.
+    maybe_load_sysdata_fallback(&mut prepared.state).await;
+    let requests = requests(&args.files, &root, &prepared);
+    let mut warm: Vec<PathBuf> = prepared.scan.discovered.clone();
+    warm.extend(requests.iter().filter_map(|request| match &request.target {
+        Target::RFile(path) => Some(path.clone()),
+        Target::Unsupported => None,
+    }));
+    prefetch_reported_packages(&prepared.state, &warm).await;
 
+    let package_data = prepared.package_data;
+    let state = &mut prepared.state;
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let mut code = EXIT_OK;
-    for request in requests(&args.files, &root, &prepared) {
+    for request in requests {
         let document = match &request.target {
-            Target::RFile(fs_path) => document::document_for_file(fs_path, request.path),
+            Target::RFile(fs_path) => {
+                document::document_for_file(fs_path, request.path, package_data, &mut |text| {
+                    resolve::workspace_names(state, fs_path, text, &root)
+                })
+            }
             Target::Unsupported => document::error_document(
                 request.path,
                 "only .R and .r files are supported".to_string(),
