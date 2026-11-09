@@ -355,6 +355,11 @@ struct AttachSites {
     sources: HashMap<Url, (u32, u32)>,
 }
 
+/// When a package was attached, compared in order: a position in the file
+/// being resolved, then, for a package a sourced file attached, its position
+/// in that file.
+type AttachRank = Vec<(u32, u32)>;
+
 struct PackageLoad {
     package: String,
     at: (u32, u32),
@@ -590,9 +595,12 @@ impl<'w> FileResolver<'w> {
     /// The packages loaded at a position of the file `uri`, whose scope
     /// there is `scope`, in R's search order: those attached in the file
     /// itself or in a file it sources, the most recently attached first
-    /// (ranked by their first `library()` call in the file, or the `source()`
-    /// call of the file that attached them); then `NAMESPACE` imports (package
-    /// mode); then those its callers attached, by name.
+    /// (ranked by their first `library()` call in the file, or by the
+    /// `source()` call of the file that attached them and then that file's
+    /// own first call); then `NAMESPACE` imports (package mode); then those
+    /// its callers attached, by name. A package a caller attached stays the
+    /// callers' even when the file attaches it again: R doesn't move an
+    /// attached package.
     fn search_order(
         &mut self,
         uri: &Url,
@@ -602,7 +610,27 @@ impl<'w> FileResolver<'w> {
     ) -> Vec<(String, Attached)> {
         let snapshot = self.snapshot();
         let at = scope::Position::new(line, column);
-        let sites = self.attach_sites(uri);
+        let origins: Vec<Url> = scope
+            .package_origins
+            .values()
+            .flatten()
+            .filter(|origin| origin.as_ref() != uri)
+            .map(|origin| origin.as_ref().clone())
+            .collect();
+        for origin in origins.iter().chain(std::iter::once(uri)) {
+            self.attach_sites(origin);
+        }
+        let all_sites = &self.attach_sites;
+        let sites = &all_sites[uri];
+        // A sourced file's own first top-level load of `package`.
+        let first_top_level_load = |origin: &Url, package: &str| {
+            all_sites[origin]
+                .loads
+                .iter()
+                .filter(|load| load.function_scope.is_none() && load.package == package)
+                .map(|load| load.at)
+                .min()
+        };
         let mut first_load: HashMap<&str, (u32, u32)> = HashMap::new();
         for load in sites.loads.iter().filter(|load| {
             load.function_scope
@@ -613,21 +641,31 @@ impl<'w> FileResolver<'w> {
                 .and_modify(|first| *first = (*first).min(load.at))
                 .or_insert(load.at);
         }
-        let rank = |package: &str| -> Option<(u32, u32)> {
-            let own = first_load.get(package).copied();
+        // Compared in order: a position in this file, then, for a package a
+        // sourced file attached, its position in that file.
+        let rank = |package: &str| -> Option<AttachRank> {
+            let own = first_load.get(package).map(|&at| vec![at]);
             let sourced = scope
                 .package_origins
                 .get(package)
                 .into_iter()
                 .flatten()
                 .filter(|origin| origin.as_ref() != uri)
-                .filter_map(|origin| sites.sources.get(origin.as_ref()).copied())
+                .filter_map(|origin| {
+                    let call = sites.sources.get(origin.as_ref())?;
+                    Some(
+                        std::iter::once(*call)
+                            .chain(first_top_level_load(origin, package))
+                            .collect(),
+                    )
+                })
                 .min();
             own.into_iter().chain(sourced).min()
         };
-        let mut here: Vec<(Option<(u32, u32)>, &String)> = scope
+        let mut here: Vec<(Option<AttachRank>, &String)> = scope
             .loaded_packages
             .iter()
+            .filter(|package| !scope.inherited_packages.contains(*package))
             .map(|package| (rank(package), package))
             .collect();
         // Most recent first; a package with no known position (attached by a
@@ -652,10 +690,7 @@ impl<'w> FileResolver<'w> {
         let mut inherited: Vec<&String> = scope
             .inherited_packages
             .iter()
-            .filter(|package| {
-                !scope.loaded_packages.contains(*package)
-                    && !snapshot.scope_contribution.full_imports.contains(*package)
-            })
+            .filter(|package| !snapshot.scope_contribution.full_imports.contains(*package))
             .collect();
         inherited.sort();
         order.extend(

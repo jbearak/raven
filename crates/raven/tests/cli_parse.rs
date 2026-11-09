@@ -404,6 +404,35 @@ fn a_later_attach_masks_an_earlier_one() {
 }
 
 #[test]
+fn a_sourced_file_attaches_in_its_own_order() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "main.R", b"source(\"setup.R\")\nclash()\n");
+    write(&ws, "setup.R", b"library(ravenpkga)\nlibrary(ravenpkgb)\n");
+    write(&ws, "rev.R", b"source(\"setup_rev.R\")\nclash()\n");
+    write(
+        &ws,
+        "setup_rev.R",
+        b"library(ravenpkgb)\nlibrary(ravenpkga)\n",
+    );
+    let docs = parse_isolated(&ws, &["main.R", "rev.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkgb"));
+    assert_eq!(*resolution_of(&docs[1], "clash", 1), package("ravenpkga"));
+}
+
+#[test]
+fn attaching_a_caller_attached_package_again_doesnt_move_it() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        b"library(ravenpkga)\nlibrary(ravenpkgb)\nsource(\"kid.R\")\n",
+    );
+    write(&ws, "kid.R", b"library(ravenpkga)\nclash()\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkgb"));
+}
+
+#[test]
 fn nested_calls_formulas_and_t_and_f_resolve() {
     let (_tmp, ws) = package_workspace();
     write(
