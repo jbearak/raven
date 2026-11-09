@@ -43,6 +43,7 @@ Raven reads these forms without any configuration:
 |---|---|
 | `source("utils.R")`, `source('utils.R')`, `source(file = "utils.R")` | Follows the file. |
 | `sys.source("utils.R", envir = globalenv())` | Follows the file. Without a global `envir`, the child's symbols don't come back to the caller. |
+| `base::source("utils.R")`, `base::sys.source("utils.R", envir = globalenv())` | Same as the unqualified call. `base:::` works too. Another package's `source()`, such as `otherpkg::source()`, isn't followed. |
 | `source(system.file("helper.R", package = "pkg"))` | Resolves to `inst/helper.R` for the package you're developing, or to the installed package's copy. |
 | `source(file.path("scripts", "helpers.R"))` | Folds a path built from fixed parts into a plain path. |
 | `if (file.exists("config.R")) source("config.R")` | Follows the file when it exists, and reports nothing when it doesn't. |
@@ -315,7 +316,7 @@ See the [settings reference](settings-reference.md) for every `raven.crossFile.*
 
 ### How Raven reads `source()` calls
 
-Raven reads `source()` and `sys.source()` with single or double quotes, a named `file =` argument, and static `local` and `chdir` values (`TRUE`/`FALSE` and the unshadowed aliases `T`/`F`). The blocks below give the exact limits of each form.
+Raven reads `source()` and `sys.source()`, bare or qualified with `base::` or `base:::`, with single or double quotes, a named `file =` argument, and static `local` and `chdir` values (`TRUE`/`FALSE` and the unshadowed aliases `T`/`F`). The blocks below give the exact limits of each form.
 
 <details markdown="1">
 <summary><code>system.file()</code> paths</summary>

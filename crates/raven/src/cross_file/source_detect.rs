@@ -594,6 +594,29 @@ fn match_source_call_arguments<'tree>(
     super::binding::match_call_arguments(args_node, content, source_formals(is_sys_source), mode)
 }
 
+/// Classify a call's callee as `source` (`Some(false)`) or `sys.source`
+/// (`Some(true)`). The bare names and their `base::` / `base:::` qualified
+/// forms all count, since R runs the same function for each. Any other
+/// namespace (`otherpkg::source`) is a different function and returns `None`.
+pub(crate) fn classify_source_callee(function: Node, content: &str) -> Option<bool> {
+    let name = match function.kind() {
+        "identifier" => function,
+        "namespace_operator" => {
+            let lhs = function.child_by_field_name("lhs")?;
+            if node_text(lhs, content) != "base" {
+                return None;
+            }
+            function.child_by_field_name("rhs")?
+        }
+        _ => return None,
+    };
+    match node_text(name, content) {
+        "source" => Some(false),
+        "sys.source" => Some(true),
+        _ => None,
+    }
+}
+
 fn try_parse_source_call<'tree, 'text>(
     node: Node<'tree>,
     content: &'text str,
@@ -602,13 +625,7 @@ fn try_parse_source_call<'tree, 'text>(
     runtime_function_scope: RuntimeFunctionScope,
 ) -> Option<ForwardSource> {
     let func_node = node.child_by_field_name("function")?;
-    let func_text = node_text(func_node, content);
-
-    let is_sys_source = match func_text {
-        "source" => false,
-        "sys.source" => true,
-        _ => return None,
-    };
+    let is_sys_source = classify_source_callee(func_node, content)?;
 
     let args_node = node.child_by_field_name("arguments")?;
     let formals = source_formals(is_sys_source);
@@ -5403,6 +5420,73 @@ source(p)
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].path, "utils.R");
         assert!(sources[0].is_sys_source);
+    }
+
+    /// `base::` and `base:::` qualified calls run the same function as the
+    /// bare names, so they detect identically; the position is the call's
+    /// start (the `base` token), as for a bare call.
+    #[test]
+    fn base_qualified_source_calls_detect_like_bare_calls() {
+        let code = "base::source(\"a.R\")\n\
+                    y <- base::source(\"b.R\", chdir = TRUE)\n\
+                    base:::source(\"c.R\", local = new.env())\n\
+                    base::sys.source(\"d.R\", envir = globalenv())\n\
+                    base::sys.source(\"e.R\", envir = new.env())\n\
+                    f <- function() base::source(\"f.R\", local = TRUE)\n";
+        let sources = detect_source_calls(&parse_r(code), code);
+        let got: Vec<_> = sources
+            .iter()
+            .map(|s| {
+                (
+                    s.path.as_str(),
+                    s.line,
+                    s.column,
+                    s.is_sys_source,
+                    s.locality,
+                    s.chdir,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a.R", 0, 0, false, SourceLocality::Global, false),
+                ("b.R", 1, 5, false, SourceLocality::Global, true),
+                ("c.R", 2, 0, false, SourceLocality::NonInheriting, false),
+                ("d.R", 3, 0, true, SourceLocality::Global, false),
+                ("e.R", 4, 0, true, SourceLocality::NonInheriting, false),
+                ("f.R", 5, 16, false, SourceLocality::CurrentFrame, false),
+            ]
+        );
+    }
+
+    /// Computed paths fold under a qualified call as under a bare one. A
+    /// later `load()` may rebind names, which blocks only a deferred use; a
+    /// qualified call's arguments run immediately, so the helper call and the
+    /// variable still fold.
+    #[test]
+    fn base_qualified_source_calls_fold_computed_paths() {
+        let code = "base::source(file.path(\"R\", \"a.R\"))\n\
+                    p <- file.path(\"R\", \"b.R\")\n\
+                    base:::sys.source(p, envir = globalenv())\n\
+                    load(\"x.RData\")\n";
+        let sources = detect_source_calls(&parse_r(code), code);
+        let paths: Vec<_> = sources.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, vec!["R/a.R", "R/b.R"]);
+    }
+
+    /// Only base's `source`/`sys.source` count: another package's function of
+    /// the same name, or another base function, isn't a source call.
+    #[test]
+    fn other_namespaces_source_is_not_a_source_call() {
+        for code in [
+            r#"otherpkg::source("x.R")"#,
+            r#"otherpkg:::sys.source("x.R", envir = globalenv())"#,
+            r#"base::sources("x.R")"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert!(sources.is_empty(), "{code}: {sources:?}");
+        }
     }
 
     #[test]

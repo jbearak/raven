@@ -477,7 +477,8 @@ fn extract_package_vector(node: Node, content: &str) -> Option<Vec<String>> {
 /// Classify a folding-helper call from its enclosing path consumer.
 ///
 /// The helper itself sits below argument/call syntax, so immediacy is decided
-/// from the nearest enclosing `source()`/`sys.source()` call or assignment.
+/// from the nearest enclosing `source()`/`sys.source()` call (bare or
+/// `base::`-qualified, as `classify_source_callee` decides) or assignment.
 /// The shared predicate then permits only top-level brace/parenthesis wrappers.
 fn helper_use_is_deferred(node: Node, content: &str) -> bool {
     let mut current = node;
@@ -489,7 +490,7 @@ fn helper_use_is_deferred(node: Node, content: &str) -> bool {
             && parent
                 .child_by_field_name("function")
                 .is_some_and(|function| {
-                    matches!(node_text(function, content), "source" | "sys.source")
+                    super::source_detect::classify_source_callee(function, content).is_some()
                 })
         {
             return !super::binding::is_known_immediate_context(parent);
