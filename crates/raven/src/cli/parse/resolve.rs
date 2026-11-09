@@ -428,8 +428,13 @@ struct FileResolver<'w> {
     /// positions. `None` for a file that can't be read.
     other_points: RefCell<HashMap<Url, Option<Rc<ScopePoints<'static>>>>>,
     /// The earliest lending call site of each distinct caller, sorted by
-    /// caller URI.
+    /// printed path.
     callers: Vec<(Url, u32, u32)>,
+    /// Whether some caller lends nothing to the file's scope: a file with a
+    /// `# raven: sourced-by` directive has its scope from the directive's
+    /// callers only (see [`scope::parent_edge_lends_scope`]), yet R runs it
+    /// from its other `source()` callers too.
+    hidden_callers: bool,
     caller_scopes: HashMap<(usize, bool), scope::ScopeAtPosition>,
     /// Each top-level definition's position in this file, by name.
     top_level_defs: Option<HashMap<String, Vec<(u32, u32)>>>,
@@ -483,16 +488,25 @@ impl<'w> FileResolver<'w> {
         points: &'w ScopePoints<'w>,
     ) -> Self {
         let snapshot = &names.snapshot;
-        let mut earliest: HashMap<Url, (u32, u32)> = HashMap::new();
+        let metadata = &snapshot.directive_meta;
+        let mode = snapshot.cross_file_config.backward_dependencies;
+        // A caller lends the scope its edges, or, for a file a `sourced-by`
+        // directive opts out of its other callers in the scope, would lend
+        // it without that opt-out (no metadata: no per-file opt-out). Such a
+        // caller is hidden: read at its earliest such edge.
+        let mut lending: HashMap<Url, (u32, u32)> = HashMap::new();
+        let mut hidden: HashMap<Url, (u32, u32)> = HashMap::new();
         for edge in snapshot.cross_file_graph.get_dependents(&names.uri) {
-            if !scope::parent_edge_lends_scope(
-                edge,
-                Some(&snapshot.directive_meta),
-                snapshot.cross_file_config.backward_dependencies,
-            ) || edge.uses_declared_only_parent_inheritance()
-            {
+            if metadata.standalone || edge.uses_declared_only_parent_inheritance() {
                 continue;
             }
+            let earliest = if scope::parent_edge_lends_scope(edge, Some(metadata), mode) {
+                &mut lending
+            } else if scope::parent_edge_lends_scope(edge, None, mode) {
+                &mut hidden
+            } else {
+                continue;
+            };
             let site = (
                 edge.call_site_line.unwrap_or(u32::MAX),
                 edge.call_site_column.unwrap_or(u32::MAX),
@@ -502,6 +516,10 @@ impl<'w> FileResolver<'w> {
                 .and_modify(|existing| *existing = (*existing).min(site))
                 .or_insert(site);
         }
+        hidden.retain(|uri, _| !lending.contains_key(uri));
+        let hidden_callers = !hidden.is_empty();
+        let mut earliest = lending;
+        earliest.extend(hidden);
         // Sort by the printed path, the order docs/cli.md promises for
         // `ambiguous` candidates. A URI's order differs for percent-encoded
         // names and for callers outside the root.
@@ -523,6 +541,7 @@ impl<'w> FileResolver<'w> {
             points,
             other_points: RefCell::new(HashMap::new()),
             callers,
+            hidden_callers,
             caller_scopes: HashMap::new(),
             top_level_defs: None,
             attach_sites: HashMap::new(),
@@ -622,10 +641,14 @@ impl<'w> FileResolver<'w> {
                 || (*layer == ScopeLayer::Global && self.inside_late_binding_function(line, column))
         });
         let mut default_export = None;
+        // Whether the callers' views were read, or this file's own frames
+        // bind the name, so that no caller can change it.
+        let mut settled = true;
         let resolution = match found {
             Some((symbol, ScopeLayer::Function)) => Some(self.local_or_classify(&symbol, name)),
             Some((symbol, _)) if is_default_attached(&symbol) => {
                 default_export = Some(symbol);
+                settled = false;
                 None
             }
             Some((symbol, ScopeLayer::Prefix)) => {
@@ -635,18 +658,48 @@ impl<'w> FileResolver<'w> {
                 let loaded = self.search_order(&uri, &packages, line, column).loaded;
                 Some(self.decided_by_callers(name, merged, &loaded, line, column))
             }
-            Some((symbol, _)) => Some(self.classify(&symbol, name)),
-            None => None,
+            Some((symbol, layer)) => {
+                settled = layer != ScopeLayer::SearchPath;
+                Some(self.classify(&symbol, name))
+            }
+            None => {
+                settled = false;
+                None
+            }
+        };
+        let resolution = match resolution {
+            Some(resolution) => Some(resolution),
+            None => match self.attached_export(stream, name, line, column) {
+                Some((resolution, Attached::Callers)) => {
+                    settled = true;
+                    Some(resolution)
+                }
+                Some((resolution, Attached::Here)) => Some(resolution),
+                None => None,
+            },
         };
         let resolution = resolution
-            .or_else(|| self.attached_export(stream, name, line, column))
             .or_else(|| default_export.map(|symbol| self.classify(&symbol, name)))
             .or_else(|| self.builtin(name));
-        match resolution {
+        let resolution = match resolution {
             Some(resolution @ Resolution::Package { .. }) => Some(resolution),
             Some(_) | None if query.value => None,
             Some(resolution) => Some(resolution),
             None => Some(self.unresolved(stream, name, line, column)),
+        };
+        // A caller the scope doesn't read (see `hidden_callers`) may define
+        // or attach what the file's own global environment doesn't bind.
+        if settled || !self.hidden_callers {
+            return resolution;
+        }
+        let packages = stream.package_snapshot();
+        let uri = self.names.uri.clone();
+        let loaded = self.search_order(&uri, &packages, line, column).loaded;
+        let merged = resolution.unwrap_or_else(|| Resolution::unresolved("not_found"));
+        match self.decided_by_callers(name, merged, &loaded, line, column) {
+            resolution @ Resolution::Package { .. } => Some(resolution),
+            _ if query.value => None,
+            resolution => Some(resolution),
         }
     }
 
@@ -713,14 +766,15 @@ impl<'w> FileResolver<'w> {
 
     /// The package export R finds for `name` among the packages attached at
     /// the cursor: this file's (and the files it sources) first, most recent
-    /// first, then its callers'.
+    /// first, then its callers' (read as [`Self::decided_by_callers`]), and
+    /// whose attachment it was.
     fn attached_export(
         &mut self,
         stream: &mut SnapshotScopeStream<'_>,
         name: &str,
         line: u32,
         column: u32,
-    ) -> Option<Resolution> {
+    ) -> Option<(Resolution, Attached)> {
         let packages = stream.package_snapshot();
         let uri = self.names.uri.clone();
         let SearchOrder { order, loaded } = self.search_order(&uri, &packages, line, column);
@@ -736,8 +790,11 @@ impl<'w> FileResolver<'w> {
             Resolution::Package { package: owner }
         };
         Some(match attached {
-            Attached::Here => found,
-            Attached::Callers => self.decided_by_callers(name, found, &loaded, line, column),
+            Attached::Here => (found, attached),
+            Attached::Callers => (
+                self.decided_by_callers(name, found, &loaded, line, column),
+                attached,
+            ),
         })
     }
 
@@ -857,8 +914,9 @@ impl<'w> FileResolver<'w> {
     /// A result decided by what the file's callers lend (a caller's
     /// definition or attachment): `merged`, as the file's merged scope has
     /// it, unless the file has callers, whose own views then decide. Callers
-    /// that disagree give `ambiguous`. `loaded` is the file's own
-    /// [`SearchOrder::loaded`].
+    /// that disagree give `ambiguous`; callers that agree on what an
+    /// unresolved `merged` leaves unresolved keep its reason. `loaded` is the
+    /// file's own [`SearchOrder::loaded`].
     fn decided_by_callers(
         &mut self,
         name: &str,
@@ -881,6 +939,12 @@ impl<'w> FileResolver<'w> {
             .iter()
             .all(|candidate| candidate.resolution == candidates[0].resolution)
         {
+            // Left unresolved: `merged` keeps its own reason.
+            if matches!(merged, Resolution::Unresolved { .. })
+                && matches!(candidates[0].resolution, Resolution::Unresolved { .. })
+            {
+                return merged;
+            }
             return candidates.swap_remove(0).resolution;
         }
         Resolution::Ambiguous { candidates }
