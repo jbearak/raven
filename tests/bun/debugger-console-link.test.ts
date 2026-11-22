@@ -90,6 +90,8 @@ class FakeConsole {
     /** canonical path -> lines */
     files = new Map<string, number[]>();
     executes: Wire[] = [];
+    /** Reply `ok` before applying, as when the summary thread lags. */
+    ok_first = false;
     private subscribers: net.Socket[] = [];
     private server: net.Server;
     constructor(readonly socket: string) {
@@ -129,6 +131,7 @@ class FakeConsole {
                 // Like set_file_breakpoints: one file at a time, each
                 // followed by a full summary (with a gap, so a client that
                 // acts on a summary before the reply is caught).
+                if (this.ok_first) this.reply(sock, msg.id, 'ok');
                 void (async () => {
                     for (const [p, list] of Object.entries(files)) {
                         await new Promise((r) => setTimeout(r, 30));
@@ -141,7 +144,7 @@ class FakeConsole {
                         const push = JSON.stringify({ event: 'breakpoints', breakpoints: states }) + '\n';
                         for (const s of this.subscribers) s.write(push);
                     }
-                    this.reply(sock, msg.id, 'ok');
+                    if (!this.ok_first) this.reply(sock, msg.id, 'ok');
                     sock.end();
                 })();
                 return;
@@ -408,10 +411,21 @@ describe('a console path the client cannot clear', () => {
         const warn = console.warn;
         const warned: unknown[][] = [];
         console.warn = (...args: unknown[]) => { warned.push(args); };
+        const stale = path.join(real(dir), "a.R");
+        const s_c = path.join(dir, 'c.R');
+        fs.writeFileSync(s_c, 'x <- 1\n');
         let mirrors = 0;
+        let clears = 0;
         const original = con['handle'].bind(con);
         con['handle'] = (s: net.Socket, msg: Wire) => {
-            if (msg.op === 'breakpoints') mirrors++;
+            if (msg.op === 'breakpoints') {
+                mirrors++;
+                const files = msg.files as Record<string, unknown[]>;
+                if (files[stale]?.length === 0 && ++clears === 1) {
+                    // An edit while the clear is applied queues another mirror.
+                    setTimeout(() => set_breakpoints([line_bp(s_c, 1)]), 0);
+                }
+            }
             original(s, msg);
         };
         try {
@@ -421,13 +435,37 @@ describe('a console path the client cannot clear', () => {
             await until(() => con.executes.length === 1, 5_000);
             expect(Date.now() - start).toBeLessThan(3_000);
             await settle(900);
-            // The first mirror, the one clear, and nothing after.
-            expect(mirrors).toBeLessThanOrEqual(3);
+            // The first mirror, the one clear, the edit, and nothing after.
+            expect(clears).toBe(1);
+            expect(mirrors).toBeLessThanOrEqual(4);
             expect(warned.filter((a) => String(a[0]).includes('could not clear')).length).toBe(1);
         } finally {
             console.warn = warn;
         }
     }, 20_000);
+});
+
+describe('a cleared file reported before its clear lands', () => {
+    test('is not logged as one the client could not clear', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(b_r, 5)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 1);
+        detach(t1);
+        set_breakpoints([]);
+        con.ok_first = true;
+        const warn = console.warn;
+        const warned: unknown[][] = [];
+        console.warn = (...args: unknown[]) => { warned.push(args); };
+        try {
+            attach(sock);
+            await until(() => con.files.size === 0);
+            await settle(600);
+            expect(warned.filter((a) => String(a[0]).includes('could not clear'))).toEqual([]);
+        } finally {
+            console.warn = warn;
+        }
+    });
 });
 
 describe('launch with program', () => {
