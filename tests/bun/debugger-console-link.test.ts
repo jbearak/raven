@@ -20,6 +20,7 @@ type Bp = { enabled: boolean };
 const bps: Bp[] = [];
 const change_listeners: Array<() => void> = [];
 const close_listeners: Array<(t: unknown) => void> = [];
+const start_listeners: Array<(s: unknown) => void> = [];
 let tracker_factory: { createDebugAdapterTracker(s: unknown): { onDidSendMessage(m: unknown): void } } | null = null;
 
 class SourceBreakpoint {
@@ -57,7 +58,7 @@ mock.module('vscode', () => ({
             return disposable();
         },
         onDidChangeBreakpoints: (cb: () => void) => { change_listeners.push(cb); return disposable(); },
-        onDidStartDebugSession: disposable,
+        onDidStartDebugSession: (cb: (s: unknown) => void) => { start_listeners.push(cb); return disposable(); },
         onDidTerminateDebugSession: disposable,
         startDebugging: async () => true,
     },
@@ -352,6 +353,16 @@ describe('breakpoints across a detach and reattach', () => {
         set_breakpoints([]);
         await until(() => con.files.size === 0);
         expect(con.files.size).toBe(0);
+    });
+
+    test('a console a debug session owns does not hold sends for the full timeout', async () => {
+        const { con, sock } = await console_at();
+        for (const l of start_listeners) l({ type: 'raven-r', id: 'live', configuration: { consoleSocket: sock } });
+        set_breakpoints([line_bp(a_r, 1)]);
+        attach(sock);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 3_000);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [1] });
     });
 
     test('a symlinked breakpoint re-added after its real path was cleared stays armed', async () => {

@@ -301,4 +301,17 @@ describe('View() writer (real R)', () => {
         expect(await cells(1)).toEqual(['1.5', null]);
         await reader.close();
     }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('a difftime column keeps its variable label and its class', async () => {
+        const r = await runR([
+            'df <- data.frame(h = as.difftime(c(1, 2), units = "hours"))',
+            'attr(df$h, "label") <- "Hours worked"',
+            'View(df)',
+        ].join('\n'));
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const f = fieldsMd(reader);
+        expect(f.h['raven.variable_label']).toBe('Hours worked');
+        expect(f.h['raven.original_class']).toBe('difftime');
+        await reader.close();
+    }, 60_000);
 });

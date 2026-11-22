@@ -309,7 +309,13 @@ local({
         # difftime: the numbers in the column's own units, as R prints them
         # and as its "<drtn unit>" type tag says (arrow would write a
         # Duration in seconds).
-        if (inherits(col, "difftime")) return(as.numeric(unclass(col)))
+        # Labels are kept, as for haven_labelled below.
+        if (inherits(col, "difftime")) {
+            x <- as.numeric(unclass(col))
+            attr(x, "label") <- attr(col, "label", exact = TRUE)
+            attr(x, "labels") <- attr(col, "labels", exact = TRUE)
+            return(x)
+        }
         if ("haven_labelled" %in% cls) {
             x <- unclass(col)
             # exact = TRUE: a bare attr(col, "label") partial-matches the
@@ -492,7 +498,9 @@ local({
         tbl <- arrow::arrow_table(df)
         per_field <- list()
         for (nm in names(df)) {
-            md <- c(.raven_field_metadata(nm, df[[nm]]), extra_field_md[[nm]])
+            md <- .raven_field_metadata(nm, df[[nm]])
+            # extra_field_md (from the columns before encoding) wins.
+            for (k in names(extra_field_md[[nm]])) md[[k]] <- extra_field_md[[nm]][[k]]
             if (length(md) > 0L) per_field[[nm]] <- md
         }
         chunk_rows <- .raven_chunk_rows(df)
@@ -645,6 +653,10 @@ local({
         for (nm in names(df)) {
             col <- df[[nm]]
             md <- list("raven.type_tag" = .raven_type_tag(col))
+            # Encoding turns a difftime into a plain number; keep its class.
+            if (inherits(col, "difftime")) {
+                md[["raven.original_class"]] <- paste(class(col), collapse = "/")
+            }
             ssd <- .raven_subsecond_digits(col)
             if (!is.null(ssd)) md[["raven.subsecond_digits"]] <- as.character(ssd)
             if (identical(nm, rowname_col)) md[["raven.rowname"]] <- "true"

@@ -296,7 +296,13 @@ class ConsoleLink {
      * console's set; the mirror at the session's end reconciles.
      */
     private reconcile(): void {
-        if (this.closed || this.reconciled || sessions.has(this.ipc)) return;
+        if (this.closed || this.reconciled) return;
+        if (sessions.has(this.ipc)) {
+            // The session owns the console's breakpoints: don't hold sends
+            // for it. The mirror at its end reconciles.
+            if (this.applied && !this.in_flight) this.mirrored_once();
+            return;
+        }
         const wanted = with_real_paths(Object.keys(editor_breakpoints().files));
         const stale = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
         if (stale.length > 0) {
