@@ -427,6 +427,26 @@ describe('package tasks follow a session console choice', () => {
         expect(second).not.toBe(first);
         expect(second.creationOptions.shellPath).toBe('R');
     });
+
+    // The fixture is a shell script.
+    test.skipIf(process.platform === 'win32')('a task requested while the first is still starting follows the new choice', async () => {
+        binary._clear_console_probes_for_test();
+        // The first task's `console --help` probe takes a moment.
+        const slow = path.join(storage, 'raven-slow-probe');
+        fs.writeFileSync(slow, '#!/bin/sh\nsleep 0.3\necho "raven console"\n', { mode: 0o755 });
+        rtm._set_server_binaries_for_test(() => ({ configured: slow, bundled: BUNDLED }));
+        fake.set_setting('raven.rTerminal.program', 'global', 'raven');
+        const first = build.get_or_create_tasks_terminal();
+        await settle(20);
+
+        picker._set_picker_for_test(async () => ({ target: 'R', scope: 'session' }));
+        await rtm.choose_r_console();
+        picker._set_picker_for_test(null);
+
+        const second = await build.get_or_create_tasks_terminal() as unknown as FakeTerminal;
+        expect(second.creationOptions.shellPath).toBe('R');
+        expect(second).not.toBe(await first);
+    });
 });
 
 // ---------------------------------------------------------------------------

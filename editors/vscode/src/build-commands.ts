@@ -162,7 +162,11 @@ export async function get_or_create_tasks_terminal(): Promise<vscode.Terminal> {
         tasks_program = null;
     }
     if (tasks_terminal) return tasks_terminal;
-    if (tasks_creation_in_flight) return tasks_creation_in_flight;
+    // Join a creation already under way, then check its terminal the same
+    // way: a console chosen for this session while it was starting (its
+    // binary probe can take a while) means a new terminal, and
+    // `create_tasks_terminal` leaves a terminal it finds stale uncached.
+    if (tasks_creation_in_flight) return tasks_creation_in_flight.then(() => get_or_create_tasks_terminal());
     tasks_creation_in_flight = create_tasks_terminal().finally(() => {
         tasks_creation_in_flight = null;
     });
