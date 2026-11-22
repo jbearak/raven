@@ -966,22 +966,62 @@ pub struct ScopeArtifacts {
     /// just the first) matters when an earlier call is function-scoped but a
     /// later top-level call must still attach for files sourced after it.
     pub dev_load_all_sites: Vec<DevLoadAllSite>,
-    /// Definitions at this file's runtime top level (outside every function
-    /// scope, but possibly inside `local()` blocks) that bind in the global
-    /// environment whatever frame runs the file: `name <<- value` /
-    /// `value ->> name` unless an outer `local()` block binds the name, and
-    /// `assign("name", value)` whose destination is proven global
-    /// (`envir = globalenv()` or `.GlobalEnv`, or `pos = 1`). In document
-    /// order.
+    /// Effects at this file's runtime top level (outside every function
+    /// scope, but possibly inside `local()` blocks) that act on the global
+    /// environment whatever frame runs the file, in document order:
+    ///
+    /// - definitions: `name <<- value` / `value ->> name` unless an outer
+    ///   `local()` block binds the name, `assign("name", value)` whose
+    ///   destination is proven global (`envir = globalenv()` or `.GlobalEnv`,
+    ///   or `pos = 1`), `delayedAssign(assign.env = globalenv())`, and
+    ///   write-mode `textConnection()` without `local = TRUE`;
+    /// - removals: `rm(envir = globalenv())` / `rm(pos = 1)`;
+    /// - `data()` loads into the global environment, both the literal stems
+    ///   (as definitions) and the call itself, so the caller can expand the
+    ///   dataset's aliases like a direct `data()` call.
     ///
     /// A caller that runs this file in a `local()` block's frame
     /// (`local({ source(file, local = TRUE) })`) keeps the file's ordinary
-    /// definitions in that block, but these still reach the caller's global
-    /// scope after the call; see `current_frame_source_reaches_global`. A
-    /// top-level `<<-` in such a file reaches the global environment because
+    /// definitions in that block, but the net effect of these reaches the
+    /// caller's global scope after the call; see
+    /// `current_frame_source_reaches_global` and `child_global_net_effects`.
+    /// A top-level `<<-` in such a file reaches the global environment because
     /// the frame running it has the global environment as its enclosure.
     /// Folded into `interface_hash`.
-    pub global_assignments: Vec<ScopedSymbol>,
+    pub global_effects: Vec<GlobalEffect>,
+}
+
+/// One entry of [`ScopeArtifacts::global_effects`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GlobalEffect {
+    /// A binding in the global environment, anchored like its `Def` event.
+    Def(ScopedSymbol),
+    /// An `rm()` from the global environment, anchored like its `Removal`
+    /// event.
+    Removal {
+        line: u32,
+        column: u32,
+        symbols: Vec<String>,
+    },
+    /// A `data()` call loading into the global environment, anchored like its
+    /// `DataLoad` event.
+    DataLoad {
+        line: u32,
+        column: u32,
+        stems: Vec<String>,
+        package: Option<String>,
+    },
+}
+
+impl GlobalEffect {
+    /// The anchor shared with this effect's timeline event.
+    fn anchor(&self) -> (u32, u32) {
+        match self {
+            GlobalEffect::Def(symbol) => (symbol.defined_line, symbol.defined_column),
+            GlobalEffect::Removal { line, column, .. }
+            | GlobalEffect::DataLoad { line, column, .. } => (*line, *column),
+        }
+    }
 }
 
 impl Default for ScopeArtifacts {
@@ -1011,7 +1051,7 @@ impl Default for ScopeArtifacts {
             escaping_effect_anchors: HashSet::new(),
             calls_dev_load_all: false,
             dev_load_all_sites: Vec::new(),
-            global_assignments: Vec::new(),
+            global_effects: Vec::new(),
         }
     }
 }
@@ -1305,12 +1345,12 @@ fn child_source_symbol_is_leak(
     symbol.source_uri == *queried_uri || child_parent_prefix_names.contains(name)
 }
 
-/// Whether a child's [`ScopeArtifacts::global_assignments`] reach this file's
+/// Whether a child's [`ScopeArtifacts::global_effects`] reach this file's
 /// global scope through a `CurrentFrame` `source()` owned by `owner`.
 ///
 /// Such a source runs the child in the calling frame. Its ordinary
 /// definitions stay in that frame (a `local()` block keeps them to itself),
-/// but its global assignments bind in the global environment. They reach the
+/// but its global effects act on the global environment. They reach the
 /// file's global scope when the frame is the top level, or a `local()` block
 /// nested only in other `local()` blocks: `outside_immediate` of the owner is
 /// then the top level. A source inside a function body is left alone, since
@@ -1325,54 +1365,166 @@ fn current_frame_source_reaches_global(
         && tree.outside_immediate(owner).is_none()
 }
 
-/// Merge a child's global assignments into the recursive resolver's flat
-/// scope, with the same parent-prefix bookkeeping as its forward child merge
-/// (#476): an identical binding is a no-op that still clears a stale marker,
-/// a parent-prefix-only name is overridden, and anything else is first-wins,
-/// or overrides under execution-order merging.
-fn merge_global_assignments_into_point_scope(
+/// Merge a child's net global effects (see [`child_global_net_effects`]) into
+/// the recursive resolver's flat scope. A net definition gets the same
+/// parent-prefix bookkeeping as the forward child merge (#476): an identical
+/// binding is a no-op that still clears a stale marker, a parent-prefix-only
+/// name is overridden, and anything else is first-wins, or overrides under
+/// execution-order merging. A net removal acts like this file's own `rm()`
+/// at the `source()` call, with the call's `visibility`.
+fn merge_global_effects_into_point_scope(
     scope: &mut ScopeAtPosition,
     forward_contributed: &mut HashSet<Arc<str>>,
     child: &ScopeArtifacts,
     queried_uri: &Url,
     execution_order: bool,
+    visibility: EventVisibility,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) {
-    for symbol in child_global_assignments(child, queried_uri) {
-        let name = &symbol.name;
-        if scope.parent_prefix_symbol_names.contains(name) {
+    let attached = scope.attached_packages.clone();
+    let effects = child_global_net_effects(child, queried_uri, data_alias_provider, || attached);
+    for (name, effect) in effects {
+        let Some(symbol) = effect else {
+            scope.symbols.remove(&name);
+            if visibility == EventVisibility::Positional {
+                scope.removed_names.insert(name);
+            }
+            continue;
+        };
+        if scope.parent_prefix_symbol_names.contains(&name) {
             forward_contributed.insert(name.clone());
         }
-        if scope.symbols.get(name) == Some(symbol) {
+        if scope.symbols.get(&name) == Some(&symbol) {
             continue;
         }
-        scope.removed_names.remove(name);
-        if scope.parent_prefix_symbol_names.remove(name) || execution_order {
-            scope.symbols.insert(name.clone(), symbol.clone());
+        scope.removed_names.remove(&name);
+        if scope.parent_prefix_symbol_names.remove(&name) || execution_order {
+            scope.symbols.insert(name, symbol);
         } else {
-            scope
-                .symbols
-                .entry(name.clone())
-                .or_insert_with(|| symbol.clone());
+            scope.symbols.entry(name).or_insert(symbol);
         }
     }
 }
 
-/// The global assignments of a child run by a `CurrentFrame` `source()` that
-/// [`current_frame_source_reaches_global`] accepts.
+/// The net effect on the global environment of a child run by a
+/// `CurrentFrame` `source()` that [`current_frame_source_reaches_global`]
+/// accepts: the child's [`ScopeArtifacts::global_effects`] folded in order,
+/// one entry per name, `Some` for a binding and `None` for a removal. A global
+/// `data()` load binds its dataset's aliases through `data_alias_provider`, as
+/// a direct call does; a bare `data(stem)` searches `attached_packages()`, the
+/// caller's packages at the `source()` call.
 ///
-/// Only the child's own top-level assignments count; sources nested inside
-/// the child are not followed. A symbol the queried file itself defines (a
+/// Only the child's own top-level effects count; sources nested inside the
+/// child are not followed. A definition from the queried file itself (a
 /// source cycle) is skipped, as in [`child_source_symbol_is_leak`]. Callers
-/// merge the rest into the global scope like their other source
-/// contributions (first source wins, a prior `rm()` is cleared).
-fn child_global_assignments<'a>(
-    child: &'a ScopeArtifacts,
-    queried_uri: &'a Url,
-) -> impl Iterator<Item = &'a ScopedSymbol> + 'a {
-    child
-        .global_assignments
-        .iter()
-        .filter(move |symbol| symbol.source_uri != *queried_uri)
+/// apply net bindings like their other source contributions (first source
+/// wins, a prior `rm()` is cleared) and net removals like an `rm()` at the
+/// call.
+fn child_global_net_effects(
+    child: &ScopeArtifacts,
+    queried_uri: &Url,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+    attached_packages: impl FnOnce() -> HashSet<String>,
+) -> Vec<(Arc<str>, Option<ScopedSymbol>)> {
+    let mut net: indexmap::IndexMap<Arc<str>, Option<ScopedSymbol>> = indexmap::IndexMap::new();
+    let mut attached_packages = Some(attached_packages);
+    let mut attached: Option<HashSet<String>> = None;
+    for effect in &child.global_effects {
+        match effect {
+            GlobalEffect::Def(symbol) => {
+                if symbol.source_uri != *queried_uri {
+                    net.insert(symbol.name.clone(), Some(symbol.clone()));
+                }
+            }
+            GlobalEffect::Removal { symbols, .. } => {
+                for name in symbols {
+                    net.insert(Arc::from(name.as_str()), None);
+                }
+            }
+            GlobalEffect::DataLoad {
+                line,
+                column,
+                stems,
+                package,
+            } => {
+                let Some(provider) = data_alias_provider else {
+                    continue;
+                };
+                let mut attached_for_call = HashSet::new();
+                if package.is_none() {
+                    attached_for_call.extend(
+                        attached
+                            .get_or_insert_with(|| {
+                                attached_packages.take().map(|f| f()).unwrap_or_default()
+                            })
+                            .iter()
+                            .cloned(),
+                    );
+                    attached_for_call.extend(child_top_level_attaches_before(
+                        child,
+                        (*line, *column),
+                        &attached_for_call,
+                    ));
+                }
+                for (name, symbol) in expand_data_load(stems, package, &attached_for_call, provider)
+                {
+                    net.insert(name, Some(symbol));
+                }
+            }
+        }
+    }
+    net.into_iter().collect()
+}
+
+/// The packages a child's top-level `library()`-style calls attach before
+/// `anchor`, in order, each gated on its `requires_attached` package against
+/// `attached` plus the attaches before it. A bare `data(stem)` in the child
+/// searches these too, since attaching is process-wide.
+fn child_top_level_attaches_before(
+    child: &ScopeArtifacts,
+    anchor: (u32, u32),
+    attached: &HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for event in &child.timeline {
+        if let ScopeEvent::PackageLoad {
+            line,
+            column,
+            package,
+            attaches: true,
+            requires_attached,
+            function_scope: None,
+            ..
+        } = event
+            && (*line, *column) < anchor
+            && requires_attached.as_deref().is_none_or(|required| {
+                attached.contains(required) || out.iter().any(|p| p == required)
+            })
+        {
+            out.push(package.clone());
+        }
+    }
+    out
+}
+
+/// Apply [`child_global_net_effects`] to a streaming frame: a net binding is
+/// first-wins and clears a prior removal, a net removal acts like an `rm()`.
+fn apply_net_global_effects_to_frame(
+    frame: &mut ScopeFrame,
+    effects: Vec<(Arc<str>, Option<ScopedSymbol>)>,
+) {
+    for (name, effect) in effects {
+        match effect {
+            Some(symbol) => {
+                frame.removed_names.remove(&name);
+                frame.symbols.entry(name).or_insert(symbol);
+            }
+            None => {
+                frame.symbols.remove(&name);
+                frame.removed_names.insert(name);
+            }
+        }
+    }
 }
 
 /// Merge one package channel while preserving the invariant that an ordinary
@@ -2192,6 +2344,11 @@ fn push_removal_event(artifacts: &mut ScopeArtifacts, rm_call: FramedRmCall) {
         artifacts
             .escaping_effect_anchors
             .insert((rm_call.call.line, rm_call.call.column));
+        artifacts.global_effects.push(GlobalEffect::Removal {
+            line: rm_call.call.line,
+            column: rm_call.call.column,
+            symbols: rm_call.call.symbols.clone(),
+        });
     }
     artifacts.timeline.push(ScopeEvent::Removal {
         line: rm_call.call.line,
@@ -2980,10 +3137,10 @@ pub fn compute_artifacts_with_metadata(
     // edit between `x <- 1` and `x <<- 1` must revalidate it even though the
     // top-level interface is unchanged. Mixed in only when present, so other
     // files keep their existing hash.
-    if !artifacts.global_assignments.is_empty() {
+    if !artifacts.global_effects.is_empty() {
         let mut hash = DefaultHasher::new();
         artifacts.interface_hash.hash(&mut hash);
-        artifacts.global_assignments.hash(&mut hash);
+        artifacts.global_effects.hash(&mut hash);
         artifacts.interface_hash = hash.finish();
     }
 
@@ -3445,7 +3602,9 @@ fn collect_definitions(
             && evaluation_frame.is_caller_or_global()
             && !outer_local_frame_binds(node, &symbol.name, line_index.text)
         {
-            artifacts.global_assignments.push(symbol.clone());
+            artifacts
+                .global_effects
+                .push(GlobalEffect::Def(symbol.clone()));
         }
         artifacts
             .exported_interface
@@ -3709,8 +3868,9 @@ fn collect_definitions(
     if call_callee == Some("data") && evaluation_frame.is_caller_or_global() {
         let (data_symbols, data_call_info) =
             try_extract_data_call_definitions(node, line_index, uri);
-        if !data_symbols.is_empty() && data_call_targets_global(node, line_index, capture_bindings)
-        {
+        let targets_global = !data_symbols.is_empty()
+            && data_call_targets_global(node, line_index, capture_bindings);
+        if targets_global {
             for symbol in &data_symbols {
                 mark_global_destination(artifacts, symbol);
             }
@@ -3743,6 +3903,14 @@ fn collect_definitions(
         // `annotate_event_function_scopes`, matching the Def idiom above.
         if let Some(DataCallInfo { stems, package }) = data_call_info {
             let (line, column) = node_start_position_utf16(node, line_index);
+            if targets_global {
+                artifacts.global_effects.push(GlobalEffect::DataLoad {
+                    line,
+                    column,
+                    stems: stems.clone(),
+                    package: package.clone(),
+                });
+            }
             artifacts.timeline.push(ScopeEvent::DataLoad {
                 line,
                 column,
@@ -4059,43 +4227,72 @@ fn local_call_body<'tree>(
 fn finalize_scope_timeline(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
     artifacts.timeline.sort_by_key(event_sort_key);
     rebuild_function_scope_index(artifacts, line_index);
-    retain_top_level_global_assignments(artifacts);
+    retain_top_level_global_effects(artifacts);
 }
 
-/// Drop [`ScopeArtifacts::global_assignments`] entries whose definition landed
-/// in a function scope (real or synthetic) once the timeline is annotated.
-/// Each entry shares its anchor with the `Def` event pushed alongside it.
-fn retain_top_level_global_assignments(artifacts: &mut ScopeArtifacts) {
-    if artifacts.global_assignments.is_empty() {
+/// Keep the [`ScopeArtifacts::global_effects`] entries whose timeline event
+/// stayed at the runtime top level (not in a real or synthetic function scope)
+/// once the timeline is annotated, and put them in document order: removals
+/// are detected in a separate pass from definitions. Each entry shares its
+/// anchor with the event pushed alongside it; the sort is stable, so the
+/// literal-stem definitions of a `data()` call stay ahead of its load.
+fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
+    if artifacts.global_effects.is_empty() {
         return;
     }
-    let top_level: HashSet<(&str, u32, u32)> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|event| match event {
+    let mut top_level_defs: HashSet<(&str, u32, u32)> = HashSet::new();
+    let mut top_level_removals: HashSet<(u32, u32)> = HashSet::new();
+    let mut top_level_data_loads: HashSet<(u32, u32)> = HashSet::new();
+    for event in &artifacts.timeline {
+        match event {
             ScopeEvent::Def {
                 line,
                 column,
                 symbol,
                 function_scope: None,
                 ..
-            } => Some((symbol.name.as_ref(), *line, *column)),
-            _ => None,
-        })
-        .collect();
-    let retained: Vec<ScopedSymbol> = artifacts
-        .global_assignments
+            } => {
+                top_level_defs.insert((symbol.name.as_ref(), *line, *column));
+            }
+            ScopeEvent::Removal {
+                line,
+                column,
+                function_scope: None,
+                ..
+            } => {
+                top_level_removals.insert((*line, *column));
+            }
+            ScopeEvent::DataLoad {
+                line,
+                column,
+                function_scope: None,
+                ..
+            } => {
+                top_level_data_loads.insert((*line, *column));
+            }
+            _ => {}
+        }
+    }
+    let mut retained: Vec<GlobalEffect> = artifacts
+        .global_effects
         .iter()
-        .filter(|symbol| {
-            top_level.contains(&(
+        .filter(|effect| match effect {
+            GlobalEffect::Def(symbol) => top_level_defs.contains(&(
                 symbol.name.as_ref(),
                 symbol.defined_line,
                 symbol.defined_column,
-            ))
+            )),
+            GlobalEffect::Removal { line, column, .. } => {
+                top_level_removals.contains(&(*line, *column))
+            }
+            GlobalEffect::DataLoad { line, column, .. } => {
+                top_level_data_loads.contains(&(*line, *column))
+            }
         })
         .cloned()
         .collect();
-    artifacts.global_assignments = retained;
+    retained.sort_by_key(GlobalEffect::anchor);
+    artifacts.global_effects = retained;
 }
 
 /// Issue #402: append nested `FunctionScope` events for Shiny deferred-
@@ -4745,12 +4942,14 @@ fn try_extract_assign_call(
 /// Record that the `Def` anchored at `symbol` binds in the global
 /// environment: it escapes an immediate `local()` body and, at the file's
 /// runtime top level, reaches a caller that runs the file in a `local()` block
-/// (see [`ScopeArtifacts::global_assignments`]).
+/// (see [`ScopeArtifacts::global_effects`]).
 fn mark_global_destination(artifacts: &mut ScopeArtifacts, symbol: &ScopedSymbol) {
     artifacts
         .escaping_effect_anchors
         .insert((symbol.defined_line, symbol.defined_column));
-    artifacts.global_assignments.push(symbol.clone());
+    artifacts
+        .global_effects
+        .push(GlobalEffect::Def(symbol.clone()));
 }
 
 /// Whether bare `globalenv` and `.GlobalEnv` still name base's global
@@ -4876,39 +5075,38 @@ fn text_connection_targets_global(node: Node, line_index: &LineIndex) -> bool {
 /// definition visible from the end of the call lets later references resolve —
 /// at top level this becomes a package-internal symbol; inside a function body
 /// the position-based scope annotation keeps it local, matching R's semantics.
-/// Only the common, statically-safe shape is handled: the first positional
-/// argument (or named `x=`) is a non-empty string literal.
+/// Only the common, statically-safe shape is handled: the name argument is a
+/// non-empty string literal. It is found the way R matches arguments: a named
+/// `x =` anywhere wins, otherwise the first unnamed argument (named arguments
+/// such as `value =` never take the positional slot), so
+/// `delayedAssign("wrong", x = "right")` binds `right`. Accepts the bare and
+/// `base::`-qualified callee.
 fn try_extract_delayed_assign_call(
     node: Node,
     line_index: &LineIndex,
     uri: &Url,
 ) -> Option<ScopedSymbol> {
     let func_node = node.child_by_field_name("function")?;
-    if node_text(func_node, line_index.text) != "delayedAssign" {
+    if !callee_is_base_function(func_node, line_index.text, "delayedAssign") {
         return None;
     }
 
     let args_node = node.child_by_field_name("arguments")?;
-    let mut name_arg = None;
-    let mut positional_index = 0;
+    let mut named_x = None;
+    let mut first_positional = None;
     for child in args_node.children(&mut args_node.walk()) {
         if child.kind() != "argument" {
             continue;
         }
         if let Some(name_node) = child.child_by_field_name("name") {
-            if node_text(name_node, line_index.text) == "x" {
-                name_arg = child.child_by_field_name("value");
-                break;
+            if named_x.is_none() && node_text(name_node, line_index.text) == "x" {
+                named_x = Some(child.child_by_field_name("value"));
             }
-        } else {
-            // First positional argument is the symbol name.
-            if positional_index == 0 {
-                name_arg = child.child_by_field_name("value");
-                break;
-            }
-            positional_index += 1;
+        } else if first_positional.is_none() {
+            first_positional = Some(child.child_by_field_name("value"));
         }
     }
+    let name_arg = named_x.or(first_positional).flatten();
 
     let name_node = name_arg?;
     if name_node.kind() != "string" {
@@ -4946,6 +5144,12 @@ fn callee_leaf_name<'a>(func: Node<'a>, text: &'a str) -> Option<&'a str> {
             .map(|rhs| node_text(rhs, text)),
         _ => None,
     }
+}
+
+/// Whether a call's `function` node names base's `name`: the bare identifier
+/// or `base::name` / `base:::name`.
+fn callee_is_base_function(func: Node, text: &str, name: &str) -> bool {
+    callee_leaf_name(func, text) == Some(name) && callee_namespace_allowed(func, text, &["base"])
 }
 
 /// The namespace qualifier of a call's `function` node: `Some("pkg")` for a
@@ -5243,7 +5447,7 @@ fn try_extract_text_connection_definition(
     uri: &Url,
 ) -> Option<ScopedSymbol> {
     let func_node = node.child_by_field_name("function")?;
-    if node_text(func_node, line_index.text) != "textConnection" {
+    if !callee_is_base_function(func_node, line_index.text, "textConnection") {
         return None;
     }
 
@@ -9208,7 +9412,8 @@ where
                     event_owner,
                     &artifacts.function_scope_tree,
                 )
-                && query.evaluate_escaping(event) != EventVisibility::Hidden
+                && let escaping_visibility = query.evaluate_escaping(event)
+                && escaping_visibility != EventVisibility::Hidden
                 && let Some(child_artifacts) =
                     forward_child_uri(*src_line, *src_col, source).and_then(|u| get_artifacts(&u))
             {
@@ -9218,12 +9423,14 @@ where
                         .depth_exceeded
                         .push((uri.clone(), *src_line, *src_col));
                 } else {
-                    merge_global_assignments_into_point_scope(
+                    merge_global_effects_into_point_scope(
                         &mut scope,
                         &mut forward_contributed,
                         &child_artifacts,
                         uri,
                         merge_policy.is_execution_order(),
+                        escaping_visibility,
+                        data_alias_provider,
                     );
                 }
             }
@@ -9261,12 +9468,14 @@ where
                                 .depth_exceeded
                                 .push((uri.clone(), *src_line, *src_col));
                         } else {
-                            merge_global_assignments_into_point_scope(
+                            merge_global_effects_into_point_scope(
                                 &mut scope,
                                 &mut forward_contributed,
                                 &child_artifacts,
                                 uri,
                                 false,
+                                visibility,
+                                data_alias_provider,
                             );
                         }
                     }
@@ -10932,15 +11141,14 @@ where
                     function_scope,
                     &self.artifacts.function_scope_tree,
                 ) {
-                    let globals =
-                        self.current_frame_global_assignments(*src_line, *src_col, source);
-                    if !globals.is_empty()
+                    let effects =
+                        self.current_frame_global_effects(*src_line, *src_col, source, || {
+                            self.attached_packages_so_far()
+                        });
+                    if !effects.is_empty()
                         && let Some(frame) = self.pick_frame_mut(None)
                     {
-                        for symbol in globals {
-                            frame.removed_names.remove(&symbol.name);
-                            frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
-                        }
+                        apply_net_global_effects_to_frame(frame, effects);
                     }
                 }
                 // Top-level CurrentFrame sources contribute nothing else. An
@@ -12052,10 +12260,12 @@ where
                 &self.artifacts.function_scope_tree,
             )
         {
-            for symbol in self.current_frame_global_assignments(*src_line, *src_col, source) {
-                frame.removed_names.remove(&symbol.name);
-                frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
-            }
+            let effects = self.current_frame_global_effects(*src_line, *src_col, source, || {
+                let mut attached: HashSet<String> = frame.attached_packages.clone();
+                attached.extend(self.choose_prefix().attached_packages.iter().cloned());
+                attached
+            });
+            apply_net_global_effects_to_frame(frame, effects);
             return;
         }
         if !event_context.is_global() {
@@ -12279,14 +12489,15 @@ where
             })
     }
 
-    /// The global assignments a top-level current-frame `source()` brings in;
-    /// see [`child_global_assignments`].
-    fn current_frame_global_assignments(
+    /// The net global effects a top-level current-frame `source()` brings in;
+    /// see [`child_global_net_effects`].
+    fn current_frame_global_effects(
         &self,
         src_line: u32,
         src_col: u32,
         source: &ForwardSource,
-    ) -> Vec<ScopedSymbol> {
+        attached_packages: impl FnOnce() -> HashSet<String>,
+    ) -> Vec<(Arc<str>, Option<ScopedSymbol>)> {
         // Same depth budget as `resolve_source_contribution`.
         if self.resolution_depth + 1 >= self.max_depth {
             return Vec::new();
@@ -12297,9 +12508,12 @@ where
         else {
             return Vec::new();
         };
-        child_global_assignments(&child, self.queried_uri)
-            .cloned()
-            .collect()
+        child_global_net_effects(
+            &child,
+            self.queried_uri,
+            self.data_alias_provider,
+            attached_packages,
+        )
     }
 
     fn resolve_source_contribution(
@@ -14288,19 +14502,114 @@ mod tests {
         }
     }
 
+    /// The names a file's [`ScopeArtifacts::global_effects`] define, in order.
+    fn global_effect_defs(artifacts: &ScopeArtifacts) -> Vec<&str> {
+        artifacts
+            .global_effects
+            .iter()
+            .filter_map(|effect| match effect {
+                GlobalEffect::Def(symbol) => Some(symbol.name.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// A global-destination effect at the top level of a file also lands in
-    /// `global_assignments`, so a caller running the file in a `local()`
-    /// block sees it; one inside a function body does not.
+    /// `global_effects`, so a caller running the file in a `local()` block
+    /// sees it; one inside a function body does not.
     #[test]
-    fn global_destination_effects_are_global_assignments() {
+    fn global_destination_effects_are_global_effects() {
         let code = "data(ds)\ntc <- textConnection(\"out\", \"w\")\ndelayedAssign(\"dv\", 1, assign.env = globalenv())\nordinary <- 1\nf <- function() data(in_fn)\n";
         let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
-        let names: Vec<&str> = artifacts
-            .global_assignments
+        assert_eq!(global_effect_defs(&artifacts), vec!["ds", "out", "dv"]);
+    }
+
+    /// Global removals and `data()` loads join the definitions in document
+    /// order, though `rm()` calls are detected in a separate pass. Removals
+    /// inside a function body, from the calling frame, or to an unproven
+    /// destination are left out.
+    #[test]
+    fn global_effects_record_removals_and_data_loads_in_order() {
+        let code = r#"rm(early, envir = globalenv())
+con <- textConnection("captured", "w")
+local({ rm(captured, envir = base::globalenv()) })
+data(api, package = "survey")
+rm(current)
+f <- function() rm(in_fn, envir = globalenv())
+local({ rm(by_pos, pos = 1) })
+"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let effects: Vec<String> = artifacts
+            .global_effects
             .iter()
-            .map(|symbol| symbol.name.as_ref())
+            .map(|effect| match effect {
+                GlobalEffect::Def(symbol) => format!("def {}", symbol.name),
+                GlobalEffect::Removal { symbols, .. } => format!("rm {}", symbols.join(",")),
+                GlobalEffect::DataLoad { stems, package, .. } => {
+                    format!("data {} {package:?}", stems.join(","))
+                }
+            })
             .collect();
-        assert_eq!(names, vec!["ds", "out", "dv"]);
+        assert_eq!(
+            effects,
+            [
+                "rm early",
+                "def captured",
+                "rm captured",
+                "def api",
+                "data api Some(\"survey\")",
+                "rm by_pos",
+            ]
+        );
+    }
+
+    /// `delayedAssign()` takes its name the way R matches arguments, and the
+    /// `base::` spellings of `delayedAssign()`, `textConnection()`, and `rm()`
+    /// work like the bare ones.
+    #[test]
+    fn delayed_assign_name_and_base_qualified_global_effect_calls() {
+        for (code, defined, undefined) in [
+            (
+                "delayedAssign(\"wrong\", x = \"right\")\n",
+                "right",
+                "wrong",
+            ),
+            ("delayedAssign(value = 1, \"named\")\n", "named", "value"),
+            (
+                "local({ delayedAssign(\"wrong\", x = \"right\", assign.env = globalenv()) })\n",
+                "right",
+                "wrong",
+            ),
+            (
+                "local({ base::delayedAssign(\"raven_x\", 42, assign.env = globalenv()) })\n",
+                "raven_x",
+                "wrong",
+            ),
+            (
+                "local({ con <- base::textConnection(\"tc\", \"w\") })\n",
+                "tc",
+                "con",
+            ),
+            (
+                "kept <- 1\ngone <- 1\nbase::local({ base::rm(gone, envir = base::globalenv()) })\n",
+                "kept",
+                "gone",
+            ),
+            ("kept <- 1\ngone <- 1\nbase::remove(gone)\n", "kept", "gone"),
+            (
+                "gone <- 1\nother::rm(gone)\nlocal({ other::delayedAssign(\"d\", 1, assign.env = globalenv()) })\n",
+                "gone",
+                "d",
+            ),
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(scope.symbols.contains_key(defined), "{code}: {defined}");
+            assert!(
+                !scope.symbols.contains_key(undefined),
+                "{code}: {undefined}"
+            );
+        }
     }
 
     #[test]
@@ -14323,7 +14632,7 @@ mod tests {
     }
 
     #[test]
-    fn global_assignments_keep_top_level_global_effects_only() {
+    fn global_effects_keep_top_level_global_definitions_only() {
         let code = r#"published <<- 1
 local({ in_local <<- 2 })
 assign("assigned", 3, envir = globalenv())
@@ -14338,13 +14647,8 @@ f <- function() { in_function <<- 10; assign("function_assigned", 11, envir = gl
 local({ caught <- 0; local({ caught <<- 12 }) })
 "#;
         let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
-        let names: Vec<&str> = artifacts
-            .global_assignments
-            .iter()
-            .map(|symbol| symbol.name.as_ref())
-            .collect();
         assert_eq!(
-            names,
+            global_effect_defs(&artifacts),
             [
                 "published",
                 "in_local",
@@ -14367,7 +14671,7 @@ local({ caught <- 0; local({ caught <<- 12 }) })
     }
 
     #[test]
-    fn current_frame_source_contributes_child_global_assignments() {
+    fn current_frame_source_contributes_child_global_definitions() {
         use crate::cross_file::dependency::DependencyGraph;
 
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
@@ -14491,6 +14795,131 @@ local({ caught <- 0; local({ caught <<- 12 }) })
         );
         assert!(!shallow.symbols.contains_key("published"));
         assert!(!shallow.depth_exceeded.is_empty());
+    }
+
+    /// A child run by `local({ source(f, local = TRUE) })` contributes the net
+    /// effect of its global definitions, global removals, and global `data()`
+    /// loads, in order: a global it creates and then removes is gone, a global
+    /// it removes and then recreates is back, a caller global it removes is
+    /// gone, and a dataset's aliases are bound as for a direct `data()` call,
+    /// with a bare `data(stem)` also searching the packages the child attached
+    /// before it.
+    #[test]
+    fn current_frame_source_contributes_net_child_global_effects() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let parent_code = "pre <- 1\n\
+                           use_later <- function() pre\n\
+                           local({ source(\"child.R\", local = TRUE) })\n\
+                           after <- 2\n";
+        let parent_artifacts = Arc::new(compute_artifacts(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+        ));
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child_code = "con <- textConnection(\"captured\", \"w\")\n\
+                          close(con)\n\
+                          rm(captured, envir = base::globalenv())\n\
+                          rm(readded, envir = globalenv())\n\
+                          readded <<- 1\n\
+                          rm(pre, envir = globalenv())\n\
+                          data(api, package = \"survey\")\n\
+                          data(shared)\n\
+                          library(pkga)\n\
+                          data(shared)\n";
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                (uri == &parent_uri).then(|| std::sync::Arc::new(parent_meta.clone()))
+            };
+        let base_exports = HashSet::new();
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_exports,
+        };
+
+        // (line, column, hoist globals). Line 1 column 25 is inside
+        // `use_later`'s body, which sees the block's effects only when
+        // hoisting is on.
+        let expected = [
+            ("captured", false),
+            ("readded", true),
+            ("pre", false),
+            ("api", true),
+            ("apiclus1", true),
+            ("shared_obj", true),
+            ("con", false),
+        ];
+        for (line, column, hoist) in [(3, 0, false), (1, 25, true)] {
+            let scope = scope_at_position_with_graph(
+                &parent_uri,
+                line,
+                column,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                hoist,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                Some(&provider),
+            );
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &parent_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                hoist,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                Some(&provider),
+            )
+            .unwrap();
+            stream.advance_to(line, column);
+            for (name, visible) in expected {
+                assert_eq!(
+                    scope.symbols.contains_key(name),
+                    visible,
+                    "recursive {name} at ({line}, {column}), hoist={hoist}"
+                );
+                assert_eq!(
+                    stream.is_visible(name),
+                    visible,
+                    "stream {name} at ({line}, {column}), hoist={hoist}"
+                );
+            }
+        }
     }
 
     #[test]

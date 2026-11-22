@@ -152,7 +152,9 @@ print(config)  # defined by R/setup.R
 assign("config", list(debug = TRUE), envir = globalenv())
 ```
 
-A non-literal name or any other `envir` defines nothing, and a read before the call is still undefined. Without an explicit environment, `assign()`, `delayedAssign()`, and `rm()` act on the block's own frame, so inside `local()` they stay in the block. `rm(name, envir = globalenv())` and `rm(name, pos = 1)` remove the global `name`, also from inside a `local()` block. Raven doesn't follow function calls, so an assignment inside a function body still only counts within that function.
+The caller sees what the child leaves in the global environment, in order. A name the child defines and then removes with `rm(name, envir = globalenv())` is gone, and so is a caller's global that the child removes.
+
+The `base::` spellings (`base::delayedAssign()`, `base::rm()`, `base::textConnection()`) work the same. `delayedAssign()` takes its name the way R matches arguments, so `delayedAssign("a", x = "b")` binds `b`. A non-literal name or any other `envir` defines nothing, and a read before the call is still undefined. Without an explicit environment, `assign()`, `delayedAssign()`, and `rm()` act on the block's own frame, so inside `local()` they stay in the block. `rm(name, envir = globalenv())` and `rm(name, pos = 1)` remove the global `name`, also from inside a `local()` block. Raven doesn't follow function calls, so an assignment inside a function body still only counts within that function.
 
 For symbols created dynamically (`eval()`, `load()`, `assign()` with a computed name), use [declaration directives](directives.md#declaration-directives).
 
