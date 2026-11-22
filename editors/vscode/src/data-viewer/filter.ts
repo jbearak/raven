@@ -158,6 +158,13 @@ async function acceptorFor(
         return (i) => values[i] === want;
     }
 
+    // A bound that isn't a number (a `null` from a lossy transport) matches
+    // nothing; comparing with it would coerce it to 0.
+    if ((predicate.kind === 'numCompare' && typeof predicate.value !== 'number')
+        || ((predicate.kind === 'numBetween' || predicate.kind === 'numNotBetween')
+            && (typeof predicate.lo !== 'number' || typeof predicate.hi !== 'number'))) {
+        return () => false;
+    }
     if (predicate.kind === 'numCompare') {
         const values = await loadNumeric(reader, columnIndex, signal);
         const v = predicate.value;
@@ -328,8 +335,17 @@ async function acceptorFor(
         const t = schema.arrowType;
         const isNumericLabelled = !isFactor && hasValueLabels
             && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
+        if (isNumericLabelled && /^U?[Ii]nt64$/.test(t)) {
+            // Int64/UInt64: exact, on the decimal text (Value Counts counts
+            // on the bigint and sends values a double can't hold as text).
+            const want = new Set(predicate.values.map(int64SetKey).filter(k => k !== undefined));
+            const values = await loadString(reader, columnIndex, signal);
+            return predicate.kind === 'setIn'
+                ? (i) => want.has(values[i])
+                : (i) => !want.has(values[i]);
+        }
         if (isNumericLabelled) {
-            const want = new Set(predicate.values.map(Number));
+            const want = new Set(predicate.values.filter(isNumberLike).map(Number));
             const values = await loadNumeric(reader, columnIndex, signal);
             return predicate.kind === 'setIn'
                 ? (i) => want.has(values[i])
@@ -351,6 +367,28 @@ async function acceptorFor(
 
     const _exhaustive: never = predicate;
     throw new Error(`filter: unhandled predicate ${(_exhaustive as { kind: string }).kind}`);
+}
+
+/** A set-filter value as an Int64 column's decimal text, or undefined
+ *  when it can't equal any integer (or isn't a value at all: a `null`
+ *  from a lossy transport must match nothing, not 0). */
+export function int64SetKey(v: unknown): string | undefined {
+    let b: bigint | undefined;
+    if (typeof v === 'number' && Number.isInteger(v)) b = BigInt(v);
+    else if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) b = BigInt(v.trim());
+    // No column value lies outside ±(2^63 − 1): -2^63 is bit64's NA, and
+    // as.integer64() turns it (or anything further out) into NA, which
+    // would match the missing rows in R.
+    if (b === undefined || b > INT64_MAX || b < -INT64_MAX) return undefined;
+    return b.toString();
+}
+const INT64_MAX = (1n << 63n) - 1n;
+
+/** A set-filter value that reads as a number: a number, or numeric text
+ *  (`"Infinity"`, `"3"`). Anything else, `null` included, is not one. */
+export function isNumberLike(v: unknown): v is number | string {
+    if (typeof v === 'number') return true;
+    return typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v));
 }
 
 /** Memo bound for {@link stringAcceptor} on non-dictionary columns. Past

@@ -118,6 +118,17 @@ describe('source display formats', () => {
         ['PERCENT8.2', -Number.MAX_VALUE, '-1.7976931348623157e+308'],
         ['Z5.', 42, '00042'],
         ['Z5.', -42, '-0042'],
+        // haven's read_xpt() spellings: no trailing dot, no default width.
+        ['PERCENT8', 0.25, '25%'],
+        ['PERCENT', 0.25, '25%'],
+        ['PERCENTN', -0.25, '-25%'],
+        ['PERCENTN10.1', -0.25, '-25.0%'],
+        ['DOLLAR', 1234.5, '$1,235'],
+        ['DOLLAR8', -5, '-$5'],
+        ['COMMA9', 1234.5, '1,235'],
+        ['COMMA', 1234.5, '1,235'],
+        ['F8', 3.6, '4'],
+        ['Z5', 42, '00042'],
     ])('%s: %p → %s', (fmt, x, want) => {
         expect(formatCell(x, withFmt(fmt), undefined, pad).text).toBe(want);
     });
@@ -127,6 +138,10 @@ describe('source display formats', () => {
         expect(parseDisplayFormat('E10.3')).toBeUndefined();
         expect(parseDisplayFormat('DATE9.')).toBeUndefined();
         expect(formatCell(1.23456, withFmt('BEST12.'), undefined, on).text).toBe('1.235');
+        expect(parseDisplayFormat('BEST12')).toBeUndefined();
+        expect(parseDisplayFormat('DATE9')).toBeUndefined();
+        expect(parseDisplayFormat('E10')).toBeUndefined();
+        expect(parseDisplayFormat('.')).toBeUndefined();
     });
     test('a fixed format still falls back to scientific rather than rounding to zero', () => {
         expect(formatCell(1e-9, withFmt('%9.2f'), undefined, on).text).toBe('1e-09');

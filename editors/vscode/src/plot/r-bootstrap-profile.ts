@@ -442,8 +442,8 @@ local({
         n <- nrow(df)
         idx <- if (n > 1000L) unique(as.integer(round(seq(1, n, length.out = 1000L)))) else seq_len(n)
         total <- 0
-        for (nm in names(df)) {
-            col <- df[[nm]]
+        for (i in seq_along(df)) {
+            col <- df[[i]]
             total <- total + if (is.factor(col) || is.integer(col) || inherits(col, "Date")) {
                 4
             } else if (is.logical(col)) {
@@ -485,7 +485,9 @@ local({
     #   block count and the last batch's length, and falls back to parsing
     #   headers when either check fails).
     # - raven.session_tz: the session zone for POSIXct without a tzone.
-    # - raven.fields: per-column metadata as one JSON object (see below),
+    # - raven.fields: per-column metadata as one JSON object keyed by
+    #   column name (see below), or, when names repeat or are empty,
+    #   raven.fields_by_position: a JSON array with one object per column,
     #   merged with extra_field_md (type tags, subsecond digits) computed
     #   from the pre-encode columns.
     .raven_write_arrow <- function(df, file_path, schema_md = list(), extra_field_md = list()) {
@@ -496,27 +498,41 @@ local({
         # under the key "raven.fields"; the JS reader unpacks it into
         # ColumnSchema fields.
         tbl <- arrow::arrow_table(df)
-        per_field <- list()
-        for (nm in names(df)) {
-            md <- .raven_field_metadata(nm, df[[nm]])
+        # By position: a name reaches only the first of two columns that
+        # share it, and no column at all when it is empty.
+        # extra_field_md is a list by position too.
+        per_field <- vector("list", length(df))
+        for (i in seq_along(df)) {
+            md <- .raven_field_metadata(names(df)[[i]], df[[i]])
             # extra_field_md (from the columns before encoding) wins.
-            for (k in names(extra_field_md[[nm]])) md[[k]] <- extra_field_md[[nm]][[k]]
-            if (length(md) > 0L) per_field[[nm]] <- md
+            extra <- if (i <= length(extra_field_md)) extra_field_md[[i]] else NULL
+            for (k in names(extra)) md[[k]] <- extra[[k]]
+            if (length(md) > 0L) per_field[[i]] <- md
         }
         chunk_rows <- .raven_chunk_rows(df)
         meta <- as.list(schema_md)
         meta[["raven.nrow"]] <- format(nrow(df), scientific = FALSE)
         meta[["raven.chunk_rows"]] <- as.character(chunk_rows)
         meta[["raven.session_tz"]] <- .raven_session_tz()
-        if (length(per_field) > 0L) {
-            entries <- vapply(names(per_field), function(nm) {
-                fld <- per_field[[nm]]
-                kv <- vapply(names(fld), function(k) {
-                    paste0(.raven_json_str(k), ":", .raven_json_str(as.character(fld[[k]])))
-                }, character(1L))
-                paste0(.raven_json_str(nm), ":{", paste(kv, collapse = ","), "}")
+        field_json <- function(fld) {
+            kv <- vapply(names(fld), function(k) {
+                paste0(.raven_json_str(k), ":", .raven_json_str(as.character(fld[[k]])))
             }, character(1L))
-            meta[["raven.fields"]] <- paste0("{", paste(entries, collapse = ","), "}")
+            paste0("{", paste(kv, collapse = ","), "}")
+        }
+        nms <- names(df)
+        if (anyDuplicated(nms) > 0L || any(!nzchar(nms))) {
+            # Names can't key the map: one object per column, in order.
+            meta[["raven.fields_by_position"]] <- paste0(
+                "[", paste(vapply(per_field, field_json, character(1L)), collapse = ","), "]")
+        } else {
+            keep <- which(lengths(per_field) > 0L)
+            if (length(keep) > 0L) {
+                entries <- vapply(keep, function(i) {
+                    paste0(.raven_json_str(nms[[i]]), ":", field_json(per_field[[i]]))
+                }, character(1L))
+                meta[["raven.fields"]] <- paste0("{", paste(entries, collapse = ","), "}")
+            }
         }
         tbl <- tbl$ReplaceSchemaMetadata(meta)
         # apache-arrow JS does not ship LZ4/Zstd codecs, so write uncompressed.
@@ -649,9 +665,10 @@ local({
         }
         # Class-derived metadata comes from the columns as the user has
         # them; encoding below strips haven_labelled and stringifies lists.
-        extra_md <- list()
-        for (nm in names(df)) {
-            col <- df[[nm]]
+        # By position throughout: names can repeat or be empty.
+        extra_md <- vector("list", length(df))
+        for (i in seq_along(df)) {
+            col <- df[[i]]
             md <- list("raven.type_tag" = .raven_type_tag(col))
             # Encoding turns a difftime into a plain number; keep its class.
             if (inherits(col, "difftime")) {
@@ -659,11 +676,11 @@ local({
             }
             ssd <- .raven_subsecond_digits(col)
             if (!is.null(ssd)) md[["raven.subsecond_digits"]] <- as.character(ssd)
-            if (identical(nm, rowname_col)) md[["raven.rowname"]] <- "true"
-            extra_md[[nm]] <- md
+            if (identical(names(df)[[i]], rowname_col)) md[["raven.rowname"]] <- "true"
+            extra_md[[i]] <- md
         }
         # Pre-encode every column.
-        for (nm in names(df)) df[[nm]] <- .raven_encode_col(df[[nm]])
+        for (i in seq_along(df)) df[[i]] <- .raven_encode_col(df[[i]])
 
         nr <- nrow(df)
         .raven_view_seq <<- .raven_view_seq + 1L

@@ -201,7 +201,9 @@ async function profileNumeric(
                 if (x > fmax) fmax = x;
             }
             reservoir.add(x);
-            if (declared) countDeclared(declared, String(x));
+            // On the exact integer: label keys of an integer64 are its
+            // decimal text, and values past 2^53 round together as doubles.
+            if (declared) countDeclared(declared, typeof raw === 'bigint' ? raw.toString() : String(x));
             if (hll === undefined) {
                 if (counter.add(raw, x)) continue;
                 // Overflow: seed the sketches from the exact counts so far.

@@ -10,6 +10,7 @@
 
 import type { Memento } from './layout-state';
 import type { FilterState } from './messages';
+import { decodeNonFinite, encodeNonFiniteIfAny } from './wire-format';
 
 const PREFIX = 'raven.dataViewer.filter::';
 const ORDER_KEY = 'raven.dataViewer.filterOrder';
@@ -25,12 +26,14 @@ export class FilterStateStore {
     }
 
     async load(panelName: string, hash: string): Promise<FilterState | undefined> {
-        return this.kv.get<FilterState>(this.compositeKey(panelName, hash));
+        // Stored as JSON, so non-finite filter values go through sentinels.
+        const state = this.kv.get<FilterState>(this.compositeKey(panelName, hash));
+        return state && decodeNonFinite(state);
     }
 
     async save(panelName: string, hash: string, state: FilterState): Promise<void> {
         const key = this.compositeKey(panelName, hash);
-        await this.kv.update(key, state);
+        await this.kv.update(key, encodeNonFiniteIfAny(state));
         const order = (this.kv.get<string[]>(ORDER_KEY) ?? []).filter(k => k !== key);
         order.push(key);
         while (order.length > this.cap) {

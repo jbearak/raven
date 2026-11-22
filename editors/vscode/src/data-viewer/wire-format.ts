@@ -43,6 +43,24 @@ export function encodeNonFinite<T>(value: T): T {
         : { $nf: Number.isNaN(x) ? 'NaN' : x > 0 ? 'Inf' : '-Inf' } satisfies NonFiniteNumber)) as T;
 }
 
+/**
+ * {@link encodeNonFinite} when `value` holds a non-finite number, else
+ * `value` itself (no copy). For messages whose payload can carry filter
+ * values typed or picked by the user (`numCompare` with `Infinity`, a
+ * Value Counts selection of `Inf`), sent in either direction, and for the
+ * filter state the host and webview persist as JSON.
+ */
+export function encodeNonFiniteIfAny<T>(value: T): T {
+    return hasNonFinite(value) ? encodeNonFinite(value) : value;
+}
+
+function hasNonFinite(v: unknown): boolean {
+    if (typeof v === 'number') return !Number.isFinite(v);
+    if (Array.isArray(v)) return v.some(hasNonFinite);
+    if (v !== null && typeof v === 'object') return Object.values(v).some(hasNonFinite);
+    return false;
+}
+
 /** Inverse of {@link encodeNonFinite}. */
 export function decodeNonFinite<T>(value: T): T {
     return mapTree(value) as T;

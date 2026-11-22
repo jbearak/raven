@@ -6,8 +6,8 @@
 // Conservative — recognizes only well-known integer-display formats:
 //
 //   Stata    %[-]?w.0f                   e.g. %9.0f, %-12.0f
-//   SAS/SPSS NAME?w.D?                   e.g. F8., F8.0, COMMA10.0,
-//                                              DOLLAR8., Z3.
+//   SAS/SPSS NAME?w?(.D?)?               e.g. F8., F8.0, COMMA10.0,
+//                                              DOLLAR8., Z3., F8, COMMA
 //
 // Other Stata/SAS/SPSS formats (general %w.0g, scientific E, BEST,
 // dates DATE/TIME/DATETIME, etc.) are intentionally NOT recognized:
@@ -30,11 +30,12 @@ export function formatDeclaresInteger(fmt: string | undefined): boolean {
     const t = fmt.trim();
     // Stata: %[-]?w.0f (fixed, zero decimals).
     if (/^%-?\d+\.0f$/.test(t)) return true;
-    // SAS / SPSS: <NAME?><width>.<decimals?>
-    const m = /^([A-Z]*)(\d+)\.(\d*)$/.exec(t);
-    if (!m) return false;
+    // SAS / SPSS: <NAME?><width?>[.<decimals?>]; haven's read_xpt() drops
+    // the trailing dot and a default width (`F8`, `COMMA`).
+    const m = /^([A-Z]*)(\d*)(?:\.(\d*))?$/.exec(t);
+    if (!m || (m[1] === '' && m[2] === '')) return false;
     const name = m[1];
-    const decimals = m[3];
+    const decimals = m[3] ?? '';
     if (!SAS_SPSS_INTEGER_NAMES.has(name)) return false;
     return decimals === '' || decimals === '0';
 }

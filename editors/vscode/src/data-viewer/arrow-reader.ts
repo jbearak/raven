@@ -318,12 +318,19 @@ export class ArrowSliceReader {
             const ravenFieldsRaw = schemaMd?.get('raven.fields');
             const ravenFields: Record<string, Record<string, string>> =
                 ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
+            // When names repeat or are empty, the writer keys per-column
+            // metadata by position instead: one object per field, in order.
+            const byPositionRaw = schemaMd?.get('raven.fields_by_position');
+            const byPositionParsed: unknown = byPositionRaw ? safeParseJson(byPositionRaw) : undefined;
+            const byPosition = Array.isArray(byPositionParsed)
+                ? byPositionParsed as (Record<string, string> | null)[]
+                : undefined;
 
             const sessionTz = schemaMd?.get('raven.session_tz') || undefined;
             const cols: ColumnInfo[] = [];
             const schemaCols: ColumnSchema[] = fields.map((f: any, i: number) => {
                 const md: Map<string, string> = f.metadata;
-                const fieldMd = ravenFields[f.name] ?? {};
+                const fieldMd = (byPosition ? byPosition[i] : ravenFields[f.name]) ?? {};
                 const lookup = (key: string): string | undefined =>
                     md.get(key) ?? fieldMd[key];
                 const arrowType = String(f.type);

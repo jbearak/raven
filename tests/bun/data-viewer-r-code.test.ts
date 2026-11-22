@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { ColumnSchema } from '../../editors/vscode/src/data-viewer/arrow-reader';
 import { generateRCode, rName, rNumber, rString, translateRegex } from '../../editors/vscode/src/data-viewer/r-code';
-import { EMPTY_FILTER, EMPTY_SORT } from '../../editors/vscode/src/data-viewer/messages';
+import { EMPTY_FILTER, EMPTY_SORT, type FilterPredicate } from '../../editors/vscode/src/data-viewer/messages';
 
 function col(name: string, arrowType: string, extra: Partial<ColumnSchema> = {}): ColumnSchema {
     return { name, arrowType, dictionaryShipped: false, isInteger: false, ...extra };
@@ -159,9 +159,11 @@ describe('generateRCode', () => {
         expect(pcre(`^[${String.fromCharCode(0xd7ff)}-${String.fromCharCode(0xe000)}]*$`)).toBeNull();
         expect(pcre('^[a-z]*$')).not.toBeNull();
         // Counts of any-character atoms differ on non-BMP text.
-        for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]'])
+        for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]', 'foo[\\W]{2}bar', '^[\\D]$', '^[a\\W]$'])
             expect([p, pcre(p)]).toEqual([p, null]);
         expect(pcre('^.+$')).not.toBeNull();
+        expect(pcre('[\\D]*')).not.toBeNull();
+        expect(pcre('^[\\w]+$')).not.toBeNull();
         expect(pcre('^[^,]*,.*$')).not.toBeNull();
         for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]', '(?<a$b>x){0,10000}', '((x){0,200}){0,200}'])
             expect([p, pcre(p)]).toEqual([p, null]);
@@ -175,5 +177,109 @@ describe('generateRCode', () => {
         });
         expect('code' in r && r.code).toContain('# Not translated: filter on when (setIn)');
         expect('code' in r && r.code).not.toContain('filter(');
+    });
+
+    test('integer64: set values compare exactly, comparisons in the doubles the viewer compares', () => {
+        const cols = [
+            col('big', 'Int64', { typeTag: '<integer64>' }),
+            col('lab', 'Int64', { typeTag: '<integer64>', valueLabels: { '9007199254740993': 'odd' } }),
+        ];
+        const entry = (columnIndex: number, predicate: FilterPredicate) =>
+            ({ id: String(columnIndex) + JSON.stringify(predicate), columnIndex, predicate, enabled: true, includeMissing: false });
+        for (const flavor of ['dplyr', 'base', 'data.table'] as const) {
+            const r = gen({
+                columns: cols,
+                filter: { entries: [
+                    entry(0, { kind: 'setIn', values: ['9007199254740993', 3] }),
+                    entry(1, { kind: 'setIn', values: ['9007199254740993'] }),
+                    entry(0, { kind: 'numCompare', op: '>=', value: 2.5 }),
+                    entry(0, { kind: 'numBetween', lo: 1, hi: Infinity, inclusive: true }),
+                ], labelsOnWhenFiltered: true },
+            }, flavor);
+            const code = 'code' in r ? r.code : r.error;
+            expect(code).toContain('# Requires ');
+            expect(code).toContain('bit64');
+            expect(code).toContain("bit64::`%in%`(big, bit64::as.integer64(c(\"9007199254740993\", \"3\")))");
+            // No unclass(): it would turn an integer64 into raw doubles.
+            expect(code).toContain("bit64::`%in%`(lab, bit64::as.integer64(\"9007199254740993\"))");
+            expect(code).toContain("bit64::as.double.integer64(big) >= 2.5");
+            expect(code).toContain("bit64::as.double.integer64(big) >= 1 & bit64::as.double.integer64(big) <= Inf");
+            expect(code).not.toContain('9007199254740992');
+        }
+    });
+
+    test('numeric sets: Inf as Inf, NaN and null left out (never 0)', () => {
+        const cols = [col('x', 'Float64', { typeTag: '<dbl+lbl>', valueLabels: { 5: 'five' } }), col('y', 'Float64', { typeTag: '<dbl>' })];
+        const r = gen({
+            columns: cols,
+            filter: { entries: [
+                { id: 'a', columnIndex: 0, predicate: { kind: 'setIn', values: [Infinity, null as unknown as number] }, enabled: true, includeMissing: false },
+                { id: 'b', columnIndex: 1, predicate: { kind: 'setIn', values: ['-Infinity', NaN] }, enabled: true, includeMissing: false },
+            ], labelsOnWhenFiltered: true },
+        }, 'base');
+        const code = 'code' in r ? r.code : r.error;
+        expect(code).toContain('unclass(x) %in% Inf');
+        expect(code).toContain('y %in% -Inf');
+        expect(code).not.toContain('Not translated');
+    });
+
+    test('dplyr refuses a dots column only when the code reads it or select() keeps it', () => {
+        const cols = [col('a', 'Int32', { typeTag: '<int>' }), col('..1', 'Int32', { typeTag: '<int>' })];
+        const f = (columnIndex: number) => ({ entries: [{ id: 'x', columnIndex, predicate: { kind: 'numCompare' as const, op: '>' as const, value: 1 }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true });
+        const ok = gen({ columns: cols, filter: f(0) });
+        expect('code' in ok && ok.code).toContain('filter(a > 1)');
+        expect(gen({ columns: cols, filter: f(1) })).toHaveProperty('error');
+        expect(gen({ columns: cols, hiddenColumns: [0] })).toHaveProperty('error');
+        expect(gen({ columns: cols, hiddenColumns: [1] })).toHaveProperty('code');
+        // tibble::rownames_to_column() refuses any dots name.
+        const withRn = [col('rowname', 'Utf8', { isRowname: true, typeTag: '<chr>' }), ...cols];
+        const rnFilter = { entries: [{ id: 'x', columnIndex: 0, predicate: { kind: 'isNotEmpty' as const }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true };
+        expect(gen({ columns: withRn, filter: rnFilter })).toHaveProperty('error');
+        expect(gen({ columns: withRn, filter: rnFilter }, 'base')).toHaveProperty('code');
+    });
+
+    test('integer64: a comparison alone still requires bit64', () => {
+        const r = gen({
+            columns: [col('big', 'Int64', { typeTag: '<integer64>' })],
+            filter: { entries: [{ id: 'x', columnIndex: 0, predicate: { kind: 'numCompare', op: '<', value: 3 }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        }, 'data.table');
+        const code = 'code' in r ? r.code : r.error;
+        expect(code).toContain('# Requires data.table, bit64');
+        expect(code).toContain('bit64::as.double.integer64(big) < 3');
+    });
+
+    test('a non-number bound (an Inf saved as null) matches nothing, missing rows by includeMissing', () => {
+        const r = gen({
+            filter: { entries: [
+                { id: 'a', columnIndex: 1, predicate: { kind: 'numCompare', op: '<', value: null as unknown as number }, enabled: true, includeMissing: true },
+                { id: 'b', columnIndex: 2, predicate: { kind: 'numBetween', lo: 1, hi: null as unknown as number, inclusive: true }, enabled: true, includeMissing: false },
+            ], labelsOnWhenFiltered: true },
+        }, 'base');
+        const code = 'code' in r ? r.code : r.error;
+        expect(code).toContain('is.na(mpg) | FALSE');
+        expect(code).not.toContain('null');
+    });
+
+    test('dplyr: hiding only an unmaterialized row-name column emits no select(), so a dots column is fine', () => {
+        const cols = [col('rowname', 'Utf8', { isRowname: true, typeTag: '<chr>' }), col('a', 'Int32', { typeTag: '<int>' }), col('...', 'Int32', { typeTag: '<int>' })];
+        const r = gen({ columns: cols, hiddenColumns: [0] });
+        expect('code' in r && r.code).not.toContain('select(');
+    });
+
+    test('isEmpty on a value-labelled column reads the unclassed values (haven_labelled_spss na_values)', () => {
+        const cols = [col('x', 'Float64', { typeTag: '<dbl+lbl>', valueLabels: { 1: 'one' } })];
+        const r = gen({
+            columns: cols,
+            filter: { entries: [{ id: 'a', columnIndex: 0, predicate: { kind: 'isEmpty' }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        }, 'base');
+        expect('code' in r && r.code).toContain('is.na(unclass(x))');
+    });
+
+    test('integer64 set keys outside ±(2^63 − 1) are dropped (as.integer64 would make them NA)', () => {
+        const r = gen({
+            columns: [col('big', 'Int64', { typeTag: '<integer64>' })],
+            filter: { entries: [{ id: 'x', columnIndex: 0, predicate: { kind: 'setIn', values: ['-9223372036854775808', '9223372036854775808', '-9223372036854775807'] }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        }, 'base');
+        expect('code' in r && r.code).toContain('bit64::`%in%`(big, bit64::as.integer64("-9223372036854775807"))');
     });
 });

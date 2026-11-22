@@ -32,8 +32,8 @@
  *   - **Columns** are referenced by name only when the name is unique
  *     and nonempty in the R object; otherwise by position (`dat[[3]]`),
  *     since a name would read the first column with it. dplyr can't
- *     filter or sort such a frame (nor touch `...`/`..1` names at all),
- *     so that flavor refuses it. Every `[` in the base R flavor is one
+ *     filter or sort such a frame, nor read a `...`/`..1` column or
+ *     select() around one it keeps, so that flavor refuses those views. Every `[` in the base R flavor is one
  *     `[.data.table` also reads as base R does (row indices, literal
  *     column positions), so it reproduces the view on a data.table too;
  *     the data.table flavor parenthesizes an `i` that is a lone symbol or
@@ -54,6 +54,7 @@
 import type { ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState, SortState, StringOrder } from './messages';
 import { keyKind } from './sort';
+import { int64SetKey, isNumberLike } from './filter';
 
 export type CodeFlavor = 'dplyr' | 'base' | 'data.table';
 
@@ -183,7 +184,7 @@ function rVector(items: string[]): string {
 const LABEL_HELPER = [
     '# Each value\'s label where it has one, else the value, as the viewer shows with Labels on',
     'label_or_value <- function(x, labels) {',
-    '  key <- as.character(unclass(x))',
+    '  key <- if (inherits(x, "integer64")) bit64::as.character.integer64(x) else as.character(unclass(x))',
     '  out <- unname(labels[key])',
     '  out[is.na(out)] <- key[is.na(out)]',
     '  out[is.na(x)] <- NA',
@@ -201,7 +202,7 @@ type Ctx = {
     frame: string;
     /** True once a rowname column is materialized as a real column. */
     rownamesAsColumn: boolean;
-    needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble'>;
+    needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble' | 'bit64'>;
     skipped: string[];
     /** Why the last untranslatable filter is left out, when known. */
     skipReason?: string;
@@ -268,7 +269,14 @@ function rownameNameOf(input: CodeInput): string {
 function valueRef(ctx: Ctx, ci: number): string {
     const col = ctx.input.columns[ci];
     const x = colRef(ctx, ci);
-    return col.valueLabels && !isFactor(col) ? `unclass(${x})` : x;
+    // An integer64 with a "labels" attribute is no haven_labelled (haven
+    // refuses integer64); unclass() would turn it into raw doubles.
+    return col.valueLabels && !isFactor(col) && !isInt64(col) ? `unclass(${x})` : x;
+}
+
+/** An Int64/UInt64 column: a `bit64::integer64` in R. */
+function isInt64(col: ColumnSchema): boolean {
+    return /^U?[Ii]nt64$/.test(col.arrowType);
 }
 
 function isFactor(col: ColumnSchema): boolean {
@@ -298,24 +306,38 @@ function predicateCode(
     const col = ctx.input.columns[entry.columnIndex];
     const x = valueRef(ctx, entry.columnIndex);
     const p: FilterPredicate = entry.predicate;
+    // The viewer compares an integer64 column as doubles (each value
+    // rounded to the nearest one); bit64 would instead truncate a
+    // fractional bound and turn an infinite one into NA. The method is
+    // called by name: plain as.double() reads the raw bits unless bit64
+    // happens to be loaded.
+    const num = isInt64(col) ? `bit64::as.double.integer64(${x})` : x;
+    if (isInt64(col) && /^num/.test(p.kind)) ctx.needs.add('bit64');
     const str = isFactor(col) ? `as.character(${x})` : x;
+    // A bound that isn't a number (an Inf saved as null) matches nothing
+    // in the viewer.
+    if ((p.kind === 'numCompare' && typeof p.value !== 'number')
+        || ((p.kind === 'numBetween' || p.kind === 'numNotBetween')
+            && (typeof p.lo !== 'number' || typeof p.hi !== 'number'))) {
+        return { code: 'FALSE', trueOnNA: false };
+    }
     switch (p.kind) {
-        case 'isEmpty': return { code: `is.na(${x})`, trueOnNA: true };
-        case 'isNotEmpty': return { code: `!is.na(${x})`, trueOnNA: false };
+        case 'isEmpty': return { code: naCode(ctx, entry.columnIndex, x), trueOnNA: true };
+        case 'isNotEmpty': return { code: `!${naCode(ctx, entry.columnIndex, x)}`, trueOnNA: false };
         case 'bool': return { code: p.value ? x : `!${x}`, trueOnNA: false };
         case 'numCompare': {
             const op = p.op === '=' ? '==' : p.op;
-            return { code: `${x} ${op} ${rNumber(p.value)}`, trueOnNA: false };
+            return { code: `${num} ${op} ${rNumber(p.value)}`, trueOnNA: false };
         }
         case 'numBetween': {
             const hiIncl = p.upperInclusive ?? p.inclusive;
-            const lo = `${x} ${p.inclusive ? '>=' : '>'} ${rNumber(p.lo)}`;
-            const hi = `${x} ${hiIncl ? '<=' : '<'} ${rNumber(p.hi)}`;
+            const lo = `${num} ${p.inclusive ? '>=' : '>'} ${rNumber(p.lo)}`;
+            const hi = `${num} ${hiIncl ? '<=' : '<'} ${rNumber(p.hi)}`;
             return { code: `${lo} & ${hi}`, trueOnNA: false };
         }
         case 'numNotBetween': {
-            const lo = `${x} ${p.inclusive ? '<' : '<='} ${rNumber(p.lo)}`;
-            const hi = `${x} ${p.inclusive ? '>' : '>='} ${rNumber(p.hi)}`;
+            const lo = `${num} ${p.inclusive ? '<' : '<='} ${rNumber(p.lo)}`;
+            const hi = `${num} ${p.inclusive ? '>' : '>='} ${rNumber(p.hi)}`;
             return { code: `(${lo} | ${hi})`, trueOnNA: false };
         }
         case 'strCompare': {
@@ -607,6 +629,8 @@ function readClass(p: string, start: number):
     if (p[i] === ']') return { reason: '`[]` means something else in R' };
     let body = '';
     let lastChar: number | null = null;
+    /** `\W` or `\D` in the class: in JS each matches a lone surrogate. */
+    let surrogateEscape = false;
     while (i < p.length && p[i] !== ']') {
         const c = p[i];
         const code = c.charCodeAt(0);
@@ -621,6 +645,7 @@ function readClass(p: string, start: number):
                 return { reason: `the escape \\${e ?? ''} in a class means something else in R` };
             }
             const isSet = /[dDwWs]/.test(e);
+            if (e === 'W' || e === 'D') surrogateEscape = true;
             // `[\d-z]`: a union with `-` in JS, an error in PCRE.
             if (isSet && p[i + 2] === '-' && p[i + 3] !== ']') {
                 return { reason: 'a range next to a class escape means something else in R' };
@@ -664,9 +689,11 @@ function readClass(p: string, start: number):
         js,
         inner: jsInner,
         end: i + 1,
-        // A range across the surrogates holds both halves of every emoji
-        // in JS but no emoji in R; it is refused above.
-        anyUnit: negated,
+        // A negated class, or one holding `\W` or `\D`, matches a lone
+        // surrogate in JS, as `\W` and `\D` outside a class do. A range
+        // across the surrogates holds both halves of every emoji in JS but
+        // no emoji in R; it is refused above.
+        anyUnit: negated || surrogateEscape,
     };
 }
 
@@ -682,27 +709,39 @@ function setCode(ctx: Ctx, ci: number, values: readonly (string | number)[], lab
         const codes = values.map(v => Number(v)).filter(Number.isInteger).map(c => rNumber(c + 1));
         return `as.integer(${x}) %in% ${codes.length > 0 ? rVector(codes) : 'integer(0)'}`;
     }
-    if (col.valueLabels && isNumericType(t)) {
-        const nums = values.map(Number).filter(v => !Number.isNaN(v)).map(rNumber);
-        return `${x} %in% ${nums.length > 0 ? rVector(nums) : 'numeric(0)'}`;
+    if (isInt64(col)) {
+        // Exact, as the viewer matches: a double literal can't hold every
+        // integer64 (`9007199254740993` would read as ...992).
+        ctx.needs.add('bit64');
+        const keys = values.map(int64SetKey).filter((k): k is string => k !== undefined);
+        // bit64's own %in%: before R 4.3, base match() compares the raw
+        // doubles, where every negative integer64 is a NaN and they all match.
+        return `bit64::\`%in%\`(${x}, bit64::as.integer64(${keys.length > 0 ? rVector(keys.map(rString)) : 'character(0)'}))`;
     }
+    if (col.valueLabels && isNumericType(t)) return numericSet(x, values);
     if (col.valueLabels && labelsOn) {
         return `${labelled(ctx, ci)} %in% ${rVector(values.map(v => rString(String(v))))}`;
     }
     if (t === 'Utf8' || t === 'LargeUtf8') {
         return `${x} %in% ${rVector(values.map(v => rString(String(v))))}`;
     }
-    if (isNumericType(t)) {
-        const nums = values.map(v => Number(v));
-        if (nums.some(Number.isNaN)) return null;
-        return `${x} %in% ${rVector(nums.map(rNumber))}`;
-    }
+    if (isNumericType(t)) return numericSet(x, values);
     if (t === 'Bool') {
         const want = values.map(v => String(v).toLowerCase());
         if (want.some(v => v !== 'true' && v !== 'false')) return null;
         return `${x} %in% ${rVector(want.map(v => (v === 'true' ? 'TRUE' : 'FALSE')))}`;
     }
     return null;
+}
+
+/** `x %in% c(...)` over a numeric column's set values. NaN is left out:
+ *  the viewer treats NaN as missing, which no value matches (R's `%in%`
+ *  would match it). So is anything that isn't a number, such as a `null`
+ *  (an `Inf` a lossy transport turned into one, which `Number()` would
+ *  make 0). `Inf` and `-Inf` are written as such. */
+function numericSet(x: string, values: readonly (string | number)[]): string {
+    const nums = values.filter(isNumberLike).map(Number).filter(v => !Number.isNaN(v)).map(rNumber);
+    return `${x} %in% ${nums.length > 0 ? rVector(nums) : 'numeric(0)'}`;
 }
 
 /** Date and date-time comparisons, in the instants the engine compares
@@ -758,10 +797,19 @@ function entryCode(ctx: Ctx, entry: FilterEntry, labelsOn: boolean): string | nu
     if (!pred) return null;
     const kind = entry.predicate.kind;
     if (kind === 'isEmpty' || kind === 'isNotEmpty') return pred.code;
-    const x = colRef(ctx, entry.columnIndex);
-    if (entry.includeMissing) return `is.na(${x}) | ${pred.code}`;
-    if (pred.trueOnNA) return `!is.na(${x}) & ${pred.code}`;
+    const na = naCode(ctx, entry.columnIndex, colRef(ctx, entry.columnIndex));
+    if (entry.includeMissing) return `${na} | ${pred.code}`;
+    if (pred.trueOnNA) return `!${na} & ${pred.code}`;
     return pred.code;
+}
+
+/** `is.na(x)` for `x`, a reference to column `ci`. For an integer64 the
+ *  method is called by name: until bit64 is loaded, plain is.na() reads
+ *  the raw bits. */
+function naCode(ctx: Ctx, ci: number, x: string): string {
+    if (!isInt64(ctx.input.columns[ci])) return `is.na(${x})`;
+    ctx.needs.add('bit64');
+    return `bit64::is.na.integer64(${x})`;
 }
 
 type SortTerm = {
@@ -806,6 +854,7 @@ function sortTerms(ctx: Ctx): SortTerm[] {
                 text = `as.character(${x})`;
                 break;
             case 'valueLabel':
+                if (isInt64(col)) ctx.needs.add('bit64');
                 text = labelled(ctx, key.columnIndex);
                 break;
             case 'string': {
@@ -906,6 +955,7 @@ function header(ctx: Ctx, extra: string[]): string[] {
     if (ctx.flavor === 'dplyr') req.push('R >= 4.1 (|>)', 'dplyr >= 1.1.0');
     if (ctx.flavor === 'data.table') req.push('data.table');
     if (ctx.needs.has('tibble')) req.push('tibble');
+    if (ctx.needs.has('bit64')) req.push('bit64');
     if (ctx.needs.has('stringr')) req.push('stringr >= 1.5.0 (str_rank)');
     if (ctx.needs.has('stringi')) req.push('stringi (a .locale other than "C")');
     const firstLine = ctx.input.expression.trim().split(/\r\n|\r|\n/)[0];
@@ -952,17 +1002,30 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
     const ambiguous = ambiguousNames(objectNames(input, rownamesAsColumn, rownameName));
     if (flavor === 'dplyr') {
         // dplyr's data mask refuses duplicate and empty names in filter()
-        // and arrange(), and dots names (`...`, `..1`) in every verb.
-        const names = objectNames(input, rownamesAsColumn, rownameName);
-        const dots = names.filter(n => n === '...' || /^\.\.[0-9]+$/.test(n));
+        // and arrange(). A dots name (`...`, `..1`) can't be read there
+        // (`.data[["..1"]]` errors too), and select() refuses one it
+        // leaves behind; an unreferenced dots column is otherwise fine.
+        const isDots = (n: string) => n === '...' || /^\.\.[0-9]+$/.test(n);
+        const nameOf = (ci: number) => (input.columns[ci].isRowname ? rownameName : input.columns[ci].name);
+        const referenced = [...entries.map(e => e.columnIndex), ...input.sort.keys.map(k => k.columnIndex)]
+            .filter(ci => input.columns[ci] && (!input.columns[ci].isRowname || rownamesAsColumn))
+            .map(nameOf);
         const hiddenSet = new Set(input.hiddenColumns);
-        const kept = ambiguousNames(objectNames(
-            { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName));
+        const keptNames = objectNames(
+            { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName);
+        const kept = ambiguousNames(keptNames);
+        const names = objectNames(input, rownamesAsColumn, rownameName);
+        // A hidden row-name column that isn't materialized emits no select().
+        const selects = input.hiddenColumns.some(ci => input.columns[ci]
+            && (!input.columns[ci].isRowname || rownamesAsColumn));
         const refused = [...new Set([
             ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
+            // tibble::rownames_to_column() refuses any dots name.
+            ...(rownamesAsColumn ? names.filter(isDots) : []),
             // select() itself refuses duplicates it leaves behind.
-            ...(input.hiddenColumns.length > 0 ? kept : []),
-            ...(entries.length > 0 || input.sort.keys.length > 0 || input.hiddenColumns.length > 0 ? dots : []),
+            ...(selects ? kept : []),
+            ...referenced.filter(isDots),
+            ...(selects ? keptNames.filter(isDots) : []),
         ])];
         if (refused.length > 0) {
             const list = refused.map(n => (n === '' ? 'an empty name' : `"${rComment(n)}"`)).join(', ');

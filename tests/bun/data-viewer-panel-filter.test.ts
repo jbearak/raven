@@ -1292,3 +1292,74 @@ describe('DataViewerPanel: effective permutation cache (F3)', () => {
         expect(reply.rows[0][0]).toBe(1);
     });
 });
+
+// VS Code's webview transport is JSON, which turns Infinity into null.
+// The webview encodes non-finite filter values, the host decodes them,
+// echoes them back encoded, and persists them encoded.
+describe('DataViewerPanel: non-finite filter values over JSON', () => {
+    const json = <T>(v: T): T => JSON.parse(JSON.stringify(v));
+    test('y < Inf keeps the finite and -Inf rows; the echo and the saved filter keep Inf', async () => {
+        const { encodeNonFiniteIfAny, decodeNonFinite } = await import('../../editors/vscode/src/data-viewer/wire-format');
+        const { fakeWebview, filterStore } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        // tiny.arrow y: 1.5, NA, NaN, Inf, -Inf.
+        const entries = [{
+            id: 'e1', columnIndex: 1, predicate: { kind: 'numCompare', op: '<', value: Infinity },
+            enabled: true, includeMissing: false,
+        }];
+        fakeWebview.deliverFromWebview(json(encodeNonFiniteIfAny({
+            type: 'setFilters', panelGeneration: init.panelGeneration, requestId: 90, entries, labelsOn: true,
+        })));
+        await flush();
+        const applied = fakeWebview.posted.find(m => m.type === 'filterApplied' && m.requestId === 90) as any;
+        expect(applied.nrowFiltered).toBe(2);
+        expect(decodeNonFinite(json(applied.filter)).entries[0].predicate.value).toBe(Infinity);
+
+        const filter = { entries, labelsOnWhenFiltered: true };
+        fakeWebview.deliverFromWebview(json(encodeNonFiniteIfAny({
+            type: 'saveFilter', panelGeneration: init.panelGeneration, schemaHash: init.schemaHash, filter,
+        })));
+        await flush();
+        const kvJson = new (filterStore.constructor as any)({
+            get: (k: string) => json((filterStore as any).kv.get(k)),
+            update: async () => {},
+        }, 100);
+        const saved = await kvJson.load('tiny', init.schemaHash);
+        expect(saved.entries[0].predicate.value).toBe(Infinity);
+    });
+
+    test('a null bound (an unencoded Inf) matches nothing rather than 0', async () => {
+        const { fakeWebview } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        fakeWebview.deliverFromWebview(json({
+            type: 'setFilters', panelGeneration: init.panelGeneration, requestId: 91, labelsOn: true,
+            entries: [{ id: 'e1', columnIndex: 1, predicate: { kind: 'numCompare', op: '<', value: Infinity }, enabled: true, includeMissing: false }],
+        }));
+        await flush();
+        const applied = fakeWebview.posted.find(m => m.type === 'filterApplied' && m.requestId === 91) as any;
+        expect(applied.nrowFiltered).toBe(0);
+    });
+
+    test('editing y < Inf to y < -Inf refilters (cache keys keep the sign)', async () => {
+        const { encodeNonFiniteIfAny } = await import('../../editors/vscode/src/data-viewer/wire-format');
+        const { fakeWebview } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const apply = async (requestId: number, value: number) => {
+            fakeWebview.deliverFromWebview(json(encodeNonFiniteIfAny({
+                type: 'setFilters', panelGeneration: init.panelGeneration, requestId, labelsOn: true,
+                entries: [{ id: 'e1', columnIndex: 1, predicate: { kind: 'numCompare', op: '<', value }, enabled: true, includeMissing: false }],
+            })));
+            await flush();
+            return (fakeWebview.posted.find(m => m.type === 'filterApplied' && m.requestId === requestId) as any)?.nrowFiltered;
+        };
+        expect(await apply(92, Infinity)).toBe(2);
+        expect(await apply(93, -Infinity)).toBe(0);
+        expect(await apply(94, Infinity)).toBe(2);
+    });
+});

@@ -27,7 +27,7 @@ import {
     SortState,
     WebviewToExtension,
 } from './messages';
-import { encodeNonFinite } from './wire-format';
+import { decodeNonFinite, encodeNonFinite, encodeNonFiniteIfAny } from './wire-format';
 import { composeEffectivePermutation } from './effective-permutation';
 import { isAbortError, isInterruption } from './abort';
 import { isNumericArrowType } from './histograms';
@@ -115,7 +115,8 @@ function workerEngineFactory(extensionUri: vscode.Uri, log: (line: string) => vo
 }
 
 function specKey(sort: SortState, filter: FilterState): string {
-    return JSON.stringify([sort.keys, sort.stringOrder ?? 'natural', filter.entries]);
+    // encodeNonFinite: JSON.stringify writes Inf, -Inf and NaN all as null.
+    return JSON.stringify(encodeNonFinite([sort.keys, sort.stringOrder ?? 'natural', filter.entries]));
 }
 
 function cloneSortState(sort: SortState): SortState {
@@ -353,9 +354,21 @@ export class DataViewerPanel {
         this.webviewPanel.onDidChangeViewState?.(e => {
             this.profileScheduler?.setActive(e.webviewPanel.visible);
         });
+        // The webview encodes non-finite filter values (`Infinity` from a
+        // typed bound or a Value Counts pick), which JSON would turn into
+        // `null`; see `post` for the other direction.
         this.webviewPanel.webview.onDidReceiveMessage(
-            (m: WebviewToExtension) => { void this.handle(m); },
+            (m: WebviewToExtension) => { void this.handle(decodeNonFinite(m)); },
         );
+    }
+
+    /** Post to the webview. A message's `filter` (init, replace, rows,
+     *  filterApplied, restorePending) can hold non-finite filter values,
+     *  which go through sentinels; nothing else is copied. */
+    private post(msg: ExtensionToWebview): Thenable<boolean> {
+        const filter = (msg as { filter?: unknown }).filter;
+        const encoded = filter === undefined ? filter : encodeNonFiniteIfAny(filter);
+        return this.webviewPanel.webview.postMessage(encoded === filter ? msg : { ...msg, filter: encoded });
     }
 
     /** Host mirror of the committed sort's row order: the committed
@@ -471,7 +484,7 @@ export class DataViewerPanel {
                     panelGeneration: this.generation,
                     updates: encodeNonFinite(updates),
                 };
-                void this.webviewPanel.webview.postMessage(msg);
+                void this.post(msg);
             },
             // Interrupted, not failed: a cancel or a worker restart (a
             // regex cancel or a deadline terminates the scan worker) is
@@ -632,7 +645,7 @@ export class DataViewerPanel {
         const reader = this.reader;
         const perm = this.coordinator.permFor(m.transformGeneration);
         const reply = (r: Omit<Extract<ExtensionToWebview, { type: 'findResult' }>, 'type' | 'panelGeneration' | 'requestId'>) =>
-            this.webviewPanel.webview.postMessage({
+            this.post({
                 type: 'findResult', panelGeneration: gen, requestId: m.requestId, ...r,
             } satisfies ExtensionToWebview);
         if (perm === null) {
@@ -670,7 +683,7 @@ export class DataViewerPanel {
         const found = this.findMatches;
         if (!found) return;
         const index = this.pickMatch(found.positions, m.from, m.direction);
-        await this.webviewPanel.webview.postMessage({
+        await this.post({
             type: 'findResult',
             panelGeneration: gen,
             requestId: m.requestId,
@@ -691,7 +704,7 @@ export class DataViewerPanel {
             if (perm === undefined) position = target;
             else if (perm !== null) position = perm.indexOf(target);
         }
-        await this.webviewPanel.webview.postMessage({
+        await this.post({
             type: 'rowPosition', panelGeneration: gen, requestId: m.requestId, rowNumber: m.rowNumber, position,
             ...(m.transformGeneration !== undefined ? { transformGeneration: m.transformGeneration } : {}),
         } satisfies ExtensionToWebview);
@@ -728,7 +741,7 @@ export class DataViewerPanel {
         }
         if (gen !== this.generation) return;
         const flavor = m.flavor === 'base' ? 'base R' : m.flavor;
-        await this.webviewPanel.webview.postMessage({
+        await this.post({
             type: 'notice',
             panelGeneration: gen,
             ok,
@@ -1093,7 +1106,7 @@ export class DataViewerPanel {
                 // count; the webview learns the effective count from
                 // filterApplied (metadata.nrow stays the full dataset size).
                 if (this.filteredIndices) {
-                    await this.webviewPanel.webview.postMessage({
+                    await this.post({
                         type: 'filterApplied',
                         panelGeneration: generation,
                         requestId: -1,
@@ -1179,7 +1192,7 @@ export class DataViewerPanel {
         // The webview drops its profiles on every init/replace and
         // re-sends its interest.
         this.profileScheduler?.resetClient();
-        await this.webviewPanel.webview.postMessage(msg);
+        await this.post(msg);
         this.dictionariesSentFor = this.reader;
         this.recordSortSnapshot(0);
         this.recordFilterSnapshot(0);
@@ -1205,7 +1218,7 @@ export class DataViewerPanel {
                 counts: Array.from(counts),
                 done,
             };
-            void this.webviewPanel.webview.postMessage(msg);
+            void this.post(msg);
         };
         if (this.nullCountCache?.reader === reader) {
             post(this.nullCountCache.counts, true);
@@ -1282,7 +1295,7 @@ export class DataViewerPanel {
         // FIFO queue. Catch so a post to an already-disposed webview cannot
         // surface as an unhandled rejection (every other restore post is
         // awaited inside paintWithRestore's try).
-        void this.webviewPanel.webview.postMessage({
+        void this.post({
             type: 'restorePending',
             panelGeneration: generation,
             restoreId: this.restoreId,
@@ -1980,7 +1993,7 @@ export class DataViewerPanel {
                     rows: out.rows.length,
                     stale: out.stale,
                 });
-                await this.webviewPanel.webview.postMessage(reply);
+                await this.post(reply);
                 return;
             }
             case 'getLabels': {
@@ -1993,7 +2006,7 @@ export class DataViewerPanel {
                     columnIndex: m.columnIndex,
                     labels,
                 };
-                await this.webviewPanel.webview.postMessage(reply);
+                await this.post(reply);
                 return;
             }
             case 'setProfileInterest': {
@@ -2010,7 +2023,7 @@ export class DataViewerPanel {
                         type: 'valueCounts', panelGeneration: gen, requestId: m.requestId, columnIndex: ci,
                         ...encodeNonFinite(body),
                     };
-                    void this.webviewPanel.webview.postMessage(msg);
+                    void this.post(msg);
                 };
                 if (!Number.isInteger(ci) || ci < 0 || ci >= reader.schema.columns.length) {
                     reply({ error: `no column ${ci}` });
@@ -2112,7 +2125,7 @@ export class DataViewerPanel {
                     columnIndex: ci,
                     bins,
                 };
-                await this.webviewPanel.webview.postMessage(reply);
+                await this.post(reply);
                 return;
             }
             case 'copy': {
@@ -2139,7 +2152,7 @@ export class DataViewerPanel {
                     text: got.text,
                     truncated: got.truncated,
                 };
-                await this.webviewPanel.webview.postMessage(reply);
+                await this.post(reply);
                 return;
             }
             case 'copyText': {
@@ -2210,7 +2223,7 @@ export class DataViewerPanel {
                     fromPersistence: false,
                     rollback: true,
                 };
-                void this.webviewPanel.webview.postMessage(ack)
+                void this.post(ack)
                     .then(undefined, () => undefined);
             }
             return;
@@ -2229,7 +2242,7 @@ export class DataViewerPanel {
         const abort = new AbortController();
         this.sortAbort = abort;
         if (m.keys.length > 0) {
-            await this.webviewPanel.webview.postMessage({
+            await this.post({
                 type: 'sortStatus',
                 panelGeneration: gen,
                 requestId: m.requestId,
@@ -2270,7 +2283,7 @@ export class DataViewerPanel {
         };
         const engine = this.engine;
         if (pending && engine.takeScanRestarted()) {
-            void this.webviewPanel.webview.postMessage({
+            void this.post({
                 type: 'sortStatus', panelGeneration: gen, requestId: m.requestId,
                 state: 'pending', rebuildingKeys: true,
             } satisfies ExtensionToWebview).then(undefined, () => undefined);
@@ -2281,7 +2294,7 @@ export class DataViewerPanel {
             && m.keys.some(k => isStringKey(this.columns[k.columnIndex], m.labelsOn))
             ? setTimeout(() => {
                 if (superseded()) return;
-                void this.webviewPanel.webview.postMessage({
+                void this.post({
                     type: 'sortStatus', panelGeneration: gen, requestId: m.requestId,
                     state: 'pending', slow: true,
                 } satisfies ExtensionToWebview).then(undefined, () => undefined);
@@ -2317,12 +2330,12 @@ export class DataViewerPanel {
         done();
         if (gen !== this.generation || reader !== this.reader || this.disposed) return;
         if (pending) {
-            await this.webviewPanel.webview.postMessage({
+            await this.post({
                 type: 'sortStatus', panelGeneration: gen, requestId: m.requestId, state: 'idle',
             } satisfies ExtensionToWebview);
         }
         this.recordSortSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
-        void this.webviewPanel.webview.postMessage({
+        void this.post({
             type: 'sortApplied',
             panelGeneration: gen,
             requestId: m.requestId,
@@ -2345,7 +2358,7 @@ export class DataViewerPanel {
         const stale = () => gen !== this.generation || reader !== this.reader
             || mySortGen !== this.sortGeneration || this.disposed;
         if (m.keys.length > 0) {
-            await this.webviewPanel.webview.postMessage({
+            await this.post({
                 type: 'sortStatus', panelGeneration: gen, requestId: m.requestId, state: 'idle',
             } satisfies ExtensionToWebview);
         }
@@ -2361,7 +2374,7 @@ export class DataViewerPanel {
         }
         if (gen !== this.generation || reader !== this.reader || this.disposed) return;
         this.recordSortSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
-        void this.webviewPanel.webview.postMessage({
+        void this.post({
             type: 'sortApplied',
             panelGeneration: gen,
             requestId: m.requestId,
@@ -2422,7 +2435,7 @@ export class DataViewerPanel {
                     fromPersistence: false,
                     rollback: true,
                 };
-                void this.webviewPanel.webview.postMessage(ack)
+                void this.post(ack)
                     .then(undefined, () => undefined);
             }
             return;
@@ -2437,7 +2450,7 @@ export class DataViewerPanel {
         const next: FilterState = { entries: m.entries, labelsOnWhenFiltered: m.labelsOn };
         const clearing = m.entries.length === 0 || m.entries.every(e => !e.enabled);
         if (!clearing) {
-            await this.webviewPanel.webview.postMessage({
+            await this.post({
                 type: 'filterStatus', panelGeneration: gen, requestId: m.requestId, state: 'pending',
             } satisfies ExtensionToWebview);
         }
@@ -2483,7 +2496,7 @@ export class DataViewerPanel {
         } catch (err) {
             if (superseded() || isAbortError(err)) { done(); return; }
             if (pending) {
-                await this.webviewPanel.webview.postMessage({
+                await this.post({
                     type: 'filterStatus', panelGeneration: gen, requestId: m.requestId, state: 'idle',
                 } satisfies ExtensionToWebview);
             }
@@ -2502,7 +2515,7 @@ export class DataViewerPanel {
             done();
             if (gen !== this.generation || reader !== this.reader || this.disposed) return;
             this.recordFilterSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
-            void this.webviewPanel.webview.postMessage({
+            void this.post({
                 type: 'filterApplied',
                 panelGeneration: gen,
                 requestId: m.requestId,
@@ -2523,12 +2536,12 @@ export class DataViewerPanel {
         done();
         if (gen !== this.generation || reader !== this.reader || this.disposed) return;
         if (pending) {
-            await this.webviewPanel.webview.postMessage({
+            await this.post({
                 type: 'filterStatus', panelGeneration: gen, requestId: m.requestId, state: 'idle',
             } satisfies ExtensionToWebview);
         }
         this.recordFilterSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
-        void this.webviewPanel.webview.postMessage({
+        void this.post({
             type: 'filterApplied',
             panelGeneration: gen,
             requestId: m.requestId,
@@ -2545,7 +2558,7 @@ export class DataViewerPanel {
         ok: boolean,
         error?: string,
     ): Promise<void> {
-        await this.webviewPanel.webview.postMessage({
+        await this.post({
             type: 'copyDone',
             panelGeneration: gen,
             requestId: m.requestId,
@@ -2668,7 +2681,7 @@ export class DataViewerPanel {
             panelGeneration: this.generation,
             key,
         };
-        await this.webviewPanel.webview.postMessage(msg);
+        await this.post(msg);
     }
 
     /** Test-only: post a `testScrollToFraction` message to the webview
@@ -2689,7 +2702,7 @@ export class DataViewerPanel {
             panelGeneration: this.generation,
             fraction: clampedFraction,
         };
-        await this.webviewPanel.webview.postMessage(msg);
+        await this.post(msg);
     }
 
     /** Column names in schema order — used by the test harness. */
@@ -2752,7 +2765,8 @@ function build_html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 }
 
 function sameJson(a: unknown, b: unknown): boolean {
-    return JSON.stringify(a) === JSON.stringify(b);
+    // encodeNonFinite: JSON.stringify writes Inf, -Inf and NaN all as null.
+    return JSON.stringify(encodeNonFinite(a)) === JSON.stringify(encodeNonFinite(b));
 }
 
 /** Whether sorting `column` goes through a string rank (so its order

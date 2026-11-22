@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
+import { formatCell } from '../../editors/vscode/src/data-viewer/display-format';
 import {
     generate_profile_source,
     write_profile_file,
@@ -314,6 +315,88 @@ describe('View() writer (real R)', () => {
         expect(f.h['raven.variable_label']).toBe('Hours worked');
         expect(f.h['raven.original_class']).toBe('difftime');
         expect(JSON.parse(f.h['raven.value_labels'])).toEqual({ '1': 'short' });
+        await reader.close();
+    }, 60_000);
+
+    // haven's read_xpt() drops the trailing dot and a default width
+    // (`PERCENT8`, `PERCENTN`, `DOLLAR`), so the formats the viewer reads
+    // after a normal XPT import are these spellings.
+    test.skipIf(!HAS_HAVEN)('SAS formats after a write_xpt / read_xpt round trip', async () => {
+        const fmts: [string, number, string][] = [
+            ['PERCENT8.2', 0.25, '25.00%'],
+            ['PERCENT8.', 0.25, '25%'],
+            ['PERCENT.', -0.25, '(25%)'],
+            ['PERCENTN10.1', -0.25, '-25.0%'],
+            ['PERCENTN.', 0.25, '25%'],
+            ['DOLLAR10.2', 1234.5, '$1,234.50'],
+            ['DOLLAR.', 1234.5, '$1,235'],
+            ['COMMA10.2', 1234.5, '1,234.50'],
+            ['COMMA9.', 1234.5, '1,235'],
+            ['F8.', 3.6, '4'],
+            ['Z5.', 42, '00042'],
+            // Not in the table: the toolbar digits.
+            ['BEST12.', 1.23456, '1.235'],
+        ];
+        const r = await runR([
+            `fmts <- c(${fmts.map(f => JSON.stringify(f[0])).join(', ')})`,
+            `vals <- c(${fmts.map(f => String(f[1])).join(', ')})`,
+            'df <- as.data.frame(setNames(as.list(vals), paste0("v", seq_along(vals))))',
+            'for (i in seq_along(fmts)) attr(df[[i]], "format.sas") <- fmts[i]',
+            // Dates come back as Date, whatever their format.
+            'df$d <- as.Date("2024-03-05"); attr(df$d, "format.sas") <- "DATE9."',
+            'p <- tempfile(fileext = ".xpt"); haven::write_xpt(df, p)',
+            'x <- haven::read_xpt(p)',
+            'cat("FORMATS=", paste(vapply(x, function(c) attr(c, "format.sas"), ""), collapse = ","), "\\n", sep = "")',
+            'View(x)',
+        ].join('\n'));
+        // The spellings haven produces, for the record.
+        expect(r.stdout).toContain('FORMATS=PERCENT8.2,PERCENT8,PERCENT,PERCENTN10.1,PERCENTN,DOLLAR10.2,DOLLAR,COMMA10.2,COMMA9,F8,Z5,BEST12,DATE9');
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const cols = reader.schema.columns;
+        const batch = await reader.getBatch(0);
+        for (let i = 0; i < fmts.length; i++) {
+            const x = batch.getChildAt(i)!.get(0) as number;
+            expect([cols[i].format, formatCell(x, cols[i], undefined, { labelsOn: true, formatOn: true, digits: 3 }).text])
+                .toEqual([fmts[i][0].replace(/\.$/, ''), fmts[i][2]]);
+        }
+        expect(cols[fmts.length].arrowType.startsWith('Date')).toBe(true);
+        await reader.close();
+    }, 60_000);
+
+    // The writer addresses columns by position: a name would reach the
+    // first of two columns that share it, or no column for an empty name.
+    test.skipIf(!HAS_ARROW)('duplicate names: each column gets its own conversion and metadata', async () => {
+        const r = await runR([
+            'df <- data.frame(id = 1:2)',
+            'df$a <- as.difftime(c(1, 2), units = "hours")',
+            'df$b <- as.difftime(c(1, 2), units = "mins")',
+            'attr(df$b, "label") <- "Minutes"',
+            'names(df) <- c("id", "d", "d")',
+            'View(df)',
+        ].join('\n'));
+        expect(r.files).toHaveLength(1);
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const cols = reader.schema.columns;
+        expect(cols.map(c => c.name)).toEqual(['id', 'd', 'd']);
+        expect(cols.map(c => c.typeTag)).toEqual(['<int>', '<drtn hours>', '<drtn mins>']);
+        expect(cols.map(c => c.variableLabel)).toEqual([undefined, undefined, 'Minutes']);
+        const cell = async (row: number, col: number) => (await reader.getCellText(row, col, 100)).text;
+        expect([await cell(0, 1), await cell(0, 2), await cell(1, 2)]).toEqual(['1', '1', '2']);
+        await reader.close();
+    }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('an empty column name opens', async () => {
+        const r = await runR([
+            'df <- data.frame(id = 1:3, x = c(10, 20, 30), y = c("a", "b", "c"))',
+            'names(df)[2] <- ""',
+            // R echoes its input, so the marker is assembled at run time.
+            'tryCatch(View(df), error = function(e) cat(paste0("VIEW_", "ERROR="), conditionMessage(e), sep = ""))',
+        ].join('\n'));
+        expect(r.stdout).not.toContain('VIEW_ERROR');
+        expect(r.files).toHaveLength(1);
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        expect(reader.schema.columns.map(c => [c.name, c.typeTag])).toEqual([['id', '<int>'], ['', '<dbl>'], ['y', '<chr>']]);
+        expect((await reader.getCellText(2, 1, 100)).text).toBe('30');
         await reader.close();
     }, 60_000);
 });

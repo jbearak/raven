@@ -54,7 +54,7 @@ const { App } = await import('../../editors/vscode/src/data-viewer/webview/App')
 const { ValueCountsPopover } = await import('../../editors/vscode/src/data-viewer/webview/value-counts-popover');
 const { setFilterFor, sidebarRows, profileStatLines, entryCell } = await import('../../editors/vscode/src/data-viewer/webview/summary-model');
 const { formatCell } = await import('../../editors/vscode/src/data-viewer/display-format');
-const { encodeNonFinite } = await import('../../editors/vscode/src/data-viewer/wire-format');
+const { encodeNonFinite, encodeNonFiniteIfAny, decodeNonFinite } = await import('../../editors/vscode/src/data-viewer/wire-format');
 
 /**
  * Phase 4 in the webview: profile interest (what the band and sidebar
@@ -361,5 +361,45 @@ describe('value counts', () => {
         expect(document.querySelector('.value-counts-count')!.textContent).toBe('≈ 40 ± 3');
         expect((document.querySelector('.value-counts-controls input') as HTMLInputElement).disabled).toBe(true);
         expect(document.body.textContent).toContain('approximate order');
+    });
+});
+
+describe('non-finite filter values over the JSON transport', () => {
+    test('an Inf set value survives host → webview, webview → host and setState', async () => {
+        const json = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
+        const posted: any[] = [];
+        const states: any[] = [];
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+        const root = createRoot(container);
+        roots.push(root);
+        // What VS Code delivers: JSON copies, both ways.
+        const vscode = {
+            postMessage: (msg: any) => { posted.push(json(msg)); },
+            setState: (st: any) => { states.push(json(st)); },
+        };
+        await act(async () => { root.render(<App vscode={vscode} />); });
+        // Built with Labels off, shown with Labels on: the webview re-applies it.
+        const filter = {
+            entries: [{ id: 'e1', columnIndex: 0, predicate: { kind: 'setIn', values: [Infinity, -Infinity] }, enabled: true, includeMissing: false }],
+            labelsOnWhenFiltered: false,
+        };
+        await send(json(encodeNonFiniteIfAny(init({ filter }))));
+        await wait(300);
+        // The chip shows the values, not undecoded sentinels.
+        const strip = document.querySelector('[class*=chip]')!.textContent ?? '';
+        expect(strip).toContain('Infinity, -Infinity');
+        expect(strip).not.toContain('object');
+        const req = posted.filter(m => m.type === 'setFilters').at(-1);
+        expect(req).toBeDefined();
+        expect(decodeNonFinite(req).entries[0].predicate.values).toEqual([Infinity, -Infinity]);
+        const st = states.at(-1);
+        expect(decodeNonFinite(st).filter.entries[0].predicate.values).toEqual([Infinity, -Infinity]);
+    });
+
+    test('pure: a labelled column\'s Inf pick builds a filter with Inf', () => {
+        const col = { name: 'x', arrowType: 'Float64', dictionaryShipped: false, isInteger: false, valueLabels: { 5: 'five' } };
+        const p = setFilterFor(col as any, 'labelled', [{ value: Infinity, count: 1, error: 0 }] as any, true);
+        expect(p).toEqual({ kind: 'setIn', values: [Infinity] });
     });
 });

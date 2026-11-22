@@ -45,7 +45,7 @@ import {
     type ProfileUpdate,
     type ValueCounts,
 } from '../profile';
-import { decodeNonFinite, type Cell } from '../wire-format';
+import { decodeNonFinite, encodeNonFiniteIfAny, type Cell } from '../wire-format';
 import { TileCache, tileGeometry } from './tile-cache';
 import { StatusLine, createRangeStore, createVersionStore } from './status-line';
 import { formatCell, type FormattedCell } from './cell-render';
@@ -353,7 +353,7 @@ function sameColumns(a: readonly ColumnSchema[], b: readonly ColumnSchema[]): bo
 }
 
 export function App({
-    vscode,
+    vscode: vscodeApi,
     initialState,
     onRender,
 }: {
@@ -364,7 +364,21 @@ export function App({
     onRender?: () => void;
 }) {
     onRender?.();
-    const restored = initialState as PersistedState | undefined;
+    // Messages and persisted state are JSON, which turns a non-finite
+    // number into `null`; filter values can be `Infinity` (a typed bound,
+    // a Value Counts pick), so they go through sentinels both ways.
+    const vscode = useMemo<VscodeApi>(() => ({
+        postMessage: msg => vscodeApi.postMessage(encodeNonFiniteIfAny(msg)),
+        ...(vscodeApi.setState
+            ? { setState: (state: PersistedState) => vscodeApi.setState!(encodeNonFiniteIfAny(state)) }
+            : {}),
+    }), [vscodeApi]);
+    const restored = useMemo(
+        () => (initialState === undefined ? undefined : decodeNonFinite(initialState as PersistedState)),
+        // Read once, on mount.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [],
+    );
     const theme = useGridTheme();
     const vscodeTheme = theme.grid;
     const rowHeight = rowHeightFor(theme.fontSizePx);
@@ -1598,8 +1612,12 @@ export function App({
                 handleTestKey, scrollToFraction, showCopyToast,
                 applyFindResult, applyRowPosition, showNotice,
             } = handlersRef.current;
-            const m = event.data;
-            if (!m || typeof m !== 'object') return;
+            const raw = event.data;
+            if (!raw || typeof raw !== 'object') return;
+            // The host encodes non-finite filter values (see `post` in panel.ts).
+            const m = 'filter' in raw && typeof raw.filter === 'object'
+                ? { ...raw, filter: decodeNonFinite(raw.filter) } as typeof raw
+                : raw;
             const currentGeneration = panelGenerationRef.current;
             if ('panelGeneration' in m && m.panelGeneration < currentGeneration) return;
             if ('panelGeneration' in m && bootstrappingRef.current) {

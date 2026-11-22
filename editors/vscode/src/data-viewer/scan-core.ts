@@ -46,6 +46,7 @@ import type { CountSummary } from './profile-engine';
 import type { ColumnProfile, ValueCounts } from './profile';
 import { allocPerm, MemoryCounter, sharePerm } from './perm-buffer';
 import { findSourceRows, toDisplayPositions } from './find';
+import { encodeNonFinite } from './wire-format';
 import type { FindQuery } from './find';
 
 /** Everything that determines an effective permutation. */
@@ -345,7 +346,8 @@ export class ScanCore {
 }
 
 function entryKey(e: FilterEntry, ctx: FilterContext): string {
-    return JSON.stringify([e.columnIndex, e.predicate, e.includeMissing, ctx.labelsOn]);
+    // encodeNonFinite: JSON.stringify writes Inf, -Inf and NaN all as null.
+    return JSON.stringify(encodeNonFinite([e.columnIndex, e.predicate, e.includeMissing, ctx.labelsOn]));
 }
 
 function errorText(err: unknown): string {

@@ -425,3 +425,103 @@ edgeSuite('Copy as R code round trip: logical columns and data.table objects (re
         { name: 'hide all but id', hide: [1, 2] },
         { name: 'b is TRUE, hide b and s', filters: [{ ci: 1, p: { kind: 'bool', value: true } }], hide: [1, 2] },
     ]);
+
+// integer64: set values are decimal strings the double can't hold
+// (Value Counts counts on the bigint), so the code compares them as
+// integer64; comparisons and ranges round the column to double, as the
+// viewer does. `lab` carries integer64 value labels.
+edgeSuite('Copy as R code round trip: integer64 (real R)',
+    `df <- data.frame(id = 1:3)
+df$big <- bit64::as.integer64(c("9007199254740992", "9007199254740993", "9007199254740993"))
+df$small <- bit64::as.integer64(c("2", "3", NA))
+lab <- df$big
+labs <- bit64::as.integer64(c("9007199254740992", "9007199254740993"))
+names(labs) <- c("even", "odd")
+attr(lab, "labels") <- labs
+df$lab <- lab
+df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
+    ['df', 'dtobj'],
+    [
+        { name: 'big in one exact value', filters: [{ ci: 1, p: { kind: 'setIn', values: ['9007199254740993'] } }] },
+        { name: 'big not in one exact value', filters: [{ ci: 1, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
+        { name: 'big > 2^53', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 9007199254740992 } }] },
+        { name: 'big = 2^53', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: 9007199254740992 } }] },
+        { name: 'big between 2^53 and 2^53', filters: [{ ci: 1, p: { kind: 'numBetween', lo: 9007199254740992, hi: 9007199254740992, inclusive: true } }] },
+        { name: 'small >= 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
+        { name: 'small = 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '=', value: 2.5 } }] },
+        { name: 'small < Inf', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
+        { name: 'small not between 2.5 and 9', filters: [{ ci: 2, p: { kind: 'numNotBetween', lo: 2.5, hi: 9, inclusive: true } }] },
+        { name: 'small in 3 (a number)', filters: [{ ci: 2, p: { kind: 'setIn', values: ['3'] } }] },
+        { name: 'labelled: odd', filters: [{ ci: 3, p: { kind: 'setIn', values: ['9007199254740993'] } }] },
+        { name: 'labelled: even (a safe number)', filters: [{ ci: 3, p: { kind: 'setIn', values: [9007199254740992] } }] },
+        { name: 'labelled: not odd', filters: [{ ci: 3, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
+        { name: 'sort by big desc', sort: [{ ci: 1, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
+        { name: 'sort by label', sort: [{ ci: 3, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
+        { name: 'neg in -1', filters: [{ ci: 4, p: { kind: 'setIn', values: [-1] } }] },
+        { name: 'neg not in -2', filters: [{ ci: 4, p: { kind: 'setNotIn', values: ['-2'] } }] },
+        // -2^63 is bit64's NA: it must not select the missing row.
+        { name: 'neg in -2^63', filters: [{ ci: 4, p: { kind: 'setIn', values: ['-9223372036854775808'] } }] },
+    ]);
+
+// Comparisons alone, in a session where nothing has loaded bit64 yet:
+// plain as.double() would read an integer64's raw bits.
+// One R session per case: the first bit64 call loads it for the rest.
+const I64_FRAME = `df <- data.frame(id = 1:3)
+df$small <- bit64::as.integer64(c("2", "3", NA))`;
+const I64_FRESH: EdgeCase[] = [
+    { name: 'small >= 2.5', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
+    { name: 'small not in 3', filters: [{ ci: 1, p: { kind: 'setNotIn', values: ['3'] } }] },
+    { name: 'small > 2 or missing', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 2 }, includeMissing: true }] },
+    { name: 'small is empty', filters: [{ ci: 1, p: { kind: 'isEmpty' } }] },
+];
+for (const c of I64_FRESH) {
+    edgeSuite(`Copy as R code round trip: integer64 with bit64 not loaded, ${c.name} (real R)`, I64_FRAME, ['df'], [c]);
+}
+
+// Infinite values picked in Value Counts: a labelled double (labels on 5)
+// and a plain one.
+edgeSuite('Copy as R code round trip: infinite set values (real R)',
+    `df <- data.frame(id = 1:5)
+x <- c(Inf, 0, 5, -Inf, NaN)
+attr(x, "labels") <- c(five = 5)
+df$x <- x
+df$y <- c(Inf, 0, 5, -Inf, NaN)`,
+    ['df', 'dtobj'],
+    [
+        { name: 'labelled: Inf', filters: [{ ci: 1, p: { kind: 'setIn', values: [Infinity] } }] },
+        { name: 'labelled: not -Inf', filters: [{ ci: 1, p: { kind: 'setNotIn', values: [-Infinity] } }] },
+        { name: 'labelled: NaN or missing', filters: [{ ci: 1, p: { kind: 'setIn', values: [NaN] }, includeMissing: true }] },
+        { name: 'plain: Inf, -Inf (text from Value Counts)', filters: [{ ci: 2, p: { kind: 'setIn', values: ['Infinity', '-Infinity'] } }] },
+        { name: 'plain: < Inf', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
+        { name: 'plain: between -Inf and 0', filters: [{ ci: 2, p: { kind: 'numBetween', lo: -Infinity, hi: 0, inclusive: true } }] },
+    ]);
+
+// Empty and duplicate names through the real writer (which addresses
+// columns by position): the code reaches each column by position.
+edgeSuite('Copy as R code round trip: empty and duplicate names from the writer (real R)',
+    `df <- data.frame(id = 1:3, x = c(30, 10, 20), y = c(1, 2, 3))
+names(df)[2] <- ""
+df$d <- as.difftime(c(2, 1, 3), units = "hours")
+df$e <- as.difftime(c(60, 180, 120), units = "mins")
+names(df)[4:5] <- c("d", "d")`,
+    ['df', 'dtobj'],
+    [
+        { name: 'filter the empty-named column', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 15 } }], refuse: ['dplyr'] },
+        { name: 'sort by the second d (minutes)', sort: [{ ci: 4, dir: 'asc' }], refuse: ['dplyr'] },
+        { name: 'filter the first d (hours)', filters: [{ ci: 3, p: { kind: 'numCompare', op: '>=', value: 2 } }], refuse: ['dplyr'] },
+        { name: 'hide the empty-named column', hide: [1], refuse: ['dplyr'] },
+    ]);
+
+// Dots names (`..1`, `...`): dplyr can't read one or select() around one it
+// keeps, but an unreferenced one doesn't stop filter() or arrange().
+edgeSuite('Copy as R code round trip: dots column names (real R)',
+    'df <- setNames(data.frame(1:3, c(3L, 1L, 2L), 4:6, 7:9), c("id", "a", "..1", "..."))',
+    ['df', 'dtobj'],
+    [
+        { name: 'filter a, ..1 unreferenced', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 1 } }] },
+        { name: 'sort by a, ..1 unreferenced', sort: [{ ci: 1, dir: 'asc' }] },
+        { name: 'hide both dots columns', hide: [2, 3] },
+        { name: 'filter ..1', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>', value: 4 } }], refuse: ['dplyr'] },
+        { name: 'sort by ...', sort: [{ ci: 3, dir: 'desc' }], refuse: ['dplyr'] },
+        { name: 'hide a, keep ..1', hide: [1], refuse: ['dplyr'] },
+    ]);
