@@ -26,6 +26,8 @@ import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
  * - Breakpoints are mirrored to every console while no session exists, so
  *   code run before the first stop is already instrumented. VS Code's own
  *   `setBreakpoints` takes over inside a session; both carry the same set.
+ *   Each connection to a console makes the console's set exactly the
+ *   editor's, clearing files armed by an earlier connection (`ConsoleLink`).
  * - Sessions the extension starts are `launch` sessions, so the toolbar shows
  *   Stop, which quits the browser (`Q`), as stopping a Python or Node
  *   program does. A user-configured `attach` shows Disconnect, which lets R
@@ -92,12 +94,8 @@ export function exception_filters(stored: string[] | undefined): string[] {
     return stored ?? ['error'];
 }
 
-/**
- * What the extension tells a console about breakpoints while no session
- * exists. Every file in `previous` without breakpoints now is sent as empty,
- * which clears it.
- */
-function mirror_payload(previous: Set<string>): { msg: object; files: Set<string> } {
+/** The editor's enabled R line breakpoints by file, and its function breakpoints. */
+function editor_breakpoints(): { files: Record<string, object[]>; functions: string[] } {
     const files: Record<string, object[]> = {};
     const functions: string[] = [];
     for (const bp of vscode.debug.breakpoints) {
@@ -115,6 +113,30 @@ function mirror_payload(previous: Set<string>): { msg: object; files: Set<string
             functions.push(bp.functionName);
         }
     }
+    return { files, functions };
+}
+
+/**
+ * Every spelling under which the console may report a file the editor has
+ * breakpoints in: the editor's path and its real path (the console reports
+ * `canonicalize`d paths; macOS's /tmp and /var are symlinks).
+ */
+function editor_breakpoint_paths(): Set<string> {
+    const out = new Set<string>();
+    for (const f of Object.keys(editor_breakpoints().files)) {
+        out.add(f);
+        try { out.add(fs.realpathSync.native(f)); } catch { /* file gone: the console keeps the path as given */ }
+    }
+    return out;
+}
+
+/**
+ * What the extension tells a console about breakpoints while no session
+ * exists. Every file in `previous` without breakpoints now is sent as empty,
+ * which clears it.
+ */
+function mirror_payload(previous: Set<string>): { msg: object; files: Set<string> } {
+    const { files, functions } = editor_breakpoints();
     const now = new Set(Object.keys(files));
     for (const p of previous) if (!now.has(p)) files[p] = [];
     const filters = exception_filters(context_ref?.workspaceState.get<string[]>(FILTERS_KEY));
@@ -158,17 +180,43 @@ function update_status(): void {
     status_item.show();
 }
 
-/** The control connection to one console: stop events in, breakpoint mirror out. */
+/**
+ * A path that is never an R file, sent (as empty) in every mirror. The
+ * console pushes its full line-breakpoint summary only after it applies a
+ * file entry, so this makes every mirror answer with one, even when the
+ * editor has no line breakpoints left.
+ */
+export function probe_path(ipc: string): string {
+    return path.join(path.dirname(ipc), 'breakpoint-probe');
+}
+
+/**
+ * The control connection to one console: stop events in, breakpoint mirror
+ * out.
+ *
+ * Each connection brings the console's breakpoints to exactly the editor's,
+ * including files that no longer have any. A console can outlive the
+ * connection that armed it (a Perch console is detached and reattached; a
+ * window reloads), and the IPC protocol only replaces breakpoints file by
+ * file, so the link can't know from its own history which files to clear.
+ * It asks the console instead: every mirror carries `probe_path`, the
+ * console answers with its summary, and any file in that summary the editor
+ * has no breakpoints in is cleared by the next mirror (`reconcile`).
+ */
 class ConsoleLink {
     /** The console's line breakpoint states, as last pushed. */
     states: BreakpointState[] = [];
     private control: net.Socket | null = null;
     /**
-     * Every file any mirror has carried breakpoints for. Never shrinks, so a
+     * Every file any mirror has carried breakpoints for, plus every file the
+     * console reported that the editor doesn't have. Never shrinks, so a
      * removal is sent even when the mirror that added the file is still in
      * flight (re-sending an empty file is harmless).
      */
     private mirrored = new Set<string>();
+    /** The console has pushed a summary on this connection. */
+    private heard = false;
+    private reprobed = false;
     /** One mirror at a time, so the console applies them in order. */
     private in_flight = false;
     private again = false;
@@ -191,9 +239,9 @@ class ConsoleLink {
         sock.setEncoding('utf8');
         this.control = sock;
         let buf = '';
+        let subscribed = false;
         sock.on('connect', () => {
             sock.write(JSON.stringify({ v: 1, id: 0, op: 'subscribe' }) + '\n');
-            this.mirror();
         });
         sock.on('data', (chunk: string) => {
             buf += chunk;
@@ -201,17 +249,43 @@ class ConsoleLink {
             while ((nl = buf.indexOf('\n')) >= 0) {
                 const line = buf.slice(0, nl);
                 buf = buf.slice(nl + 1);
-                let msg: { event?: string; breakpoints?: BreakpointState[] };
+                let msg: { event?: string; status?: string; breakpoints?: BreakpointState[] };
                 try { msg = JSON.parse(line); } catch { continue; }
+                if (!subscribed && msg.status !== undefined) {
+                    // Mirror only once subscribed, so the summary the
+                    // mirror provokes reaches this connection.
+                    subscribed = true;
+                    this.mirror();
+                }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
                 if (msg.event === 'breakpoints') {
+                    this.heard = true;
                     this.states = msg.breakpoints ?? [];
                     update_status();
+                    this.reconcile();
                 }
             }
         });
         sock.on('error', () => undefined);
         sock.on('close', () => { this.control = null; });
+    }
+
+    /**
+     * Clear the files the console reported that the editor has no
+     * breakpoints in. Inside a session VS Code's `setBreakpoints` own the
+     * console's set; the mirror at the session's end reconciles.
+     */
+    private reconcile(): void {
+        if (this.closed || sessions.has(this.ipc)) return;
+        const wanted = editor_breakpoint_paths();
+        const stale = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
+        if (stale.length === 0) {
+            // Sends held for this console may run now.
+            this.mirrored_once();
+            return;
+        }
+        for (const p of stale) this.mirrored.add(p);
+        this.mirror();
     }
 
     /**
@@ -229,9 +303,23 @@ class ConsoleLink {
     }
 
     private send_mirror(attempt: number): void {
-        const finish = () => {
+        const finish = (applied = false) => {
             this.in_flight = false;
-            this.mirrored_once();
+            if (!applied) {
+                // No summary will follow; don't hold sends for one.
+                this.mirrored_once();
+            } else if (!this.heard) {
+                // The console answers an applied mirror with its summary,
+                // which `reconcile` uses. Not heard yet: give it a moment,
+                // then mirror once more in case the subscription raced;
+                // after that, stop holding sends for it.
+                setTimeout(() => {
+                    if (this.heard || this.closed) return;
+                    if (this.reprobed) return this.mirrored_once();
+                    this.reprobed = true;
+                    this.mirror();
+                }, 1_000);
+            }
             if (this.again) {
                 this.again = false;
                 this.mirror();
@@ -240,6 +328,7 @@ class ConsoleLink {
         if (this.closed || !fs.existsSync(this.ipc)) return finish();
         const { msg, files } = mirror_payload(this.mirrored);
         for (const f of files) this.mirrored.add(f);
+        (msg as { files: Record<string, object[]> }).files[probe_path(this.ipc)] = [];
         const sock = net.createConnection(socket_endpoint(this.ipc));
         sock.setEncoding('utf8');
         let reply = '';
@@ -255,7 +344,7 @@ class ConsoleLink {
                 this.again = false;
                 setTimeout(() => this.send_mirror(attempt + 1), 250);
             } else {
-                finish();
+                finish(reply.includes('"ok"'));
             }
         });
         const fail = () => {
@@ -432,9 +521,10 @@ const tracker_factory: vscode.DebugAdapterTrackerFactory = {
                 if (m.type === 'event' && m.event === 'terminated') ending.add(session.id);
                 // Run the program once the session's breakpoints are in.
                 if (program && m.type === 'response' && m.command === 'configurationDone') {
-                    const terminal = live_console_sockets().find(([, sock]) => sock === ipc)?.[0];
-                    if (!terminal) return;
-                    terminal.show(true);
+                    // A console started outside this window (`consoleSocket`
+                    // in launch.json) has no terminal here; the program
+                    // still goes to it over its socket.
+                    live_console_sockets().find(([, sock]) => sock === ipc)?.[0].show(true);
                     send_debug_program(ipc, `source(${JSON.stringify(program)}, echo = TRUE)`);
                 }
             },

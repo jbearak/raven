@@ -1,0 +1,300 @@
+/**
+ * The debugger's side of the console IPC protocol (editors/vscode/src/
+ * debugger/index.ts) against a fake console that behaves like
+ * crates/raven/src/console/ipc.rs + dap::set_file_breakpoints:
+ * - `subscribe` is acknowledged and pushes nothing;
+ * - `breakpoints` replaces breakpoints file by file under the file's
+ *   canonical path, and only a message with at least one file entry makes
+ *   the console push its full line-breakpoint summary to subscribers;
+ * - `execute` is queued and recorded.
+ */
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+// ---------------------------------------------------------------- vscode mock
+
+type Bp = { enabled: boolean };
+const bps: Bp[] = [];
+const change_listeners: Array<() => void> = [];
+const close_listeners: Array<(t: unknown) => void> = [];
+let tracker_factory: { createDebugAdapterTracker(s: unknown): { onDidSendMessage(m: unknown): void } } | null = null;
+
+class SourceBreakpoint {
+    enabled = true;
+    condition?: string;
+    hitCondition?: string;
+    logMessage?: string;
+    constructor(public location: { uri: { scheme: string; fsPath: string }; range: { start: { line: number } } }) {}
+}
+class FunctionBreakpoint {
+    enabled = true;
+    constructor(public functionName: string) {}
+}
+class Disposable {
+    constructor(private fn: () => void = () => undefined) {}
+    dispose(): void { this.fn(); }
+}
+const disposable = () => new Disposable();
+
+mock.module('vscode', () => ({
+    SourceBreakpoint,
+    FunctionBreakpoint,
+    Disposable,
+    MarkdownString: class { appendMarkdown() { return this; } },
+    DebugAdapterNamedPipeServer: class { constructor(public path: string) {} },
+    StatusBarAlignment: { Left: 1, Right: 2 },
+    commands: { registerCommand: disposable, executeCommand: async () => undefined },
+    debug: {
+        get breakpoints() { return bps; },
+        activeDebugSession: undefined,
+        registerDebugConfigurationProvider: disposable,
+        registerDebugAdapterDescriptorFactory: disposable,
+        registerDebugAdapterTrackerFactory: (_t: string, f: typeof tracker_factory) => {
+            tracker_factory = f;
+            return disposable();
+        },
+        onDidChangeBreakpoints: (cb: () => void) => { change_listeners.push(cb); return disposable(); },
+        onDidStartDebugSession: disposable,
+        onDidTerminateDebugSession: disposable,
+        startDebugging: async () => true,
+    },
+    window: {
+        activeTerminal: undefined,
+        activeTextEditor: undefined,
+        createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+        onDidChangeActiveTerminal: disposable,
+        onDidCloseTerminal: (cb: (t: unknown) => void) => { close_listeners.push(cb); return disposable(); },
+        showInformationMessage: async () => undefined,
+        showErrorMessage: async () => undefined,
+        showWarningMessage: async () => undefined,
+    },
+    workspace: {
+        workspaceFolders: undefined,
+        textDocuments: [],
+        getConfiguration: () => ({ get: (_k: string, fallback?: unknown) => fallback }),
+    },
+}));
+
+// Opening a console isn't exercised; keep the terminal manager's imports out.
+mock.module('../../editors/vscode/src/send-to-r/r-terminal-manager', () => ({
+    get_or_create_raven_console: async () => { throw new Error('not in this test'); },
+}));
+
+const { register_debugger, probe_path } = await import('../../editors/vscode/src/debugger/index');
+const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
+
+// --------------------------------------------------------------- fake console
+
+type Wire = Record<string, unknown> & { op?: string; id?: number };
+
+class FakeConsole {
+    /** canonical path -> lines */
+    files = new Map<string, number[]>();
+    executes: Wire[] = [];
+    private subscribers: net.Socket[] = [];
+    private server: net.Server;
+    constructor(readonly socket: string) {
+        this.server = net.createServer((sock) => {
+            let buf = '';
+            sock.setEncoding('utf8');
+            sock.on('error', () => undefined);
+            sock.on('data', (d: string) => {
+                buf += d;
+                let nl: number;
+                while ((nl = buf.indexOf('\n')) >= 0) {
+                    const msg = JSON.parse(buf.slice(0, nl)) as Wire;
+                    buf = buf.slice(nl + 1);
+                    this.handle(sock, msg);
+                }
+            });
+        });
+    }
+    listen(): Promise<void> {
+        return new Promise((resolve) => this.server.listen(this.socket, resolve));
+    }
+    close(): void {
+        for (const s of this.subscribers) s.destroy();
+        this.server.close();
+    }
+    private reply(sock: net.Socket, id: unknown, status: string): void {
+        sock.write(JSON.stringify({ id, status }) + '\n');
+    }
+    private handle(sock: net.Socket, msg: Wire): void {
+        switch (msg.op) {
+            case 'subscribe':
+                this.reply(sock, msg.id, 'ok');
+                this.subscribers.push(sock);
+                return;
+            case 'breakpoints': {
+                const files = (msg.files ?? {}) as Record<string, Array<{ line: number }>>;
+                for (const [p, list] of Object.entries(files)) {
+                    let key = p;
+                    try { key = fs.realpathSync(p); } catch { /* as given, like canonical() */ }
+                    if (list.length === 0) this.files.delete(key);
+                    else this.files.set(key, list.map((b) => b.line));
+                }
+                if (Object.keys(files).length > 0) {
+                    const states = [...this.files].flatMap(([p, lines]) =>
+                        lines.map((line) => ({ verified: false, line, source: { path: p } })));
+                    const push = JSON.stringify({ event: 'breakpoints', breakpoints: states }) + '\n';
+                    for (const s of this.subscribers) s.write(push);
+                }
+                this.reply(sock, msg.id, 'ok');
+                sock.end();
+                return;
+            }
+            case 'execute':
+                this.executes.push(msg);
+                this.reply(sock, msg.id, 'queued');
+                this.reply(sock, msg.id, 'done');
+                sock.end();
+                return;
+            default:
+                this.reply(sock, msg.id, 'invalid');
+        }
+    }
+}
+
+// --------------------------------------------------------------------- helpers
+
+async function until(pred: () => boolean, ms = 5_000): Promise<void> {
+    const start = Date.now();
+    while (!pred()) {
+        if (Date.now() - start > ms) throw new Error('timed out');
+        await new Promise((r) => setTimeout(r, 20));
+    }
+}
+async function settle(ms = 400): Promise<void> {
+    await new Promise((r) => setTimeout(r, ms));
+}
+
+// os.tmpdir() is under a symlink on macOS (/var -> /private/var), so the
+// editor's paths and the console's canonical paths differ there.
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-dbg-link-'));
+const a_r = path.join(root, 'a.R');
+const b_r = path.join(root, 'b.R');
+const real = (p: string) => fs.realpathSync(p);
+fs.writeFileSync(a_r, 'x <- 1\ny <- 2\nz <- 3\n');
+fs.writeFileSync(b_r, 'x <- 1\ny <- 2\nz <- 3\nw <- 4\nv <- 5\n');
+
+function line_bp(file: string, line: number): SourceBreakpoint {
+    return new SourceBreakpoint({ uri: { scheme: 'file', fsPath: file }, range: { start: { line: line - 1 } } });
+}
+function set_breakpoints(list: Bp[]): void {
+    bps.splice(0, bps.length, ...list);
+    for (const l of change_listeners) l();
+}
+
+let n = 0;
+async function console_at(): Promise<{ con: FakeConsole; sock: string }> {
+    const dir = path.join(root, `c${n++}`);
+    fs.mkdirSync(dir);
+    const sock = path.join(dir, 's');
+    const con = new FakeConsole(sock);
+    await con.listen();
+    consoles.push(con);
+    return { con, sock };
+}
+const consoles: FakeConsole[] = [];
+
+/** A Perch-style terminal: closing it detaches; the console keeps running. */
+function attach(sock: string): object {
+    const terminal = { name: 'R', show() {} };
+    ipc.register_console_terminal(terminal as never, sock, { owns_dir: false });
+    return terminal;
+}
+function detach(terminal: object): void {
+    for (const l of close_listeners) l(terminal);
+    ipc.forget_console_terminal(terminal as never);
+}
+
+beforeAll(() => {
+    register_debugger({ subscriptions: [], workspaceState: { get: () => undefined, update: async () => undefined } } as never);
+});
+afterAll(() => {
+    for (const c of consoles) c.close();
+    fs.rmSync(root, { recursive: true, force: true });
+});
+
+// ------------------------------------------------------------------------ tests
+
+describe('breakpoints across a detach and reattach', () => {
+    test('a breakpoint removed while detached is cleared on reattach', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(a_r, 3), line_bp(b_r, 5)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 2);
+        detach(t1);
+
+        set_breakpoints([line_bp(a_r, 3)]);
+        attach(sock);
+        await until(() => con.files.size === 1);
+        await settle();
+        expect([...con.files]).toEqual([[real(a_r), [3]]]);
+    });
+
+    test("the last breakpoint removed while detached is cleared on reattach", async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(b_r, 5)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 1);
+        detach(t1);
+
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => con.files.size === 0);
+        await settle();
+        expect(con.files.size).toBe(0);
+    });
+
+    test('a symlinked spelling of a kept file is not mistaken for a stale one', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(a_r, 2)]);
+        attach(sock);
+        await until(() => con.files.size === 1);
+        // Several more round trips: the console's summary (real paths) must
+        // never clear the editor's (symlinked) file.
+        set_breakpoints([line_bp(a_r, 2), line_bp(a_r, 3)]);
+        await until(() => con.files.get(real(a_r))?.length === 2);
+        await settle();
+        expect([...con.files]).toEqual([[real(a_r), [2, 3]]]);
+    });
+
+    test('the probe entry is never an R file', () => {
+        expect(/\.(r|rmd|rmarkdown|qmd)$/i.test(probe_path('/x/y/s'))).toBe(false);
+    });
+});
+
+describe('launch with program', () => {
+    async function run_program(sock: string): Promise<void> {
+        const tracker = tracker_factory!.createDebugAdapterTracker({
+            id: `s${n}`,
+            configuration: { consoleSocket: sock, program: '/w/prog.R' },
+        });
+        tracker.onDidSendMessage({ type: 'response', command: 'configurationDone' });
+    }
+
+    test('an external console (consoleSocket, no terminal here) sources the program once', async () => {
+        const { con, sock } = await console_at();
+        await run_program(sock);
+        await until(() => con.executes.length >= 1);
+        await settle();
+        expect(con.executes.map((e) => [e.code, e.debugProgram])).toEqual([
+            ['source("/w/prog.R", echo = TRUE)', true],
+        ]);
+    });
+
+    test('a console with a terminal in this window sources the program once', async () => {
+        const { con, sock } = await console_at();
+        attach(sock);
+        await until(() => con.files.size === 0 && ipc.live_console_sockets().some(([, s]) => s === sock));
+        await run_program(sock);
+        await until(() => con.executes.length >= 1);
+        await settle();
+        expect(con.executes.length).toBe(1);
+        expect(con.executes[0].debugProgram).toBe(true);
+    });
+});

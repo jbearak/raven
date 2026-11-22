@@ -283,4 +283,22 @@ describe('View() writer (real R)', () => {
         expect(rows.rows.map(x => x[0])).toEqual([null, { _: 'nan' }]);
         await reader.close();
     }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('a difftime column reads back in its own units, as its <drtn unit> tag says', async () => {
+        const r = await runR([
+            'View(data.frame(h = as.difftime(c(1, 2), units = "hours"),',
+            '                m = as.difftime(c(1.5, NA), units = "mins")))',
+        ].join('\n'));
+        expect(r.files.length).toBe(1);
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const cols = reader.schema.columns;
+        expect(cols.map(c => c.typeTag)).toEqual(['<drtn hours>', '<drtn mins>']);
+        const cells = async (col: number) => [
+            (await reader.getCellText(0, col, 100)).text,
+            (await reader.getCellText(1, col, 100)).text,
+        ];
+        expect(await cells(0)).toEqual(['1', '2']);
+        expect(await cells(1)).toEqual(['1.5', null]);
+        await reader.close();
+    }, 60_000);
 });
