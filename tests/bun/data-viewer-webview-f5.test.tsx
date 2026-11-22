@@ -327,3 +327,31 @@ describe('data viewer App: labels of an unshipped dictionary', () => {
         expect(asked.filter((i: number) => i === 80).length).toBe(1);
     });
 });
+
+describe('data viewer App: select all with pinned columns', () => {
+    const selectAllAndCopy = () => {
+        for (const key of ['a', 'c']) {
+            act(() => { window.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, metaKey: true, bubbles: true })); });
+        }
+    };
+
+    test('Select All then Copy includes pinned data columns', async () => {
+        const { posted } = await renderApp();
+        await send(init({
+            columns: [column, { ...column, name: 'y' }],
+            layout: { hiddenColumns: [], columnWidths: {}, pinnedColumns: [0] },
+        }));
+        selectAllAndCopy();
+        expect(posted.find(m => m.type === 'copy')?.range.colIndices).toEqual([0, 1]);
+    });
+
+    test('row names stay out of a Select All copy; a pinned column after them is in', async () => {
+        const { posted } = await renderApp();
+        await send(init({
+            columns: [{ ...column, name: 'rn', arrowType: 'Utf8', isRowname: true }, column, { ...column, name: 'y' }],
+            layout: { hiddenColumns: [], columnWidths: {}, pinnedColumns: [2] },
+        }));
+        selectAllAndCopy();
+        expect(posted.find(m => m.type === 'copy')?.range.colIndices).toEqual([2, 1]);
+    });
+});
