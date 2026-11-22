@@ -12481,12 +12481,6 @@ pub(crate) struct WorkspaceGraphDerivationContext {
 #[derive(Debug, Clone)]
 pub(crate) struct ForwardParent {
     pub(crate) parent: Url,
-    /// The edge's `chdir`.
-    pub(crate) chdir: bool,
-    /// The URI the edge names, one of the document's graph roots: a
-    /// `chdir = TRUE` parent runs the file in that path's directory, which
-    /// for an alias is not the editor URI's.
-    pub(crate) child: Url,
     /// A backward-directive edge: the parent is re-derived (the child's
     /// directive reads its directory) but proposes nothing forward.
     pub(crate) backward: bool,
@@ -12543,8 +12537,6 @@ pub(crate) fn forward_parents(
             .filter(|edge| is_wd_ancestor_edge(edge))
             .map(|edge| ForwardParent {
                 parent: edge.from.clone(),
-                chdir: edge.chdir,
-                child: edge.to.clone(),
                 backward: edge.is_backward_directive,
             })
             .collect()
@@ -12619,10 +12611,12 @@ fn backward_directive_parents(
 /// derivation's oscillation rule ([`settle_inherited_wd_rounds`]). So
 /// inside a `source()` cycle the answer does not depend on the order the
 /// ancestors are visited in, and it equals what the workspace derivation (and
-/// `raven check`) gives the same files. One known gap: the ancestors come
-/// from the settled graph, while the workspace derivation re-resolves
-/// `source()` targets each round, so a cycle edge that exists only under a
-/// directory some round passes through is not seen here.
+/// `raven check`) gives the same files. As there, each round resolves a
+/// parent's `source()` calls under that parent's directory for the round
+/// ([`parent_wd_proposals`]), so an edge the settled graph holds proposes
+/// nothing in a round where the call resolves elsewhere. One known gap: the
+/// ancestors come from the settled graph, so a cycle edge that exists only
+/// under a directory some round passes through is not seen here.
 pub(crate) fn enrich_open_metadata_with_inherited_wd(
     metadata: &mut crate::cross_file::CrossFileMetadata,
     uri: &Url,
@@ -12686,6 +12680,11 @@ pub(crate) fn enrich_open_metadata_with_inherited_wd(
         nodes.push((ancestor.clone(), &forward_parents.ancestors[ancestor]));
     }
 
+    // `parent_wd_proposals` per parent and its directory: a parent's calls
+    // resolve the same way whenever its directory repeats.
+    type ResolvedCalls = Arc<Vec<(Url, String)>>;
+    let resolved_calls: std::cell::RefCell<HashMap<(Url, Option<String>), ResolvedCalls>> =
+        Default::default();
     let mut current = base.clone();
     let wd_state = |current: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>| {
         current
@@ -12717,28 +12716,37 @@ pub(crate) fn enrich_open_metadata_with_inherited_wd(
                     && !fresh.standalone
                     && !unstable.contains(node)
                 {
+                    // Each forward parent's calls, resolved under its
+                    // directory this round: a graph edge settled under
+                    // another directory may not apply now.
                     let mut proposals = std::collections::BTreeSet::new();
+                    let mut seen_parents = HashSet::new();
                     for edge in parents.iter().filter(|edge| !edge.backward) {
-                        let Ok(child_path) = edge.child.to_file_path() else {
+                        if !seen_parents.insert(&edge.parent) {
                             continue;
-                        };
+                        }
                         let Some(parent) = lookup(&edge.parent) else {
                             continue;
                         };
-                        let Some(context) =
-                            crate::cross_file::path_resolve::PathContext::from_metadata(
-                                &edge.parent,
-                                &parent,
-                                workspace_root,
-                            )
-                        else {
-                            continue;
-                        };
-                        if let Some(directory) =
-                            context.forward_child_inherited_wd(&child_path, edge.chdir)
-                        {
-                            proposals.insert(directory.to_string_lossy().into_owned());
-                        }
+                        let key = (
+                            edge.parent.clone(),
+                            parent.inherited_working_directory.clone(),
+                        );
+                        let calls = resolved_calls
+                            .borrow_mut()
+                            .entry(key)
+                            .or_insert_with(|| {
+                                Arc::new(parent_wd_proposals(&edge.parent, &parent, workspace_root))
+                            })
+                            .clone();
+                        proposals.extend(calls.iter().filter_map(|(target, proposal)| {
+                            let reaches_node = if node == uri {
+                                is_root(target)
+                            } else {
+                                target == node
+                            };
+                            reaches_node.then(|| proposal.clone())
+                        }));
                     }
                     if proposals.len() == 1 {
                         fresh.inherited_working_directory = proposals.pop_first();
@@ -12806,6 +12814,42 @@ fn settle_inherited_wd_rounds<K: Ord>(
     }
 }
 
+/// The directories `parent` proposes to the files it sources, resolving
+/// each call under `parent_metadata`'s directory: `(child, directory)` for
+/// every call that resolves and proposes one (see [`forward_wd_proposals`]).
+fn parent_wd_proposals(
+    parent_uri: &Url,
+    parent_metadata: &crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> Vec<(Url, String)> {
+    let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
+        parent_uri,
+        parent_metadata,
+        workspace_root,
+    ) else {
+        return Vec::new();
+    };
+    parent_metadata
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let resolved = source
+                .resolved_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+                .or_else(|| {
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        &path_context,
+                    )
+                })?;
+            let child_uri = Url::from_file_path(&resolved).ok()?;
+            let inherited = path_context.forward_child_inherited_wd(&resolved, source.chdir)?;
+            Some((child_uri, inherited.to_string_lossy().to_string()))
+        })
+        .collect()
+}
+
 /// Forward working-directory proposals for files with no directory of their
 /// own (no `# raven: cd`, nothing inherited through a backward directive).
 ///
@@ -12826,28 +12870,9 @@ fn forward_wd_proposals(
 ) -> HashMap<Url, String> {
     let mut proposals: HashMap<Url, std::collections::BTreeSet<String>> = HashMap::new();
     for (parent_uri, parent_metadata) in parents {
-        let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
-            parent_uri,
-            parent_metadata,
-            workspace_root,
-        ) else {
-            continue;
-        };
-        for source in &parent_metadata.sources {
-            let resolved = source
-                .resolved_uri
-                .as_ref()
-                .and_then(|uri| uri.to_file_path().ok())
-                .or_else(|| {
-                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                        &source.path,
-                        &path_context,
-                    )
-                });
-            let Some(resolved) = resolved else { continue };
-            let Ok(child_uri) = Url::from_file_path(&resolved) else {
-                continue;
-            };
+        for (child_uri, inherited) in
+            parent_wd_proposals(parent_uri, parent_metadata, workspace_root)
+        {
             let Some(child) = children.get(&child_uri) else {
                 continue;
             };
@@ -12858,14 +12883,7 @@ fn forward_wd_proposals(
             {
                 continue;
             }
-            if let Some(inherited) =
-                path_context.forward_child_inherited_wd(&resolved, source.chdir)
-            {
-                proposals
-                    .entry(child_uri)
-                    .or_default()
-                    .insert(inherited.to_string_lossy().to_string());
-            }
+            proposals.entry(child_uri).or_default().insert(inherited);
         }
     }
     proposals
@@ -12991,8 +13009,12 @@ fn derive_open_candidate_metadata(
         .iter()
         .filter(|(uri, _)| !current_open_metadata.contains_key(*uri))
         .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        // Open parents as of the previous round, like closed ones in
+        // `derive_closed_descendant_metadata`: `next` has not received this
+        // round's forward directories yet.
         .chain(
-            next.iter()
+            current_open_metadata
+                .iter()
                 .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
         )
         .collect();
@@ -16460,8 +16482,6 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             roots: vec![child.clone()],
             direct: vec![ForwardParent {
                 parent: parent.clone(),
-                chdir: false,
-                child: child.clone(),
                 backward: false,
             }],
             ancestors: HashMap::new(),
@@ -16509,16 +16529,12 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             roots: vec![child.clone()],
             direct: vec![ForwardParent {
                 parent: middle.clone(),
-                chdir: false,
-                child: child.clone(),
                 backward: false,
             }],
             ancestors: HashMap::from([(
                 middle.clone(),
                 vec![ForwardParent {
                     parent: main.clone(),
-                    chdir: false,
-                    child: middle.clone(),
                     backward: false,
                 }],
             )]),
@@ -16631,17 +16647,130 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         ] {
             fs::write(root.join(file), text).unwrap();
         }
-        let (entries, graph) = derive_closed_workspace(&root, 20);
+        let (entries, _) = derive_closed_workspace(&root, 20);
         let child = Url::from_file_path(root.join("mods/child.R")).unwrap();
         assert_eq!(entries[&child].metadata.inherited_working_directory, None);
+        assert_open_buffer_parity(&root);
+    }
+
+    /// Every file of `root`, opened alone, gets the directory the closed
+    /// workspace derivation gives it, also when every closed entry carries
+    /// a stale directory.
+    fn assert_open_buffer_parity(root: &Path) {
+        let (entries, graph) = derive_closed_workspace(root, 20);
         let stale_b = root.join("b").to_string_lossy().into_owned();
         for uri in entries.keys() {
             let parents = forward_parents(&graph, std::slice::from_ref(uri), 20);
             for stale in [None, Some(stale_b.as_str())] {
                 assert_eq!(
-                    open_buffer_wd(&entries, &parents, uri, &root, stale, 20),
+                    open_buffer_wd(&entries, &parents, uri, root, stale, 20),
                     entries[uri].metadata.inherited_working_directory,
                     "{uri} with stale {stale:?}"
+                );
+            }
+        }
+    }
+
+    /// A cycle edge that resolves only under some directories: `y.R`'s
+    /// `source("x.R")` reaches `s/x.R` only while `y.R` has no directory, so
+    /// while it inherits `b/` it proposes nothing to `x.R`. The workspace
+    /// settles on `x.R` in `a/` and `y.R` in none; the open-buffer
+    /// derivation re-resolves the settled edge each round and agrees.
+    #[test]
+    fn an_open_file_resolves_settled_edges_under_each_rounds_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["a", "b", "s"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for (file, text) in [
+            ("r1.R", "# raven: cd a\nsource(\"../s/x.R\")\n"),
+            ("r2.R", "# raven: cd b\nsource(\"../s/y.R\")\n"),
+            ("s/x.R", "source(\"../s/y.R\")\n"),
+            ("s/y.R", "source(\"x.R\")\n"),
+        ] {
+            fs::write(root.join(file), text).unwrap();
+        }
+        let (entries, _) = derive_closed_workspace(&root, 20);
+        let x = Url::from_file_path(root.join("s/x.R")).unwrap();
+        assert_eq!(
+            entries[&x].metadata.inherited_working_directory,
+            Some(root.join("a").to_string_lossy().into_owned())
+        );
+        assert_open_buffer_parity(&root);
+    }
+
+    /// With files open, the workspace derivation gives them the directories
+    /// it gives them closed: an open parent proposes the directory it
+    /// inherited in the previous round, as a closed one does.
+    #[test]
+    fn open_overlays_derive_the_closed_directories() {
+        let layouts: [&[(&str, &str)]; 2] = [
+            &[
+                ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
+                ("r2.R", "# raven: cd b\nsource(\"../mods/y.R\")\n"),
+                (
+                    "mods/x.R",
+                    "source(\"../mods/y.R\")\nsource(\"../mods/child.R\")\n",
+                ),
+                (
+                    "mods/y.R",
+                    "source(\"../mods/x.R\")\nsource(\"../mods/child.R\")\n",
+                ),
+                ("mods/child.R", "source(\"constants.R\")\n"),
+            ],
+            &[
+                ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
+                ("mods/x.R", "source(\"../mods/y.R\")\n"),
+                ("mods/y.R", "source(\"../mods/child.R\")\n"),
+                ("mods/child.R", "source(\"constants.R\")\n"),
+            ],
+        ];
+        for layout in layouts {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            for dir in ["a", "b", "mods"] {
+                fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            for (file, text) in layout {
+                fs::write(root.join(file), text).unwrap();
+            }
+            let (closed, _) = derive_closed_workspace(&root, 20);
+            let root_uri = Url::from_directory_path(&root).unwrap();
+            let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+            let overlays: Vec<_> = layout
+                .iter()
+                .filter(|(file, _)| file.starts_with("mods/"))
+                .map(|(file, _)| {
+                    let uri = Url::from_file_path(root.join(file)).unwrap();
+                    let entry = &entries[&uri];
+                    WorkspaceGraphOverlay {
+                        uri: uri.clone(),
+                        content: entry.contents.clone(),
+                        chunk_kind: ChunkKind::R,
+                        metadata: Some(entry.metadata.clone()),
+                        graph_roots: vec![uri],
+                        excluded: false,
+                    }
+                })
+                .collect();
+            let context = WorkspaceGraphDerivationContext {
+                reuse_unchanged_artifacts: false,
+                workspace_root: Some(root_uri),
+                max_depth: 20,
+                exclusions: Default::default(),
+                system_file_workspace_name: None,
+                system_file_workspace_root: None,
+                system_file_library_paths: Vec::new(),
+            };
+            let (_, open) =
+                derive_workspace_dependency_graph(&mut entries, None, &overlays, &context, false);
+            for overlay in &overlays {
+                assert_eq!(
+                    open[&overlay.uri].inherited_working_directory,
+                    closed[&overlay.uri].metadata.inherited_working_directory,
+                    "{}",
+                    overlay.uri
                 );
             }
         }
