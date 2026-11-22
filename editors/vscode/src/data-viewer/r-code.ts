@@ -29,6 +29,22 @@
  *     `stringr::str_rank(x, locale = "<ui language>", numeric = TRUE)`.
  *     Descending keys use `desc()`, `decreasing =`, or unary minus.
  *
+ *   - **Columns** are referenced by name only when the name is unique
+ *     and nonempty in the R object; otherwise by position (`dat[[3]]`),
+ *     since a name would read the first column with it. dplyr can't
+ *     filter or sort such a frame (nor touch `...`/`..1` names at all),
+ *     so that flavor refuses it. Every `[` in the base R flavor is one
+ *     `[.data.table` also reads as base R does (row indices, literal
+ *     column positions), so it reproduces the view on a data.table too;
+ *     the data.table flavor parenthesizes an `i` that is a lone symbol or
+ *     starts with `!` (calling-scope lookup, not-join).
+ *
+ * Text from the data (column names, values, labels, the `View()`
+ * expression) is never code: in comments it goes through `rComment()`,
+ * in code through `rString()` or `rName()`, which escape every line
+ * terminator, control and invisible format character. A name with no
+ * safe symbol spelling is read as `x[["name"]]` (or `.data[["name"]]`).
+ *
  * A filter or sort the generator can't express faithfully is left out
  * and named in a comment, never approximated silently.
  */
@@ -63,24 +79,86 @@ const RESERVED = new Set([
     'Inf', 'NaN', 'NA', 'NA_integer_', 'NA_real_', 'NA_character_', 'NA_complex_', 'in',
 ]);
 
-/** `name` as an R symbol, backticked when it isn't syntactic. */
+/**
+ * Characters that must never appear raw in the copied code: C0/C1
+ * controls and DEL; the line and paragraph separators (U+2028/9, which
+ * editors may turn into line breaks) and NEL (U+0085); and invisible
+ * format characters, bidi controls included, that can make text read
+ * differently from how it parses ("Trojan Source").
+ */
+const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'g');
+
+/** Thrown when data-derived text has no R spelling (NUL, which R strings
+ *  can't hold); the caller leaves the piece out with a "Not translated"
+ *  comment, or refuses the whole export. */
+class Unrepresentable extends Error {}
+
+function hex4(c: number): string {
+    return c.toString(16).padStart(4, '0');
+}
+
+/**
+ * Data-derived text (a column name, a value, the `View()` expression) as
+ * the body of a `#` comment: one line, nothing invisible. Every unsafe
+ * character, line terminators included, is written as a visible escape,
+ * so no part of it can end the comment and run as code.
+ */
+export function rComment(s: string): string {
+    return s.replace(UNSAFE_CHARS, ch => {
+        if (ch === '\n') return '\\n';
+        if (ch === '\r') return '\\r';
+        if (ch === '\t') return '\\t';
+        return '\\u' + hex4(ch.charCodeAt(0));
+    });
+}
+
+/** `name` is spelled as a bare or backticked R symbol. Backticks process
+ *  `\\`, `` \` `` and `\xNN` escapes but not `\u`, so a name holding an
+ *  unsafe non-ASCII character (or NUL) has no safe symbol spelling; nor
+ *  do `...` and `..1`, which stay the dots symbols even backticked. */
+export function rNameRepresentable(name: string): boolean {
+    if (name === '...' || /^\.\.[0-9]+$/.test(name)) return false;
+    for (const ch of name) {
+        const c = ch.charCodeAt(0);
+        if (c === 0) return false;
+        if (c >= 0x80 && UNSAFE_CHAR.test(ch)) return false;
+    }
+    return name !== '';
+}
+
+/** `name` as an R symbol, backticked when it isn't syntactic. Throws
+ *  `Unrepresentable` unless `rNameRepresentable(name)`; callers that may
+ *  see such names reach the column as `x[["name"]]` instead. */
 export function rName(name: string): string {
+    if (!rNameRepresentable(name)) throw new Unrepresentable(`column name ${rComment(name)}`);
     if (SYNTACTIC.test(name) && !RESERVED.has(name)) return name;
-    return '`' + name.replace(/\\/g, '\\\\').replace(/`/g, '\\`') + '`';
+    let out = '`';
+    for (const ch of name) {
+        const c = ch.charCodeAt(0);
+        if (ch === '\\') out += '\\\\';
+        else if (ch === '`') out += '\\`';
+        else if (c < 0x20 || c === 0x7f) out += '\\x' + c.toString(16).padStart(2, '0');
+        else out += ch;
+    }
+    return out + '`';
 }
 
 /** A double-quoted R string literal. Non-ASCII text stays literal (R
- *  reads UTF-8 source); control characters are escaped. */
+ *  reads UTF-8 source); control, separator and invisible format
+ *  characters are escaped. Throws `Unrepresentable` on NUL. */
 export function rString(s: string): string {
     let out = '"';
     for (const ch of s) {
         const c = ch.codePointAt(0)!;
+        if (c === 0) throw new Unrepresentable('a NUL character');
         if (ch === '\\') out += '\\\\';
         else if (ch === '"') out += '\\"';
         else if (ch === '\n') out += '\\n';
         else if (ch === '\r') out += '\\r';
         else if (ch === '\t') out += '\\t';
         else if (c < 0x20 || c === 0x7f) out += '\\x' + c.toString(16).padStart(2, '0');
+        else if (UNSAFE_CHAR.test(ch)) out += '\\u' + hex4(c);
         else out += ch;
     }
     return out + '"';
@@ -113,18 +191,69 @@ const LABEL_HELPER = [
 type Ctx = {
     flavor: CodeFlavor;
     input: CodeInput;
-    /** Name of the frame inside base R's `with()` (rownames lookup). */
+    /** The frame a column reference reads from: base R's frame inside
+     *  `with()` (row names, positional references), data.table's `dt` or
+     *  `out`. */
     frame: string;
     /** True once a rowname column is materialized as a real column. */
     rownamesAsColumn: boolean;
     needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble'>;
     skipped: string[];
+    /** Names the R object (with a materialized row name column) has more
+     *  than once, or the empty name: a reference by name would read
+     *  another column, so these are reached by position. */
+    ambiguous: Set<string>;
 };
+
+/** Column `ci`'s 1-based position in the R object the code indexes:
+ *  row names count only once materialized as a column. */
+function columnPosition(ctx: Ctx, ci: number): number {
+    const { columns } = ctx.input;
+    let p = ci + 1;
+    if (!ctx.rownamesAsColumn) {
+        for (let j = 0; j < ci; j++) if (columns[j].isRowname) p--;
+    }
+    return p;
+}
+
+/** The names of the R object's columns, in order. */
+function objectNames(input: CodeInput, rownamesAsColumn: boolean, rownameName: string): string[] {
+    return input.columns
+        .filter(c => !c.isRowname || rownamesAsColumn)
+        .map(c => (c.isRowname ? rownameName : c.name));
+}
+
+function ambiguousNames(names: readonly string[]): Set<string> {
+    const counts = new Map<string, number>();
+    for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+    return new Set(names.filter(n => n === '' || counts.get(n)! > 1));
+}
 
 function colRef(ctx: Ctx, ci: number): string {
     const col = ctx.input.columns[ci];
     if (col.isRowname && !ctx.rownamesAsColumn) return `rownames(${ctx.frame})`;
-    return rName(col.name);
+    const name = col.isRowname ? rownameNameOf(ctx.input) : col.name;
+    if (ctx.ambiguous.has(name)) {
+        // dplyr refuses such frames up front (generateRCode).
+        return `${ctx.frame}[[${columnPosition(ctx, ci)}]]`;
+    }
+    if (!rNameRepresentable(name)) {
+        return ctx.flavor === 'dplyr' ? `.data[[${rString(name)}]]` : `${ctx.frame}[[${rString(name)}]]`;
+    }
+    return rName(name);
+}
+
+/** True when column `ci` is referenced by a bare (possibly backticked)
+ *  name, which data.table's unary minus needs for character keys. */
+function isBareRef(ctx: Ctx, ci: number): boolean {
+    const col = ctx.input.columns[ci];
+    if (col.isRowname && !ctx.rownamesAsColumn) return false;
+    const name = col.isRowname ? rownameNameOf(ctx.input) : col.name;
+    return !ctx.ambiguous.has(name) && rNameRepresentable(name);
+}
+
+function rownameNameOf(input: CodeInput): string {
+    return input.columns.find(c => c.isRowname)?.name ?? 'rowname';
 }
 
 /** A column's values for comparison: value-labelled vectors are
@@ -342,7 +471,13 @@ function dateCode(
 
 /** One entry's full condition, missing-value semantics included. */
 function entryCode(ctx: Ctx, entry: FilterEntry, labelsOn: boolean): string | null {
-    const pred = predicateCode(ctx, entry, labelsOn);
+    let pred: ReturnType<typeof predicateCode>;
+    try {
+        pred = predicateCode(ctx, entry, labelsOn);
+    } catch (e) {
+        if (e instanceof Unrepresentable) return null;
+        throw e;
+    }
     if (!pred) return null;
     const kind = entry.predicate.kind;
     if (kind === 'isEmpty' || kind === 'isNotEmpty') return pred.code;
@@ -406,7 +541,7 @@ function sortTerms(ctx: Ctx): SortTerm[] {
                 break;
             }
         }
-        const bare = text === colRef(ctx, key.columnIndex) && !(col.isRowname && !ctx.rownamesAsColumn);
+        const bare = text === colRef(ctx, key.columnIndex) && isBareRef(ctx, key.columnIndex);
         if (order === 'natural') {
             ctx.needs.add('stringr');
             terms.push({
@@ -466,27 +601,27 @@ function balancedCall(e: string): boolean {
     return false;
 }
 
-/** Hidden columns that exist in the R object, as names or (with
- *  duplicates or empty names) 1-based positions. */
+/** Hidden columns that exist in the R object, as names (when every one
+ *  is unique and nonempty) or 1-based positions. */
 function hiddenSelection(ctx: Ctx): { names?: string[]; positions?: number[] } {
     const { columns, hiddenColumns } = ctx.input;
     const hidden = [...new Set(hiddenColumns)]
         .filter(ci => columns[ci] && (!columns[ci].isRowname || ctx.rownamesAsColumn))
         .sort((a, b) => a - b);
     if (hidden.length === 0) return {};
-    const counts = new Map<string, number>();
-    for (const c of columns) counts.set(c.name, (counts.get(c.name) ?? 0) + 1);
-    if (hidden.every(ci => columns[ci].name !== '' && counts.get(columns[ci].name) === 1)) {
-        return { names: hidden.map(ci => columns[ci].name) };
-    }
-    const position = (ci: number): number => {
-        let p = ci + 1;
-        if (!ctx.rownamesAsColumn) {
-            for (let j = 0; j < ci; j++) if (columns[j].isRowname) p--;
-        }
-        return p;
-    };
-    return { positions: hidden.map(position) };
+    const positions = hidden.map(ci => columnPosition(ctx, ci));
+    const names = hidden.map(ci => (columns[ci].isRowname ? rownameNameOf(ctx.input) : columns[ci].name));
+    if (names.every(n => !ctx.ambiguous.has(n) && rNameRepresentable(n))) return { names, positions };
+    return { positions };
+}
+
+/** data.table's `i`: a lone symbol is looked up in the calling scope and
+ *  a leading `!` means a not-join, so either is parenthesized to make it
+ *  a plain logical index. */
+function dataTableI(conditions: readonly string[]): string {
+    const i = conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
+    const symbol = /^(?:[A-Za-z.][A-Za-z0-9._]*|`(?:[^`\\]|\\.)*`)$/.test(i);
+    return symbol || i.startsWith('!') ? `(${i})` : i;
 }
 
 function header(ctx: Ctx, extra: string[]): string[] {
@@ -496,14 +631,15 @@ function header(ctx: Ctx, extra: string[]): string[] {
     if (ctx.needs.has('tibble')) req.push('tibble');
     if (ctx.needs.has('stringr')) req.push('stringr >= 1.5.0 (str_rank)');
     if (ctx.needs.has('stringi')) req.push('stringi (a .locale other than "C")');
-    const lines = [`# ${ctx.input.expression.split('\n')[0]} as shown in Raven's data viewer`];
+    const firstLine = ctx.input.expression.trim().split(/\r\n|\r|\n/)[0];
+    const lines = [`# ${rComment(firstLine)} as shown in Raven's data viewer`];
     if (req.length > 0) lines.push(`# Requires ${req.join(', ')}`);
     const order = ctx.input.sort.stringOrder ?? 'natural';
     if (ctx.input.sort.keys.length > 0 && order !== 'c' && (ctx.needs.has('stringr') || ctx.needs.has('stringi'))) {
         lines.push('# String order uses ICU collation, as the viewer does; R and VS Code can ship',
             '# different ICU versions, which may order rare characters differently.');
     }
-    for (const s of ctx.skipped) lines.push(`# Not translated: ${s}`);
+    for (const s of ctx.skipped) lines.push(`# Not translated: ${rComment(s)}`);
     lines.push(...extra);
     if (ctx.needs.has('labelHelper')) lines.push('', ...LABEL_HELPER);
     return lines;
@@ -511,6 +647,17 @@ function header(ctx: Ctx, extra: string[]): string[] {
 
 /** The R code for the current view, or why there is none. */
 export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult {
+    try {
+        return generate(input, flavor);
+    } catch (e) {
+        if (e instanceof Unrepresentable) {
+            return { error: `Copy as R code can't write ${e.message} as R code.` };
+        }
+        throw e;
+    }
+}
+
+function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
     const kind = input.sourceKind ?? 'data.frame';
     if (kind !== 'data.frame' && kind !== 'matrix') {
         return { error: `Copy as R code works for data frames and matrices; this view shows a ${kind}.` };
@@ -523,20 +670,39 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
         ...entries.map(e => e.columnIndex),
         ...input.sort.keys.map(k => k.columnIndex),
     ].some(ci => input.columns[ci]?.isRowname);
+    const rownamesAsColumn = usesRownames && flavor !== 'base';
+    const rownameName = rownameNameOf(input);
+    const ambiguous = ambiguousNames(objectNames(input, rownamesAsColumn, rownameName));
+    if (flavor === 'dplyr') {
+        // dplyr's data mask refuses duplicate and empty names in filter()
+        // and arrange(), and dots names (`...`, `..1`) in every verb.
+        const names = objectNames(input, rownamesAsColumn, rownameName);
+        const dots = names.filter(n => n === '...' || /^\.\.[0-9]+$/.test(n));
+        const refused = [...new Set([
+            ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
+            ...(entries.length > 0 || input.sort.keys.length > 0 || input.hiddenColumns.length > 0 ? dots : []),
+        ])];
+        if (refused.length > 0) {
+            const list = refused.map(n => (n === '' ? 'an empty name' : `"${rComment(n)}"`)).join(', ');
+            return {
+                error: `dplyr can't work with this data frame's column names (${list}: duplicate, empty, `
+                    + 'or `...`/`..1`); copy the base R or data.table code instead.',
+            };
+        }
+    }
+    const src0 = kind === 'matrix' ? `as.data.frame(${input.expression.trim()})` : input.expression.trim();
+    // Base R names the frame for rownames() and positional references: the
+    // expression itself when it is a plain name, else `dat`.
+    const simple = /^[A-Za-z.][\w.]*$/.test(src0);
     const ctx: Ctx = {
         flavor,
         input,
-        frame: 'dat',
-        rownamesAsColumn: usesRownames && flavor !== 'base',
+        frame: flavor === 'data.table' ? 'dt' : flavor === 'base' && simple ? src0 : 'dat',
+        rownamesAsColumn,
         needs: new Set(),
         skipped: [],
+        ambiguous,
     };
-    const src0 = kind === 'matrix' ? `as.data.frame(${input.expression.trim()})` : input.expression.trim();
-    // Base R names the frame for rownames(): the expression itself when
-    // it is a plain name, else `dat`.
-    const simple = /^[A-Za-z.][\w.]*$/.test(src0);
-    if (flavor === 'base' && simple) ctx.frame = src0;
-    const rownameName = input.columns.find(c => c.isRowname)?.name ?? 'rowname';
 
     const labelsOn = input.filter.labelsOnWhenFiltered;
     const conditions: string[] = [];
@@ -548,9 +714,10 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
             conditions.push(code);
         }
     }
+    // Sort keys read the filtered frame (base R and data.table).
+    if (conditions.length > 0 && flavor !== 'dplyr') ctx.frame = 'out';
     const terms = sortTerms(ctx);
     const hidden = hiddenSelection(ctx);
-    const hiddenNames = hidden.names?.map(n => rName(n));
     const order = input.sort.stringOrder ?? 'natural';
 
     if (flavor === 'dplyr') {
@@ -570,7 +737,7 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
             if (terms.some(t => t.character)) args.push(`.locale = ${rString(order === 'c' ? 'C' : input.locale)}`);
             body.push(`arrange(${args.join(', ')})`);
         }
-        if (hiddenNames) body.push(`select(-${rVector(hiddenNames)})`);
+        if (hidden.names) body.push(`select(-${rVector(hidden.names.map(rName))})`);
         else if (hidden.positions) body.push(`select(-${rVector(hidden.positions.map(String))})`);
         if (body.length === 0) head = src0;
         const lines = header(ctx, ['', 'library(dplyr)', '']);
@@ -585,7 +752,7 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
         const steps: string[] = [setup];
         let out = 'dt';
         if (conditions.length > 0) {
-            steps.push(`out <- dt[${conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ')}]`);
+            steps.push(`out <- dt[${dataTableI(conditions)}]`);
             out = 'out';
         }
         if (terms.length > 0) {
@@ -593,8 +760,8 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
             steps.push(`out <- ${out}[order(${args.join(', ')})]`);
             out = 'out';
         }
-        if (hiddenNames) {
-            steps.push(`out <- ${out}[, !${rVector(hidden.names!.map(rString))}]`);
+        if (hidden.names) {
+            steps.push(`out <- ${out}[, !${rVector(hidden.names.map(rString))}]`);
             out = 'out';
         } else if (hidden.positions) {
             steps.push(`out <- ${out}[, -${rVector(hidden.positions.map(String))}]`);
@@ -606,32 +773,30 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
         return { code: lines.join('\n') + '\n' };
     }
 
-    // Base R.
-    const dat = ctx.frame;
-    const conds = conditions;
+    // Base R. Every `[` here is one a data.table also reads as base R
+    // does (row indices with an empty `j`, literal column positions), so
+    // the code reproduces the view whatever the object's class.
+    const dat = simple ? src0 : 'dat';
     const steps: string[] = [];
     if (!simple) steps.push(`dat <- ${src0}`);
     let out = dat;
-    if (conds.length > 0) {
-        const joined = conds.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
+    if (conditions.length > 0) {
+        const joined = conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
         steps.push(`out <- ${dat}[which(with(${dat}, ${joined})), , drop = FALSE]`);
         out = 'out';
     }
     if (terms.length > 0) {
-        // Sort keys are evaluated in the filtered frame.
-        const sortTermsOut = sortTerms({ ...ctx, frame: out, skipped: [] });
-        const args = sortTermsOut.map(t => t.expr);
-        const decreasing = sortTermsOut.map(t => (t.desc ? 'TRUE' : 'FALSE'));
+        const args = terms.map(t => t.expr);
+        const decreasing = terms.map(t => (t.desc ? 'TRUE' : 'FALSE'));
         const dec = decreasing.every(d => d === 'FALSE') ? ''
             : decreasing.every(d => d === 'TRUE') ? ', decreasing = TRUE'
                 : `, decreasing = c(${decreasing.join(', ')})`;
         steps.push(`out <- ${out}[with(${out}, order(${args.join(', ')}${dec}, method = "radix")), , drop = FALSE]`);
         out = 'out';
     }
-    if (hidden.names) {
-        steps.push(`out <- ${out}[, setdiff(names(${out}), ${rVector(hidden.names.map(rString))}), drop = FALSE]`);
-        out = 'out';
-    } else if (hidden.positions) {
+    if (hidden.positions) {
+        // Literal positions: a computed `j` (`setdiff(names(out), ...)`)
+        // would be evaluated as an expression by `[.data.table`.
         steps.push(`out <- ${out}[, -${rVector(hidden.positions.map(String))}, drop = FALSE]`);
         out = 'out';
     }

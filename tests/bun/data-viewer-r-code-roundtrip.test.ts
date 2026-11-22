@@ -303,3 +303,114 @@ describe.skipIf(!READY)('Copy as R code round trip: row names (real R)', () => {
         });
     }
 });
+
+/** A small frame through the real writer and engines: each case names
+ *  columns by index (duplicate names allowed), and R evaluates the code
+ *  against `objects` (e.g. the frame and the same data as a data.table). */
+type EdgeCase = {
+    name: string;
+    filters?: { ci: number; p: FilterPredicate; includeMissing?: boolean }[];
+    sort?: { ci: number; dir: 'asc' | 'desc' }[];
+    hide?: number[];
+    /** Flavors that must refuse the view (generator error), not emit code. */
+    refuse?: CodeFlavor[];
+};
+
+function edgeSuite(title: string, frameR: string, objects: string[], cases: EdgeCase[]): void {
+    describe.skipIf(!READY)(title, () => {
+        const results = new Map<string, string>();
+        const want = new Map<string, string>();
+        const errors = new Map<string, string>();
+        beforeAll(async () => {
+            const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-rcode-edge-'));
+            const rds = join(tmp, 'df.rds');
+            const w = await runR(`${frameR}\nsaveRDS(df, ${JSON.stringify(rds)})\nView(df)\n`);
+            const files = readdirSync(w.dir).filter(f => f.endsWith('.arrow'));
+            if (files.length !== 1) throw new Error(`View() wrote ${files.length} files\n${w.stderr}`);
+            const rd = await ArrowSliceReader.open(join(w.dir, files[0]));
+            const cols = rd.schema.columns;
+            const script = [
+                'suppressPackageStartupMessages({ library(dplyr); library(data.table) })',
+                `df <- readRDS(${JSON.stringify(rds)})`,
+                'dtobj <- data.table::as.data.table(df)',
+            ];
+            for (const c of cases) {
+                const entries: FilterEntry[] = (c.filters ?? []).map((f, k) => ({
+                    id: `f${k}`, columnIndex: f.ci, predicate: f.p, enabled: true, includeMissing: f.includeMissing ?? false,
+                }));
+                const keys: SortKey[] = (c.sort ?? []).map(s => ({ columnIndex: s.ci, direction: s.dir }));
+                const ctx = { labelsOn: true, formatOn: true, digits: 3 };
+                const rows = await computeFilteredIndices(rd, { entries, labelsOnWhenFiltered: true }, ctx);
+                const perm = await computePermutation(rd, keys, { ...ctx, stringOrder: 'c', locale: LOCALE }, { rows });
+                const keep = cols.map((col, i) => (c.hide ?? []).includes(i) ? null : col.name).filter(n => n !== null);
+                want.set(c.name, `${Array.from(perm, r => r + 1).join(',')}\t${keep.join(',')}`);
+                for (const obj of objects) {
+                    for (const flavor of FLAVORS) {
+                        const res = generateRCode({
+                            expression: obj, sourceKind: 'data.frame', columns: cols,
+                            sort: { keys, labelsOnWhenSorted: true, stringOrder: 'c' },
+                            filter: { entries, labelsOnWhenFiltered: true },
+                            hiddenColumns: c.hide ?? [], locale: LOCALE,
+                        }, flavor);
+                        const key = `${obj}|${flavor}|${c.name}`;
+                        if ('error' in res) { errors.set(key, res.error); continue; }
+                        script.push(`local({ out <- tryCatch({ out <- {\n${res.code}\n}; out }, error = function(e) { cat("@@", ${JSON.stringify(key)}, "\\tERROR: ", conditionMessage(e), "\\n", sep = ""); NULL }); if (!is.null(out)) cat("@@", ${JSON.stringify(key)}, "\\t", if (is.data.frame(out)) paste(out[["id"]], collapse = ",") else paste("NOT A FRAME:", deparse(out)), "\\t", paste(names(out), collapse = ","), "\\n", sep = "") })`);
+                    }
+                }
+            }
+            const scriptPath = join(tmp, 'edge.R');
+            writeFileSync(scriptPath, script.join('\n'), 'utf8');
+            const r = await runR(`source(${JSON.stringify(scriptPath)}, encoding = "UTF-8")`);
+            for (const line of r.stdout.split('\n')) {
+                const m = /^@@(.*?)\t(.*)$/.exec(line);
+                if (m) results.set(m[1], m[2]);
+            }
+            await rd.close();
+            if (results.size === 0 && errors.size === 0) throw new Error(`R produced no results:\n${r.stderr}`);
+        }, 120_000);
+
+        for (const c of cases) {
+            for (const obj of objects) {
+                for (const flavor of FLAVORS) {
+                    test(`${obj} ${flavor}: ${c.name}`, () => {
+                        const key = `${obj}|${flavor}|${c.name}`;
+                        if (c.refuse?.includes(flavor)) {
+                            expect(errors.get(key)).toMatch(/copy the base R or data\.table code instead/);
+                            return;
+                        }
+                        expect(errors.get(key)).toBeUndefined();
+                        expect(results.get(key)).toBe(want.get(c.name)!);
+                    });
+                }
+            }
+        }
+    });
+}
+
+// Duplicate names: the second `val` is a different column from the first;
+// a reference by name would read the first one.
+edgeSuite('Copy as R code round trip: duplicate column names (real R)',
+    'df <- data.frame(id = 1:4, val = c(4L, 3L, 2L, 1L), val = c(0L, 100L, NA, 70L), check.names = FALSE)',
+    ['df', 'dtobj'],
+    [
+        { name: 'filter the second val', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>', value: 50 } }], refuse: ['dplyr'] },
+        { name: 'sort by the second val', sort: [{ ci: 2, dir: 'desc' }], refuse: ['dplyr'] },
+        { name: 'filter the first val, sort by the second', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>=', value: 2 } }], sort: [{ ci: 2, dir: 'asc' }], refuse: ['dplyr'] },
+        { name: 'hide the second val', hide: [2] },
+    ]);
+
+// Logical filters (data.table reads a lone symbol or a leading `!` in `i`
+// specially) and hidden columns, against a data.frame and a data.table
+// (base R's `[` dispatches to `[.data.table`).
+edgeSuite('Copy as R code round trip: logical columns and data.table objects (real R)',
+    'df <- data.frame(id = 1:5, b = c(TRUE, FALSE, NA, TRUE, NA), s = c("e", "d", "c", "b", "a"))',
+    ['df', 'dtobj'],
+    [
+        { name: 'b is TRUE', filters: [{ ci: 1, p: { kind: 'bool', value: true } }] },
+        { name: 'b is FALSE', filters: [{ ci: 1, p: { kind: 'bool', value: false } }] },
+        { name: 'b is FALSE or missing', filters: [{ ci: 1, p: { kind: 'bool', value: false }, includeMissing: true }] },
+        { name: 'b is TRUE, sorted by s', filters: [{ ci: 1, p: { kind: 'bool', value: true } }], sort: [{ ci: 2, dir: 'asc' }] },
+        { name: 'hide b', hide: [1] },
+        { name: 'hide all but id', hide: [1, 2] },
+        { name: 'b is TRUE, hide b and s', filters: [{ ci: 1, p: { kind: 'bool', value: true } }], hide: [1, 2] },
+    ]);
