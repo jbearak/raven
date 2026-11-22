@@ -1709,6 +1709,62 @@ fn a_function_breakpoint_binds_inside_the_sourced_file_that_defines_it() {
 }
 
 #[test]
+fn source_arguments_stay_lazy_under_a_function_breakpoint() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let target = c.write_file("target.R", "raven_source_result <- 815\n");
+    let defines = c.write_file(
+        "defines.R",
+        "lazy_fn <- function() {\n  7\n}\nlazy_res <- lazy_fn()\n",
+    );
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setFunctionBreakpoints",
+        json!({"breakpoints": [{"name": "unrelated_fn"}, {"name": "lazy_fn"}]}),
+    );
+    d.req("configurationDone", json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    // The file defines neither function: base source() runs it as called,
+    // and never forces `prompt.echo` (echo is off).
+    c.send(
+        &format!(
+            "source('{target}', echo = FALSE, prompt.echo = stop('unexpected evaluation')); cat('ran:', raven_source_result, '\\n')"
+        ),
+        None,
+    );
+    c.expect("ran: 815");
+    // What the wrapper reads to decide (`encoding`) is evaluated once.
+    c.send(
+        &format!(
+            "n <- 0; source('{target}', encoding = {{ n <- n + 1; 'UTF-8' }}); cat('enc evals:', n, '\\n')"
+        ),
+        None,
+    );
+    c.expect("enc evals: 1");
+    // A file that defines the function is rewritten so the breakpoint
+    // binds; its unused arguments stay unevaluated too.
+    let m = d.mark();
+    c.send(
+        &format!(
+            "k <- 0; source('{defines}', echo = FALSE, encoding = {{ k <- k + 1; 'UTF-8' }}, prompt.echo = stop('unexpected evaluation')); cat('bound:', lazy_res, k, '\\n')"
+        ),
+        None,
+    );
+    assert_eq!(
+        d.event("stopped", m)["body"]["reason"],
+        "function breakpoint"
+    );
+    assert_eq!(d.stack()[0].0, "lazy_fn");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("bound: 7 1");
+    assert!(!c.text().contains("Error"), "{}", c.text());
+}
+
+#[test]
 fn step_out_of_a_loop_still_stops_at_later_breakpoints_in_it() {
     if !r_available() {
         return;
@@ -2219,6 +2275,14 @@ fn hover_runs_no_user_methods_and_reads_s4_slots() {
          when <- structure(0, tzone = structure(\"UTC\", class = \"labelset\"), class = c(\"POSIXct\", \"POSIXt\"))\n\
          setClass(\"Box\", representation(value = \"numeric\", any = \"ANY\"))\n\
          obj <- new(\"Box\", value = 7)\n\
+         setClass(\"WrappedNumbers\", contains = \"numeric\", representation(tag = \"character\"))\n\
+         wrapped <- new(\"WrappedNumbers\", c(a = 4), tag = \"t\")\n\
+         setClass(\"Grid\", contains = \"matrix\")\n\
+         grid <- new(\"Grid\", matrix(1:4, 2))\n\
+         setClass(\"Bag\", contains = \"list\")\n\
+         bag <- new(\"Bag\", list(1, \"a\"))\n\
+         setClass(\"Scope\", contains = \"environment\")\n\
+         scope <- new(\"Scope\")\n\
          hv <- function() { browser(); 1 }",
         None,
     );
@@ -2249,6 +2313,22 @@ fn hover_runs_no_user_methods_and_reads_s4_slots() {
     assert_eq!(slot["body"]["result"], "7", "{slot}");
     let empty = hover(&mut d, "obj@any");
     assert_eq!(empty["body"]["result"], "NULL", "{empty}");
+    // `.Data` is the data part, which is no attribute: the object without
+    // its slots. Each matches what `x@.Data` prints in R.
+    let data = hover(&mut d, "wrapped@.Data");
+    assert_eq!(data["body"]["result"], "4", "{data}");
+    assert_eq!(data["body"]["type"], "num", "{data}");
+    let data = hover(&mut d, "grid@.Data");
+    assert_eq!(data["body"]["result"], "int [2 x 2] 1 2 3 4", "{data}");
+    let data = hover(&mut d, "bag@.Data");
+    assert_eq!(data["body"]["result"], "list [2]", "{data}");
+    let data = hover(&mut d, "scope@.Data");
+    assert_eq!(data["body"]["type"], "environment", "{data}");
+    // A class with no data part: NULL, as in R.
+    let data = hover(&mut d, "obj@.Data");
+    assert_eq!(data["body"]["result"], "NULL", "{data}");
+    let hits = hover(&mut d, "hits");
+    assert_eq!(hits["body"]["result"], "0", "a hover ran a user method");
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
