@@ -52,7 +52,8 @@ const canvasContext = new Proxy({
 
 const { App } = await import('../../editors/vscode/src/data-viewer/webview/App');
 const { ValueCountsPopover } = await import('../../editors/vscode/src/data-viewer/webview/value-counts-popover');
-const { setFilterFor, sidebarRows, profileStatLines } = await import('../../editors/vscode/src/data-viewer/webview/summary-model');
+const { setFilterFor, sidebarRows, profileStatLines, entryCell } = await import('../../editors/vscode/src/data-viewer/webview/summary-model');
+const { formatCell } = await import('../../editors/vscode/src/data-viewer/display-format');
 const { encodeNonFinite } = await import('../../editors/vscode/src/data-viewer/wire-format');
 
 /**
@@ -276,6 +277,15 @@ describe('Columns sidebar', () => {
         expect(sidebarRows(columns as any, info, '', 'missing')).toEqual([2, 3, 0, 1]);
         expect(sidebarRows(columns as any, info, 'MILES', 'position')).toEqual([0]);
         expect(sidebarRows(columns as any, info, '', 'name')).toEqual([1, 0, 3, 2]);
+    });
+
+    test('pure: infinite counted values format as the grid shows them', () => {
+        const col = columns[0] as any;
+        const show = (v: number) => formatCell(entryCell(col, 'numeric', v), col, undefined,
+            { labelsOn: true, formatOn: true, digits: 3, alignPad: false } as any).text;
+        expect(show(Infinity)).toBe('Inf');
+        expect(show(-Infinity)).toBe('-Inf');
+        expect(show(1.5)).toBe('1.500');
     });
 
     test('pure: numeric stat lines mark reservoir quantiles with ≈', () => {

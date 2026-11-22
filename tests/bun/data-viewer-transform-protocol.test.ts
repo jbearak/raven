@@ -325,6 +325,19 @@ describe('WorkerEngine: thread lifecycles', () => {
         scanScript: join(THREADS, 'scan-worker.ts'),
     });
 
+    test('a thread that exits before it is ready rejects start (the panel then falls back in process)', async () => {
+        const path = await catastrophicFixture();
+        const dir = mkdtempSync(join(tmpdir(), 'raven-dv-exit-'));
+        const dying = join(dir, 'exits.js');
+        await writeFile(dying, 'process.exit(3);\n');
+        const t0 = Date.now();
+        const err = await WorkerEngine.start({
+            filePath: path, nrow: 8, readerScript: dying, scanScript: join(THREADS, 'scan-worker.ts'),
+        }).then(() => undefined, e => e);
+        expect(String(err)).toContain('before it was ready');
+        expect(Date.now() - t0).toBeLessThan(5000);
+    });
+
     test('regex filter cancel terminates the worker; the next transform starts from committed state', async () => {
         const path = await catastrophicFixture();
         engine = await start(path, 8);

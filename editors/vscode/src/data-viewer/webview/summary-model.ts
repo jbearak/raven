@@ -257,6 +257,10 @@ function isoDay(days: number): string {
 
 /** A counted value as a wire cell, so it formats like the grid. */
 export function entryCell(col: ColumnSchema, kind: ColumnProfile['kind'], value: CountedEntry['value']): Cell {
+    // Infinite values: the grid's sentinels, which format as `Inf`.
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+        return Number.isNaN(value) ? { _: 'nan' } : value > 0 ? { _: 'inf' } : { _: '-inf' };
+    }
     if (kind === 'date' && typeof value === 'number') {
         if (col.arrowType.startsWith('Timestamp')) {
             const ms = Math.floor(value / 1000);
