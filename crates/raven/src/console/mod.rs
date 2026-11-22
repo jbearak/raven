@@ -985,8 +985,13 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
         return Some(rest);
     }
     reclaim_output_hook();
-    output::get().at_prompt();
     let kind = classify(prompt, hist);
+    if kind == PromptKind::Other {
+        // Before the flush below: what the debugger's output filter holds
+        // is on screen before `readline()` waits for an answer.
+        dap::on_input_prompt();
+    }
+    output::get().at_prompt();
     let repl_prompt = kind != PromptKind::Other;
     if repl_prompt {
         // A request whose lines have all been fed is finished once R asks at

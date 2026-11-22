@@ -262,12 +262,6 @@ struct RState {
     /// One-shot step probe armed for the segment being fed.
     step_probe_armed: bool,
     plans: HashMap<String, (String, annotate::Plan)>,
-    /// Output lines held until the next prompt decides whether the stop
-    /// they belong to is shown (`Called from:` before a hidden stop), or
-    /// whether a probe's `debug at` announcement was really R's.
-    held: Vec<String>,
-    line_buf: String,
-    filter_mode: FilterMode,
     hook_installed: bool,
     /// The JIT was turned off for a step-in; restore it at the next prompt.
     jit_off: bool,
@@ -397,9 +391,6 @@ pub fn init(
             step_next_segment: false,
             step_probe_armed: false,
             plans: HashMap::new(),
-            held: Vec::new(),
-            line_buf: String::new(),
-            filter_mode: FilterMode::Pass,
             hook_installed: false,
             jit_off: false,
             jmc_steps: 0,
@@ -1526,7 +1517,7 @@ pub fn on_repl_prompt(level: u32, more: bool) -> Option<String> {
             }
         })?;
         if step {
-            release_held(false, false);
+            release_held(Release::Announced { called_from: false });
             return Some("n\n".into());
         }
     }
@@ -1711,7 +1702,7 @@ fn print_traceback(json: &str) {
 }
 
 fn on_top_level(more: bool) -> Option<String> {
-    release_held(true, true);
+    release_held(Release::All);
     // A pause or Stop that arrived as R finished on its own must not change
     // what a later Ctrl-C does.
     if let Some(h) = handle() {
@@ -1806,7 +1797,7 @@ fn on_captured() -> Option<String> {
     })
     .unwrap_or(false);
     if jmc {
-        release_held(false, false);
+        release_held(Release::Announced { called_from: false });
         return Some("f\n".into());
     }
     // Step Into first stops on the function's whole body, at its opening
@@ -1821,7 +1812,7 @@ fn on_captured() -> Option<String> {
     let stepped_in =
         with_r(|r| r.resumed && r.last_user_resume.as_deref() == Some("s")).unwrap_or(false);
     if on_body && stepped_in && !fbp {
-        release_held(false, false);
+        release_held(Release::Announced { called_from: false });
         return Some("n\n".into());
     }
     let mut sources: Vec<(i64, String)> = Vec::new();
@@ -1875,7 +1866,9 @@ fn on_captured() -> Option<String> {
             .as_ref()
             .is_some_and(|s| frames_equal(&s.frames, &frames));
         if same {
-            release_held(true, false);
+            // R announced nothing before this prompt: what is held is
+            // what the user's own expression printed.
+            release_held(Release::All);
             if let Some(out) = outbox() {
                 out.event(
                     "invalidated",
@@ -1949,7 +1942,9 @@ fn on_captured() -> Option<String> {
         r.resumed = false;
         r.had_stop = true;
     });
-    release_held(!own_browser, false);
+    release_held(Release::Announced {
+        called_from: !own_browser,
+    });
     let _ = call_helper("on_stop", &[]);
     if configured && let Some(out) = outbox() {
         send_stopped(out, &stop);
@@ -2209,90 +2204,153 @@ fn sync_source_hook(h: &Handle) {
 
 // ---- output filtering (R thread) -------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterMode {
-    Pass,
-    /// Holding what looks like a probe's announcement until the next
-    /// prompt: dropped at a browser prompt, shown at a top-level one (the
-    /// user printed it; R announces a step only before `Browse>`).
-    Drop,
-    /// Holding a `Called from:` announcement until the next prompt.
-    Hold,
-}
-
+/// R's announcements the debugger hides: its own steps through a probe.
 const DROP: &[&str] = &[
     "debug at <raven-probe>#",
     "debug: base::`if`(base::identical(",
 ];
+/// R's announcement of a `browser()` call: hidden for the debugger's own.
 const HOLD: &str = "Called from: ";
+/// How R starts any step announcement, a user line's included.
+const STEP: &[&str] = &["debug at ", "debug: "];
+/// Most text held back. An announcement of the debugger's own is far
+/// shorter; past this the text is written out as it is.
+const HELD_MAX: usize = 64 * 1024;
+
+/// What the prompt that ends a hold says about the held text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// R announced nothing before this prompt: all of it is the user's.
+    All,
+    /// A browser prompt R announced: the last announcement held is R's,
+    /// and is shown unless it is a probe step, or a `Called from:` when
+    /// `called_from` is false. Text before it is the user's.
+    Announced { called_from: bool },
+}
+
+/// The state of [`filter_output`]. R prints an announcement just before it
+/// reads at a `Browse>` prompt, and only then; the program can print the
+/// same words at any time. So text that starts like one the debugger hides
+/// is held, with everything after it, until the next read shows which it
+/// was ([`Release`]).
+///
+/// This is process-global, not R-thread state, so that text still held
+/// when R exits can be written by the exit handler
+/// ([`take_held_at_exit`]). It is locked only to move text, never across
+/// an R call or a write.
+#[derive(Debug, Default)]
+struct OutputFilter {
+    /// Held text, starting at a line that looks like a hidden announcement.
+    held: String,
+    /// Offset in `held` of the last write that starts like an announcement.
+    last: usize,
+    /// The start of a line that may still become one.
+    line_buf: String,
+    holding: bool,
+}
+
+static FILTER: Mutex<OutputFilter> = Mutex::new(OutputFilter {
+    held: String::new(),
+    last: 0,
+    line_buf: String::new(),
+    holding: false,
+});
+
+impl OutputFilter {
+    /// Take `text` R wrote; returns what to write now.
+    fn push(&mut self, text: &str) -> String {
+        let mut out = String::new();
+        for piece in text.split_inclusive('\n') {
+            if self.holding {
+                if STEP.iter().any(|p| piece.starts_with(p)) || piece.starts_with(HOLD) {
+                    self.last = self.held.len();
+                }
+                self.held.push_str(piece);
+                if self.held.len() > HELD_MAX {
+                    out.push_str(&std::mem::take(&mut self.held));
+                    self.holding = false;
+                }
+                continue;
+            }
+            self.line_buf.push_str(piece);
+            let hidden = || DROP.iter().copied().chain(std::iter::once(HOLD));
+            if hidden().any(|p| self.line_buf.starts_with(p)) {
+                self.held = std::mem::take(&mut self.line_buf);
+                self.last = 0;
+                self.holding = true;
+            } else if !hidden().any(|p| p.starts_with(self.line_buf.as_str())) {
+                out.push_str(&self.line_buf);
+                self.line_buf.clear();
+            }
+        }
+        out
+    }
+
+    /// A read ends the hold; returns the held text to write.
+    fn release(&mut self, how: Release) -> String {
+        let mut out = std::mem::take(&mut self.held);
+        if self.holding
+            && let Release::Announced { called_from } = how
+        {
+            let tail = out.split_off(self.last.min(out.len()));
+            let show = if DROP.iter().any(|p| tail.starts_with(p)) {
+                false
+            } else if tail.starts_with(HOLD) {
+                called_from
+            } else {
+                true
+            };
+            if show {
+                out.push_str(&tail);
+            }
+        }
+        self.holding = false;
+        // A partial line is never R's: it writes an announcement whole.
+        out.push_str(&std::mem::take(&mut self.line_buf));
+        out
+    }
+}
+
+fn filter() -> std::sync::MutexGuard<'static, OutputFilter> {
+    FILTER.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Filter R's stdout so the debugger's own steps stay invisible: a probe's
-/// `debug at` announcement and a `Called from:` announcement are held until
-/// the next prompt shows whether they were the debugger's (see
-/// [`release_held`]). Both run until that prompt (R prints them just before
-/// reading), which also covers deparsed calls that span several lines.
+/// `debug at` announcement and the `Called from:` of the debugger's own
+/// `browser()` are held until the next read shows whether they were R's
+/// (see `OutputFilter`), and written out before that only past `HELD_MAX`.
 pub fn filter_output(text: &str) -> String {
     if !active() {
         return text.to_string();
     }
-    with_r(|r| {
-        let mut out = String::new();
-        for piece in text.split_inclusive('\n') {
-            match r.filter_mode {
-                FilterMode::Drop | FilterMode::Hold => {
-                    r.held.push(piece.to_string());
-                    continue;
-                }
-                FilterMode::Pass => {}
-            }
-            r.line_buf.push_str(piece);
-            let candidate = DROP
-                .iter()
-                .chain(std::iter::once(&HOLD))
-                .any(|p| p.starts_with(r.line_buf.as_str()) || r.line_buf.starts_with(p));
-            if !candidate {
-                out.push_str(&r.line_buf);
-                r.line_buf.clear();
-                continue;
-            }
-            if DROP.iter().any(|p| r.line_buf.starts_with(p)) {
-                let line = std::mem::take(&mut r.line_buf);
-                r.held.push(line);
-                r.filter_mode = FilterMode::Drop;
-            } else if r.line_buf.starts_with(HOLD) {
-                let line = std::mem::take(&mut r.line_buf);
-                r.held.push(line);
-                r.filter_mode = FilterMode::Hold;
-            }
-        }
-        out
-    })
-    .unwrap_or_else(|| text.to_string())
+    filter().push(text)
 }
 
-/// At a prompt: write held lines (`show`) or drop them, plus any partial
-/// line held back as a possible match. Lines held from a probe-like
-/// `debug at` are R's step announcement only when a browser prompt follows;
-/// at the top-level prompt (`top_level`) they were the user's own output,
-/// and are always shown.
-fn release_held(show: bool, top_level: bool) {
-    let (held, probe) = with_r(|r| {
-        let probe = r.filter_mode == FilterMode::Drop;
-        r.filter_mode = FilterMode::Pass;
-        let mut v = std::mem::take(&mut r.held);
-        let partial = std::mem::take(&mut r.line_buf);
-        if !partial.is_empty() {
-            v.push(partial);
-        }
-        (v, probe)
-    })
-    .unwrap_or_default();
-    let show = if probe { top_level } else { show };
-    if show {
-        for l in held {
-            super::output::get().write(l.as_bytes(), 0);
-        }
+/// At a prompt: write what the hold kept that isn't the debugger's.
+fn release_held(how: Release) {
+    let text = filter().release(how);
+    if !text.is_empty() {
+        super::output::get().write(text.as_bytes(), 0);
     }
+}
+
+/// R asks for input that isn't a REPL prompt (`readline()`, `menu()`,
+/// `scan()`). R announces nothing before such a read, so anything held is
+/// the program's own output, and the user must see it before answering.
+pub fn on_input_prompt() {
+    if active() {
+        release_held(Release::All);
+    }
+}
+
+/// Text still held when the process exits (`q()` runs no further prompt),
+/// for the exit handler to write. Never blocks: the handler may run while
+/// a write is in progress.
+pub fn take_held_at_exit() -> String {
+    FILTER
+        .try_lock()
+        .map(|mut f| f.release(Release::All))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2325,6 +2383,61 @@ mod tests {
         // No character there: inside a tab's span, or past the end.
         assert_eq!(display_col_to_char("\tx", 4), None);
         assert_eq!(display_col_to_char("x", 2), None);
+    }
+
+    #[test]
+    fn held_output_is_bounded_and_written_in_order() {
+        let mut f = OutputFilter::default();
+        assert_eq!(f.push("plain\n"), "plain\n");
+        assert_eq!(f.push("debug at <raven-probe>#1\n"), "");
+        let line = "x".repeat(1023) + "\n";
+        let mut out = String::new();
+        for _ in 0..200 {
+            out.push_str(&f.push(&line));
+            assert!(f.held.len() <= HELD_MAX, "{}", f.held.len());
+        }
+        out.push_str(&f.release(Release::All));
+        assert_eq!(
+            out,
+            format!("debug at <raven-probe>#1\n{}", line.repeat(200))
+        );
+        // Past the bound the filter starts over: a later announcement of
+        // the debugger's own is still hidden.
+        assert_eq!(f.push("debug at <raven-probe>#2: base::`if`(...)\n"), "");
+        assert_eq!(f.release(Release::Announced { called_from: false }), "");
+    }
+
+    #[test]
+    fn only_the_announcement_before_a_browser_prompt_is_hidden() {
+        let hide = Release::Announced { called_from: false };
+        let mut f = OutputFilter::default();
+        // The program's lookalike, then the debugger's own browser().
+        f.push("debug at <raven-probe>#1\nmine\n");
+        f.push("Called from: g()\n");
+        assert_eq!(f.release(hide), "debug at <raven-probe>#1\nmine\n");
+        // ... then its hidden step, announced over several lines.
+        f.push("debug at <raven-probe>#1: base::`if`(a,\n    b)\n");
+        assert_eq!(f.release(hide), "");
+        // A `Called from:` for the user's own browser() is shown.
+        f.push("Called from: g()\n");
+        assert_eq!(
+            f.release(Release::Announced { called_from: true }),
+            "Called from: g()\n"
+        );
+        // A step onto a user's line is shown, with what came before it.
+        f.push("Called from: here\nmine\n");
+        f.push("debug at /a.R#3: y <- 2\n");
+        assert_eq!(
+            f.release(hide),
+            "Called from: here\nmine\ndebug at /a.R#3: y <- 2\n"
+        );
+        // With no announcement from R, everything is the program's.
+        f.push("debug at <raven-probe>#1\nmine\n");
+        assert_eq!(f.release(Release::All), "debug at <raven-probe>#1\nmine\n");
+        // A label that only starts like one is released as it is.
+        assert_eq!(f.push("Called "), "");
+        assert_eq!(f.release(hide), "Called ");
+        assert_eq!(f.push("Called off\n"), "Called off\n");
     }
 
     #[test]

@@ -716,6 +716,10 @@ extern "C" fn flush_at_exit() {
             let inner = &mut *g;
             inner.values.close(&mut inner.buf);
             drain_editor_to_buf(inner);
+            // Output the debugger's filter was holding for a prompt that
+            // will now never come.
+            let held = super::dap::take_held_at_exit();
+            inner.buf.extend_from_slice(held.as_bytes());
             flush_inner(inner);
         }
     }
