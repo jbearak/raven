@@ -39,12 +39,16 @@ const probed = new Map<string, { stamp: string; ok: Promise<boolean> }>();
  * The file `execFile(binary)` runs. A bare command name (no directory) is
  * looked up on the extension host's PATH, in order, as `execFile` does
  * (on POSIX an empty entry is the working directory; on Windows the working
- * directory comes first, and a name without an extension is tried with
- * `.com` and `.exe`, as libuv does). Anything else names a file relative to
- * the working directory.
+ * directory comes first, and each directory is tried with `.com` and
+ * `.exe`, after the name as given only if it has an extension, as libuv
+ * does). Anything else names a file relative to the working directory.
  */
 function file_run_for(binary: string): string | undefined {
-    const candidates = path.basename(binary) === binary && !binary.includes('/')
+    const bare = path.basename(binary) === binary && !binary.includes('/');
+    // With PATH unset the lookup falls back to platform defaults; don't
+    // guess which file that finds (the result just isn't cached).
+    if (bare && process.env.PATH === undefined) return undefined;
+    const candidates = bare
         ? [
             // libuv on Windows looks in the working directory first.
             ...(process.platform === 'win32' ? [process.cwd()] : []),
@@ -52,7 +56,7 @@ function file_run_for(binary: string): string | undefined {
                 .map((dir) => (dir === '' && process.platform !== 'win32' ? '.' : dir))
                 .filter(Boolean),
         ].flatMap((dir) =>
-            (process.platform === 'win32' && path.extname(binary) === '' ? ['.com', '.exe'] : [''])
+            (process.platform !== 'win32' ? [''] : path.extname(binary) === '' ? ['.com', '.exe'] : ['', '.com', '.exe'])
                 .map((ext) => path.join(dir, binary + ext)))
         : [binary];
     return candidates.find((file) => {
