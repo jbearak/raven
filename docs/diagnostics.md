@@ -534,7 +534,7 @@ Raven reports one diagnostic per chain, on the second comparison operator, where
 
 A path in a `source()` call or a source directive doesn't lead to a file.
 
-This covers `source()` calls, forward directives (`# raven: source`, `run`, `include`), and backward directives (`# raven: sourced-by`, `run-by`, `included-by`). The path may be missing, outside the workspace, or ambiguous because two files match it when case is ignored. It also covers a missing literal `tar_render()`, `tar_knit()`, or single-document `tar_quarto()` report path.
+This covers `source()` calls, forward directives (`# raven: source`, `run`, `include`), and backward directives (`# raven: sourced-by`, `run-by`, `included-by`). The path may be missing, outside the workspace, or ambiguous because two files match it when case is ignored. It also covers a missing literal `tar_render()`, `tar_knit()`, or single-document `tar_quarto()` report path. A URL in `source()` (`https://`, `http://`, `ftp://`, `ftps://`, or `file://`) isn't reported, because R reads it; in `sys.source()`, which rejects URLs, it is.
 
 **Example**
 

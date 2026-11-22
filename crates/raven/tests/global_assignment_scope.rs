@@ -1,10 +1,13 @@
 //! End-to-end checks that global assignments made outside the global frame
 //! define their name for the rest of the run.
 //!
-//! Covers `assign("name", value, envir = globalenv())` (or `.GlobalEnv`) and
-//! `name <<- value` running inside `local()`, or at the top level of a file
-//! that a caller sources with `local = TRUE` from inside `local()`. Every
-//! fixture is synthetic and runs through `raven check --format json`.
+//! Covers `assign("name", value, envir = globalenv())` (or `.GlobalEnv`),
+//! `name <<- value`, and calls whose destination is the global environment by
+//! default or by argument (`data()`, `delayedAssign(assign.env =)`,
+//! write-mode `textConnection()`, `rm(envir =)`) running inside `local()`, or
+//! at the top level of a file that a caller sources with `local = TRUE` from
+//! inside `local()`. Every fixture is synthetic and runs through
+//! `raven check --format json`.
 
 use std::path::Path;
 use std::process::Command;
@@ -242,5 +245,163 @@ local({
             row("main.R", 4, "bound_by_function"),
             row("main.R", 5, "bound_by_outer_local"),
         ]
+    );
+}
+
+/// Calls that put a binding in the global environment, by default or by
+/// argument, define it after a `local()` block, as they do in R. The same
+/// calls aimed at the block's own frame keep the binding in the block. Each
+/// of those is in its own file, and the positive cases use `base::local()`:
+/// after a call that may bind any name (such as `data()`), Raven no longer
+/// proves a later bare `local` is base's.
+#[test]
+fn global_destination_calls_inside_local_define_name_after_the_block() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "main.R",
+        r#"base::local({ data(raven_dataset, package = "ravenpkg") })
+print(raven_dataset)
+base::local({ delayedAssign("delayed_global", 42, assign.env = globalenv()) })
+print(delayed_global)
+base::local({ connection <- textConnection("captured", "w"); close(connection) })
+print(captured)
+"#,
+    );
+    // An earlier `delayedAssign()` anywhere in the file stops Raven proving
+    // a later `.GlobalEnv` unshadowed, so this one gets its own file.
+    write(
+        dir.path(),
+        "partial.R",
+        "base::local({ delayedAssign(\"delayed_partial\", 42, assign = .GlobalEnv) })\n\
+         print(delayed_partial)\n",
+    );
+    write(
+        dir.path(),
+        "data_block.R",
+        "local({ data(block_dataset, envir = environment()); print(block_dataset) })\n\
+         print(block_dataset)\n",
+    );
+    write(
+        dir.path(),
+        "delayed_block.R",
+        "local({ delayedAssign(\"delayed_block\", 1); print(delayed_block) })\n\
+         print(delayed_block)\n",
+    );
+    write(
+        dir.path(),
+        "connection_block.R",
+        "local({ connection <- textConnection(\"captured_block\", \"w\", local = TRUE) })\n\
+         print(captured_block)\n",
+    );
+    assert_eq!(
+        undefined(
+            dir.path(),
+            &[
+                "raven_dataset",
+                "delayed_global",
+                "delayed_partial",
+                "captured",
+                "block_dataset",
+                "delayed_block",
+                "captured_block",
+            ],
+        ),
+        vec![
+            row("connection_block.R", 1, "captured_block"),
+            row("data_block.R", 1, "block_dataset"),
+            row("delayed_block.R", 1, "delayed_block"),
+        ]
+    );
+}
+
+/// `rm(envir = globalenv())` or `rm(pos = 1)` inside `local()` removes the
+/// global binding, so a later read is reported; a plain `rm()` there removes
+/// only the block's own binding.
+#[test]
+fn global_removal_inside_local_removes_the_global_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "main.R",
+        r#"gone <- 1
+local({ rm(gone, envir = globalenv()) })
+print(gone)
+gone_pos <- 1
+local({ rm(gone_pos, pos = 1) })
+print(gone_pos)
+kept <- 1
+local({ kept <- 2; rm(kept) })
+print(kept)
+local({ shadow <- 2; rm(shadow, envir = globalenv()); print(shadow) })
+"#,
+    );
+    // With `globalenv` rebound the destination is unknown: neither the
+    // block's binding nor the global one is removed.
+    write(
+        dir.path(),
+        "rebound.R",
+        r#"other <- new.env()
+globalenv <- function() other
+probe <- 1
+base::local({
+  probe <- 2
+  rm(probe, envir = globalenv())
+  print(probe)
+})
+print(probe)
+"#,
+    );
+    assert_eq!(
+        undefined(dir.path(), &["gone", "gone_pos", "kept", "shadow", "probe"]),
+        vec![row("main.R", 2, "gone"), row("main.R", 5, "gone_pos")]
+    );
+}
+
+/// The child of a `local()`-block `source(local = TRUE)` puts these bindings
+/// in the global environment too, and a plain `source()` of a file whose own
+/// `local()` block calls `data()` lends the dataset.
+#[test]
+fn local_source_brings_back_the_childs_global_destination_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "main.R",
+        r#"local({ source("R/child.R", local = TRUE) })
+print(child_dataset)
+print(child_captured)
+print(child_delayed)
+print(child_ordinary)
+source("R/data_in_local.R")
+print(nested_dataset)
+"#,
+    );
+    write(
+        dir.path(),
+        "R/child.R",
+        r#"data(child_dataset)
+connection <- textConnection("child_captured", "w")
+close(connection)
+delayedAssign("child_delayed", 1, assign.env = globalenv())
+child_ordinary <- 1
+"#,
+    );
+    write(
+        dir.path(),
+        "R/data_in_local.R",
+        "local({ data(nested_dataset) })\n",
+    );
+    assert_eq!(
+        undefined(
+            dir.path(),
+            &[
+                "child_dataset",
+                "child_captured",
+                "child_delayed",
+                "child_ordinary",
+                "nested_dataset",
+            ],
+        ),
+        vec![row("main.R", 4, "child_ordinary")]
     );
 }

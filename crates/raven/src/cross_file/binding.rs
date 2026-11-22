@@ -1729,7 +1729,7 @@ pub(crate) fn resolve_assign_arguments<'tree>(
     })
 }
 
-fn value_is_global_environment(
+pub(crate) fn value_is_global_environment(
     value: Node,
     content: &str,
     bare_globalenv_trusted: bool,
@@ -1767,7 +1767,7 @@ fn value_is_global_environment(
         && complete_call_argument_values(arguments).is_some_and(|values| values.is_empty())
 }
 
-fn remove_call_has_global_destination(
+pub(crate) fn remove_call_has_global_destination(
     arguments: Node,
     content: &str,
     bare_globalenv_trusted: bool,
