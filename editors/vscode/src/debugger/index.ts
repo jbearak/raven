@@ -234,7 +234,13 @@ class ConsoleLink {
      * while the console starts doesn't release sends early.
      */
     private subscribed = false;
-    /** Files only the console's summary named; cleared, then forgotten. */
+    /**
+     * Files only the console's summary named; cleared, then forgotten. Each
+     * is cleared at most once per connection: a path that no longer
+     * resolves to what the console stored (the file was replaced by a
+     * symlink) can't be cleared from here, and the console keeps reporting
+     * it.
+     */
     private discovered = new Set<string>();
     /** A mirror on this connection has been applied (`ok`). */
     private applied = false;
@@ -304,7 +310,8 @@ class ConsoleLink {
             return;
         }
         const wanted = with_real_paths(Object.keys(editor_breakpoints().files));
-        const stale = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
+        const reported = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
+        const stale = reported.filter((p) => !this.discovered.has(p));
         if (stale.length > 0) {
             for (const p of stale) {
                 this.mirrored.add(p);
@@ -314,6 +321,9 @@ class ConsoleLink {
         } else if (this.applied && !this.in_flight) {
             // The console pushes a summary after each file it applies, so
             // only a summary seen once a whole mirror is in counts.
+            for (const p of new Set(reported)) {
+                console.warn(`raven: could not clear the R console's breakpoints in ${p}; the path no longer names the file the console armed`);
+            }
             this.release();
         }
     }

@@ -387,6 +387,49 @@ describe('breakpoints across a detach and reattach', () => {
     });
 });
 
+describe('a console path the client cannot clear', () => {
+    test('is cleared once per connection, without holding sends', async () => {
+        const { con, sock } = await console_at();
+        // Own files: this test turns one into a symlink.
+        const dir = fs.mkdtempSync(path.join(root, 'swap-'));
+        const s_a = path.join(dir, 'a.R');
+        const s_b = path.join(dir, 'b.R');
+        fs.writeFileSync(s_a, 'x <- 1\ny <- 2\n');
+        fs.writeFileSync(s_b, 'x <- 1\n');
+        set_breakpoints([line_bp(s_a, 2)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 1);
+        detach(t1);
+        // The console remembers a.R's canonical path, which now resolves to
+        // b.R: clearing it clears b.R, and the console keeps reporting a.R.
+        fs.rmSync(s_a);
+        fs.symlinkSync(s_b, s_a);
+        set_breakpoints([]);
+        const warn = console.warn;
+        const warned: unknown[][] = [];
+        console.warn = (...args: unknown[]) => { warned.push(args); };
+        let mirrors = 0;
+        const original = con['handle'].bind(con);
+        con['handle'] = (s: net.Socket, msg: Wire) => {
+            if (msg.op === 'breakpoints') mirrors++;
+            original(s, msg);
+        };
+        try {
+            attach(sock);
+            const start = Date.now();
+            ipc.send_debug_program(sock, 'source("b.R")');
+            await until(() => con.executes.length === 1, 5_000);
+            expect(Date.now() - start).toBeLessThan(3_000);
+            await settle(900);
+            // The first mirror, the one clear, and nothing after.
+            expect(mirrors).toBeLessThanOrEqual(3);
+            expect(warned.filter((a) => String(a[0]).includes('could not clear')).length).toBe(1);
+        } finally {
+            console.warn = warn;
+        }
+    }, 20_000);
+});
+
 describe('launch with program', () => {
     async function run_program(sock: string): Promise<void> {
         const tracker = tracker_factory!.createDebugAdapterTracker({
