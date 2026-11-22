@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import * as fs from 'fs';
+import * as path from 'path';
 
 /**
  * Which binary runs `raven console`. No `vscode` import, so the bun suite can
@@ -10,7 +11,8 @@ import * as fs from 'fs';
  * every console and package task without R. `console --help` exits 0 only
  * where the subcommand exists, so a configured binary that fails it is
  * skipped for the console in favor of the bundled one (the language server
- * still uses the configured binary). Results are cached by path, size and
+ * still uses the configured binary). Results are cached by the file the
+ * binary resolves to (through PATH for a bare command name), its size and
  * modification time, so a rebuilt binary is probed again.
  */
 
@@ -33,12 +35,39 @@ export function probe_console_support(binary: string): Promise<boolean> {
 
 const probed = new Map<string, { stamp: string; ok: Promise<boolean> }>();
 
-function stamp_of(binary: string): string {
+/**
+ * The file `execFile(binary)` runs. A bare command name (no directory) is
+ * looked up on the extension host's PATH, in order, as `execFile` does;
+ * on Windows the working directory comes first and each directory is also
+ * tried with `.com` and `.exe`, as libuv does. Anything else names a file relative to the working directory.
+ */
+function file_run_for(binary: string): string | undefined {
+    const candidates = path.basename(binary) === binary && !binary.includes('/')
+        ? [
+            // libuv on Windows looks in the working directory first.
+            ...(process.platform === 'win32' ? [process.cwd()] : []),
+            ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean),
+        ].flatMap((dir) =>
+            (process.platform === 'win32' ? ['', '.com', '.exe'] : ['']).map((ext) => path.join(dir, binary + ext)))
+        : [binary];
+    return candidates.find((file) => {
+        try { return fs.statSync(file).isFile(); } catch { return false; }
+    });
+}
+
+/**
+ * Identifies the file `binary` runs, so a replaced binary (or a different
+ * one earlier on PATH) is probed again. Undefined when that file can't be
+ * found: such a result isn't cached.
+ */
+function stamp_of(binary: string): string | undefined {
+    const file = file_run_for(binary);
+    if (file === undefined) return undefined;
     try {
-        const s = fs.statSync(binary);
-        return `${s.size}:${s.mtimeMs}`;
+        const s = fs.statSync(file);
+        return `${file}:${s.size}:${s.mtimeMs}`;
     } catch {
-        return 'missing';
+        return undefined;
     }
 }
 
@@ -56,7 +85,10 @@ export async function console_binary(
     if (!configured || configured === bundled) return bundled;
     const stamp = stamp_of(configured);
     let entry = probed.get(configured);
-    if (!entry || entry.stamp !== stamp) {
+    if (stamp === undefined) {
+        probed.delete(configured);
+        entry = { stamp: '', ok: probe(configured) };
+    } else if (!entry || entry.stamp !== stamp) {
         entry = { stamp, ok: probe(configured) };
         probed.set(configured, entry);
     }

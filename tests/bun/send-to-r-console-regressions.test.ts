@@ -501,6 +501,37 @@ describe('a raven.server.path from before `raven console`', () => {
         expect(await binary.console_binary(b, () => undefined, async () => true)).toBe(file);
     });
 
+    test('a bare command name is stamped as the file PATH finds', async () => {
+        const dir = fs.mkdtempSync(path.join(storage, 'bin-'));
+        const name = 'raven-on-path';
+        const file = path.join(dir, process.platform === 'win32' ? `${name}.exe` : name);
+        fs.writeFileSync(file, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+        const saved = process.env.PATH;
+        process.env.PATH = `${dir}${path.delimiter}${saved ?? ''}`;
+        try {
+            let probes = 0;
+            const b = { configured: name, bundled: BUNDLED };
+            const old = async () => { probes++; return false; };
+            expect(await binary.console_binary(b, () => undefined, old)).toBe(BUNDLED);
+            expect(await binary.console_binary(b, () => undefined, old)).toBe(BUNDLED);
+            expect(probes).toBe(1);
+            // Replaced by a build with `console`.
+            fs.writeFileSync(file, '#!/bin/sh\nexit 0\n# rebuilt, longer\n');
+            expect(await binary.console_binary(b, () => undefined, async () => true)).toBe(name);
+        } finally {
+            process.env.PATH = saved;
+        }
+    });
+
+    test('a binary that cannot be found is probed again next time', async () => {
+        let probes = 0;
+        const probe = async () => { probes++; return false; };
+        const b = { configured: 'raven-nowhere-on-path-0123', bundled: BUNDLED };
+        await binary.console_binary(b, () => undefined, probe);
+        await binary.console_binary(b, () => undefined, probe);
+        expect(probes).toBe(2);
+    });
+
     test('no configured binary means the bundled one, without probing', async () => {
         let probes = 0;
         const probe = async () => { probes++; return true; };
