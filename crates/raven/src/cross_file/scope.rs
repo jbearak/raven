@@ -1013,17 +1013,6 @@ pub enum GlobalEffect {
     },
 }
 
-impl GlobalEffect {
-    /// The anchor shared with this effect's timeline event.
-    fn anchor(&self) -> (u32, u32) {
-        match self {
-            GlobalEffect::Def(symbol) => (symbol.defined_line, symbol.defined_column),
-            GlobalEffect::Removal { line, column, .. }
-            | GlobalEffect::DataLoad { line, column, .. } => (*line, *column),
-        }
-    }
-}
-
 impl Default for ScopeArtifacts {
     /// Creates an empty ScopeArtifacts with all fields set to their defaults.
     ///
@@ -1372,12 +1361,14 @@ fn current_frame_source_reaches_global(
 /// name is overridden, and anything else is first-wins, or overrides under
 /// execution-order merging. A net removal acts like this file's own `rm()`
 /// at the `source()` call, with the call's `visibility`.
+#[allow(clippy::too_many_arguments)]
 fn merge_global_effects_into_point_scope(
     scope: &mut ScopeAtPosition,
     forward_contributed: &mut HashSet<Arc<str>>,
     child: &ScopeArtifacts,
+    queried: &ScopeArtifacts,
     queried_uri: &Url,
-    execution_order: bool,
+    merge: GlobalEffectMerge,
     visibility: EventVisibility,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) {
@@ -1385,11 +1376,25 @@ fn merge_global_effects_into_point_scope(
     let effects = child_global_net_effects(child, queried_uri, data_alias_provider, || attached);
     for (name, effect) in effects {
         let Some(symbol) = effect else {
+            // The flat scope also holds the query's enclosing local
+            // bindings, which a global removal leaves alone.
+            if scope
+                .symbols
+                .get(&name)
+                .is_some_and(|existing| point_binding_is_local(queried, queried_uri, existing))
+            {
+                continue;
+            }
             scope.symbols.remove(&name);
             if visibility == EventVisibility::Positional {
                 scope.removed_names.insert(name);
             }
             continue;
+        };
+        let execution_order = match merge {
+            GlobalEffectMerge::RemovalsOnly => continue,
+            GlobalEffectMerge::FirstWins => false,
+            GlobalEffectMerge::ExecutionOrder => true,
         };
         if scope.parent_prefix_symbol_names.contains(&name) {
             forward_contributed.insert(name.clone());
@@ -1404,6 +1409,44 @@ fn merge_global_effects_into_point_scope(
             scope.symbols.entry(name).or_insert(symbol);
         }
     }
+}
+
+/// How [`merge_global_effects_into_point_scope`] applies a child's net
+/// bindings; net removals always apply.
+#[derive(Clone, Copy)]
+enum GlobalEffectMerge {
+    /// First binding wins, as for other source contributions.
+    FirstWins,
+    /// Later bindings override, under execution-order merging.
+    ExecutionOrder,
+    /// Bindings are skipped: the ordinary child merge already brought them in.
+    RemovalsOnly,
+}
+
+/// Whether `symbol`, bound in the recursive resolver's flat scope, is a local
+/// binding of the queried file (a parameter, or a definition inside a function
+/// or `local()` body that doesn't escape it) rather than a global one. Global
+/// bindings of the queried file all come from top-level `Def` events.
+fn point_binding_is_local(
+    queried: &ScopeArtifacts,
+    queried_uri: &Url,
+    symbol: &ScopedSymbol,
+) -> bool {
+    symbol.source_uri == *queried_uri
+        && !queried.timeline.iter().any(|event| {
+            matches!(
+                event,
+                ScopeEvent::Def {
+                    line,
+                    column,
+                    symbol: defined,
+                    function_scope: None,
+                    ..
+                } if *line == symbol.defined_line
+                    && *column == symbol.defined_column
+                    && defined.name == symbol.name
+            )
+        })
 }
 
 /// The net effect on the global environment of a child run by a
@@ -4232,15 +4275,18 @@ fn finalize_scope_timeline(artifacts: &mut ScopeArtifacts, line_index: &LineInde
 
 /// Keep the [`ScopeArtifacts::global_effects`] entries whose timeline event
 /// stayed at the runtime top level (not in a real or synthetic function scope)
-/// once the timeline is annotated, and put them in document order: removals
+/// once the timeline is annotated, and put them in execution order: removals
 /// are detected in a separate pass from definitions. Each entry shares its
-/// anchor with the event pushed alongside it; the sort is stable, so the
-/// literal-stem definitions of a `data()` call stay ahead of its load.
+/// anchor with the event pushed alongside it. A definition sorts by the
+/// position it takes effect (after its right-hand side, so
+/// `x <<- { rm(x, envir = globalenv()); 2 }` leaves `x` bound); a removal or
+/// load sorts by its call.
 fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
     if artifacts.global_effects.is_empty() {
         return;
     }
-    let mut top_level_defs: HashSet<(&str, u32, u32)> = HashSet::new();
+    // Definition anchor -> the position the binding takes effect.
+    let mut top_level_defs: HashMap<(&str, u32, u32), (u32, u32)> = HashMap::new();
     let mut top_level_removals: HashSet<(u32, u32)> = HashSet::new();
     let mut top_level_data_loads: HashSet<(u32, u32)> = HashSet::new();
     for event in &artifacts.timeline {
@@ -4248,11 +4294,16 @@ fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
             ScopeEvent::Def {
                 line,
                 column,
+                visible_from_line,
+                visible_from_column,
                 symbol,
                 function_scope: None,
                 ..
             } => {
-                top_level_defs.insert((symbol.name.as_ref(), *line, *column));
+                top_level_defs.insert(
+                    (symbol.name.as_ref(), *line, *column),
+                    (*visible_from_line, *visible_from_column),
+                );
             }
             ScopeEvent::Removal {
                 line,
@@ -4273,26 +4324,28 @@ fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
             _ => {}
         }
     }
-    let mut retained: Vec<GlobalEffect> = artifacts
+    let mut retained: Vec<((u32, u32), GlobalEffect)> = artifacts
         .global_effects
         .iter()
-        .filter(|effect| match effect {
-            GlobalEffect::Def(symbol) => top_level_defs.contains(&(
-                symbol.name.as_ref(),
-                symbol.defined_line,
-                symbol.defined_column,
-            )),
-            GlobalEffect::Removal { line, column, .. } => {
-                top_level_removals.contains(&(*line, *column))
-            }
-            GlobalEffect::DataLoad { line, column, .. } => {
-                top_level_data_loads.contains(&(*line, *column))
-            }
+        .filter_map(|effect| {
+            let effect_position = match effect {
+                GlobalEffect::Def(symbol) => *top_level_defs.get(&(
+                    symbol.name.as_ref(),
+                    symbol.defined_line,
+                    symbol.defined_column,
+                ))?,
+                GlobalEffect::Removal { line, column, .. } => top_level_removals
+                    .contains(&(*line, *column))
+                    .then_some((*line, *column))?,
+                GlobalEffect::DataLoad { line, column, .. } => top_level_data_loads
+                    .contains(&(*line, *column))
+                    .then_some((*line, *column))?,
+            };
+            Some((effect_position, effect.clone()))
         })
-        .cloned()
         .collect();
-    retained.sort_by_key(GlobalEffect::anchor);
-    artifacts.global_effects = retained;
+    retained.sort_by_key(|(effect_position, _)| *effect_position);
+    artifacts.global_effects = retained.into_iter().map(|(_, effect)| effect).collect();
 }
 
 /// Issue #402: append nested `FunctionScope` events for Shiny deferred-
@@ -5076,10 +5129,9 @@ fn text_connection_targets_global(node: Node, line_index: &LineIndex) -> bool {
 /// at top level this becomes a package-internal symbol; inside a function body
 /// the position-based scope annotation keeps it local, matching R's semantics.
 /// Only the common, statically-safe shape is handled: the name argument is a
-/// non-empty string literal. It is found the way R matches arguments: a named
-/// `x =` anywhere wins, otherwise the first unnamed argument (named arguments
-/// such as `value =` never take the positional slot), so
-/// `delayedAssign("wrong", x = "right")` binds `right`. Accepts the bare and
+/// non-empty string literal, found by matching arguments the way R does
+/// (`match_call_arguments`), so `delayedAssign("wrong", x = "right")` binds
+/// `right`. Accepts the bare and
 /// `base::`-qualified callee.
 fn try_extract_delayed_assign_call(
     node: Node,
@@ -5092,23 +5144,17 @@ fn try_extract_delayed_assign_call(
     }
 
     let args_node = node.child_by_field_name("arguments")?;
-    let mut named_x = None;
-    let mut first_positional = None;
-    for child in args_node.children(&mut args_node.walk()) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        if let Some(name_node) = child.child_by_field_name("name") {
-            if named_x.is_none() && node_text(name_node, line_index.text) == "x" {
-                named_x = Some(child.child_by_field_name("value"));
-            }
-        } else if first_positional.is_none() {
-            first_positional = Some(child.child_by_field_name("value"));
-        }
-    }
-    let name_arg = named_x.or(first_positional).flatten();
+    let matched = super::binding::match_call_arguments(
+        args_node,
+        line_index.text,
+        &["x", "value", "eval.env", "assign.env"],
+        super::binding::CallMatchMode::Strict,
+    )?;
+    let super::binding::CallActual::Value(name_arg) = matched[0]? else {
+        return None;
+    };
 
-    let name_node = name_arg?;
+    let name_node = name_arg;
     if name_node.kind() != "string" {
         return None;
     }
@@ -9427,8 +9473,13 @@ where
                         &mut scope,
                         &mut forward_contributed,
                         &child_artifacts,
+                        &artifacts,
                         uri,
-                        merge_policy.is_execution_order(),
+                        if merge_policy.is_execution_order() {
+                            GlobalEffectMerge::ExecutionOrder
+                        } else {
+                            GlobalEffectMerge::FirstWins
+                        },
                         escaping_visibility,
                         data_alias_provider,
                     );
@@ -9472,8 +9523,9 @@ where
                                 &mut scope,
                                 &mut forward_contributed,
                                 &child_artifacts,
+                                &artifacts,
                                 uri,
-                                false,
+                                GlobalEffectMerge::FirstWins,
                                 visibility,
                                 data_alias_provider,
                             );
@@ -9848,6 +9900,25 @@ where
                                 scope.removed_names.remove(&name);
                                 scope.symbols.entry(name).or_insert(symbol);
                             }
+                        }
+                        // The child's global removals also reach this
+                        // file's globals, as when the block hides the call.
+                        if current_frame_source_reaches_global(
+                            source,
+                            effective_function_scope,
+                            &artifacts.function_scope_tree,
+                        ) && let Some(child_artifacts) = get_artifacts(&child_uri)
+                        {
+                            merge_global_effects_into_point_scope(
+                                &mut scope,
+                                &mut forward_contributed,
+                                &child_artifacts,
+                                &artifacts,
+                                uri,
+                                GlobalEffectMerge::RemovalsOnly,
+                                visibility,
+                                data_alias_provider,
+                            );
                         }
                     }
                     scope.chain.extend(child_scope.chain);
@@ -14524,8 +14595,9 @@ mod tests {
         assert_eq!(global_effect_defs(&artifacts), vec!["ds", "out", "dv"]);
     }
 
-    /// Global removals and `data()` loads join the definitions in document
-    /// order, though `rm()` calls are detected in a separate pass. Removals
+    /// Global removals and `data()` loads join the definitions in execution
+    /// order, though `rm()` calls are detected in a separate pass; a
+    /// definition takes effect at the end of its call. Removals
     /// inside a function body, from the calling frame, or to an unproven
     /// destination are left out.
     #[test]
@@ -14556,8 +14628,8 @@ local({ rm(by_pos, pos = 1) })
                 "rm early",
                 "def captured",
                 "rm captured",
-                "def api",
                 "data api Some(\"survey\")",
+                "def api",
                 "rm by_pos",
             ]
         );
@@ -14795,6 +14867,111 @@ local({ caught <- 0; local({ caught <<- 12 }) })
         );
         assert!(!shallow.symbols.contains_key("published"));
         assert!(!shallow.depth_exceeded.is_empty());
+    }
+
+    /// A locally sourced child's global removals reach the caller's globals
+    /// both when a query sees the source call (inside its block) and when the
+    /// block hides it, but leave the block's own bindings alone. Definitions
+    /// take effect after their right-hand side, so `z <<- { rm(z, ...); 2 }`
+    /// leaves `z` bound.
+    #[test]
+    fn current_frame_source_global_removals_spare_local_bindings() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let child_code = "rm(x, y, envir = globalenv())\n\
+                          z <<- { rm(z, envir = globalenv()); 2 }\n";
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+        for source_line in [
+            "  source(\"child.R\", local = TRUE)",
+            "  local({ source(\"child.R\", local = TRUE) })",
+        ] {
+            let parent_code = format!(
+                "x <- 1\ny <- 1\nlocal({{\n  y <- 2\n{source_line}\n  y\n}})\nafter <- 1\n"
+            );
+            let parent_artifacts = Arc::new(compute_artifacts(
+                &parent_uri,
+                &parse_r(&parent_code),
+                &parent_code,
+            ));
+            let parent_meta = crate::cross_file::extract_metadata(&parent_code);
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri {
+                    Some(parent_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                (uri == &parent_uri).then(|| std::sync::Arc::new(parent_meta.clone()))
+            };
+            let base_exports = HashSet::new();
+            // (line, column, [(name, visible)]): inside the block after the
+            // source, then after the block.
+            for (line, column, expected) in [
+                (5, 2, [("x", false), ("y", true), ("z", true)]),
+                (7, 0, [("x", false), ("y", false), ("z", true)]),
+            ] {
+                let scope = scope_at_position_with_graph(
+                    &parent_uri,
+                    line,
+                    column,
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    Some(&workspace_root),
+                    10,
+                    &base_exports,
+                    false,
+                    crate::cross_file::config::BackwardDependencyMode::Auto,
+                    &|| false,
+                    None,
+                    None,
+                );
+                let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+                let mut stream = ScopeStream::new(
+                    &parent_uri,
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    Some(&workspace_root),
+                    10,
+                    &base_exports,
+                    false,
+                    crate::cross_file::config::BackwardDependencyMode::Auto,
+                    &|| false,
+                    &prefix_cache,
+                    None,
+                    None,
+                )
+                .unwrap();
+                stream.advance_to(line, column);
+                for (name, visible) in expected {
+                    assert_eq!(
+                        scope.symbols.contains_key(name),
+                        visible,
+                        "recursive {name} at ({line}, {column}) with {source_line}"
+                    );
+                    assert_eq!(
+                        stream.is_visible(name),
+                        visible,
+                        "stream {name} at ({line}, {column}) with {source_line}"
+                    );
+                }
+            }
+        }
     }
 
     /// A child run by `local({ source(f, local = TRUE) })` contributes the net
