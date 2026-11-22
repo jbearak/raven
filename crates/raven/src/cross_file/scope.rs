@@ -1368,7 +1368,7 @@ fn merge_global_effects_into_point_scope(
     child: &ScopeArtifacts,
     queried: &ScopeArtifacts,
     queried_uri: &Url,
-    merge: GlobalEffectMerge<'_>,
+    merge: GlobalEffectMerge,
     visibility: EventVisibility,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) {
@@ -1377,14 +1377,12 @@ fn merge_global_effects_into_point_scope(
     for (name, effect) in effects {
         let Some(symbol) = effect else {
             // The flat scope also holds the query's enclosing local
-            // bindings, and the child's own bindings in the calling frame
-            // when the query sees the call, which a global removal leaves
-            // alone.
-            if scope.symbols.get(&name).is_some_and(|existing| {
-                point_binding_is_local(queried, queried_uri, existing)
-                    || matches!(merge, GlobalEffectMerge::RemovalsOnly { child_uri }
-                        if existing.source_uri == *child_uri)
-            }) {
+            // bindings, which a global removal leaves alone.
+            if scope
+                .symbols
+                .get(&name)
+                .is_some_and(|existing| point_binding_is_local(queried, queried_uri, existing))
+            {
                 continue;
             }
             scope.symbols.remove(&name);
@@ -1394,7 +1392,7 @@ fn merge_global_effects_into_point_scope(
             continue;
         };
         let execution_order = match merge {
-            GlobalEffectMerge::RemovalsOnly { .. } => continue,
+            GlobalEffectMerge::RemovalsOnly => continue,
             GlobalEffectMerge::FirstWins => false,
             GlobalEffectMerge::ExecutionOrder => true,
         };
@@ -1416,15 +1414,14 @@ fn merge_global_effects_into_point_scope(
 /// How [`merge_global_effects_into_point_scope`] applies a child's net
 /// bindings; net removals always apply.
 #[derive(Clone, Copy)]
-enum GlobalEffectMerge<'a> {
+enum GlobalEffectMerge {
     /// First binding wins, as for other source contributions.
     FirstWins,
     /// Later bindings override, under execution-order merging.
     ExecutionOrder,
-    /// Bindings are skipped: the ordinary merge of the child at `child_uri`
-    /// already brought them in, and the child's own bindings in the calling
-    /// frame survive its global removals.
-    RemovalsOnly { child_uri: &'a Url },
+    /// Bindings are skipped: the ordinary child merge brings them in, after
+    /// these removals.
+    RemovalsOnly,
 }
 
 /// Whether `symbol`, bound in the recursive resolver's flat scope, is a local
@@ -9852,6 +9849,27 @@ where
                         // The forward-source leak rule (same-file +
                         // parent-prefix-only) lives in
                         // `child_source_symbol_is_leak`.
+                        // The child's global removals also reach this
+                        // file's globals, as when the block hides the call.
+                        // They run before the child's own calling-frame
+                        // bindings merge, which survive them.
+                        if current_frame_source_reaches_global(
+                            source,
+                            effective_function_scope,
+                            &artifacts.function_scope_tree,
+                        ) && let Some(child_artifacts) = get_artifacts(&child_uri)
+                        {
+                            merge_global_effects_into_point_scope(
+                                &mut scope,
+                                &mut forward_contributed,
+                                &child_artifacts,
+                                &artifacts,
+                                uri,
+                                GlobalEffectMerge::RemovalsOnly,
+                                visibility,
+                                data_alias_provider,
+                            );
+                        }
                         let child_parent_prefix_symbol_names =
                             child_scope.parent_prefix_symbol_names.clone();
                         if merge_policy.is_execution_order() {
@@ -9916,27 +9934,6 @@ where
                                 scope.removed_names.remove(&name);
                                 scope.symbols.entry(name).or_insert(symbol);
                             }
-                        }
-                        // The child's global removals also reach this
-                        // file's globals, as when the block hides the call.
-                        if current_frame_source_reaches_global(
-                            source,
-                            effective_function_scope,
-                            &artifacts.function_scope_tree,
-                        ) && let Some(child_artifacts) = get_artifacts(&child_uri)
-                        {
-                            merge_global_effects_into_point_scope(
-                                &mut scope,
-                                &mut forward_contributed,
-                                &child_artifacts,
-                                &artifacts,
-                                uri,
-                                GlobalEffectMerge::RemovalsOnly {
-                                    child_uri: &child_uri,
-                                },
-                                visibility,
-                                data_alias_provider,
-                            );
                         }
                     }
                     scope.chain.extend(child_scope.chain);
@@ -14919,7 +14916,7 @@ local({ caught <- 0; local({ caught <<- 12 }) })
             ("  local({ source(\"child.R\", local = TRUE) })", false),
         ] {
             let parent_code = format!(
-                "x <- 1\ny <- 1\nlocal({{\n  y <- 2\n{source_line}\n  y\n}})\nafter <- 1\n"
+                "x <- 1; w <- 1\ny <- 1\nlocal({{\n  y <- 2\n{source_line}\n  y\n}})\nafter <- 1\n"
             );
             let parent_artifacts = Arc::new(compute_artifacts(
                 &parent_uri,
