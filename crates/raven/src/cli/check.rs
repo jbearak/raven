@@ -867,6 +867,10 @@ fn build_indexed_state_reporting(
         &mut entries,
         &[],
         &crate::state::WorkspaceGraphDerivationContext {
+            // The scan computed each entry's artifacts from its final
+            // metadata, so only entries the derivation changes (a directory
+            // passed on, say) need them again.
+            reuse_unchanged_artifacts: true,
             workspace_root: Some(workspace_url.clone()),
             max_depth: max_chain_depth,
             exclusions: state.workspace_exclusions.clone(),
