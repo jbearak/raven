@@ -51,7 +51,13 @@ function file_run_for(binary: string): string | undefined {
             (process.platform === 'win32' ? ['', '.com', '.exe'] : ['']).map((ext) => path.join(dir, binary + ext)))
         : [binary];
     return candidates.find((file) => {
-        try { return fs.statSync(file).isFile(); } catch { return false; }
+        try {
+            // `execvp` passes over files it can't execute.
+            if (process.platform !== 'win32') fs.accessSync(file, fs.constants.X_OK);
+            return fs.statSync(file).isFile();
+        } catch {
+            return false;
+        }
     });
 }
 

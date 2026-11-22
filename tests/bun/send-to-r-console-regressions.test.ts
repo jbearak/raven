@@ -428,6 +428,13 @@ describe('package tasks follow a session console choice', () => {
         expect(second.creationOptions.shellPath).toBe('R');
     });
 
+    test('two tasks requested at once share one terminal', async () => {
+        fake.set_setting('raven.rTerminal.program', 'global', 'raven');
+        const [a, b] = await Promise.all([build.get_or_create_tasks_terminal(), build.get_or_create_tasks_terminal()]);
+        expect(b).toBe(a);
+        expect(fake.window.terminals.length).toBe(1);
+    });
+
     // The fixture is a shell script.
     test.skipIf(process.platform === 'win32')('a task requested while the first is still starting follows the new choice', async () => {
         binary._clear_console_probes_for_test();
