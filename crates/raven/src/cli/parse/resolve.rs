@@ -425,6 +425,20 @@ impl<'t> ScopePoints<'t> {
 /// `helper <- function(x) x; if (debug) helper <- NULL` either may be what R
 /// finds. A binding whose value Raven doesn't know, such as `k <- foo()` or a
 /// parameter, is never passed over.
+///
+/// Three refinements, each of which keeps an unknown case as "not passed
+/// over":
+/// - `assign("name", value)` with just those two arguments binds as
+///   `name <- value` does, at the position the scope gives its definition
+///   (the call's start). With more arguments (`envir`, `pos`, ...) the frame
+///   isn't worked out, so a non-literal value competes in every frame.
+/// - The single argument of `local()` is a frame of its own, as the scope
+///   reads it: `mean <- 7; local({ mean <- function(x) 0 })` leaves the
+///   outer `mean` a literal.
+/// - An assignment inside `quote()` or `expression()` doesn't run, so it is
+///   no binding, but only when the scope agrees: it records no definition
+///   there. Where the scope can't tell the call is base's and records one,
+///   the assignment still counts.
 #[derive(Default)]
 struct LiteralBindings {
     /// Each literal assignment's target: its scope position, and the
@@ -438,34 +452,66 @@ struct LiteralBindings {
 }
 
 impl LiteralBindings {
-    fn new(points: &ScopePoints<'_>) -> Self {
+    /// `definitions` is every position the scope records a definition at in
+    /// this text, or `None` when the scope has no record of the file.
+    fn new(points: &ScopePoints<'_>, definitions: Option<&HashSet<(u32, u32)>>) -> Self {
         let mut bindings = LiteralBindings::default();
         let text = points.text.as_ref();
         let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(text, None)) else {
             return bindings;
         };
-        let mut stack = vec![(tree.root_node(), None)];
-        while let Some((node, function)) = stack.pop() {
-            if node.kind() == "binary_operator" {
-                bindings.assignment(node, function, points);
-            }
-            let function = match node.kind() {
+        // Each node with its frame (the enclosing function's or `local()`
+        // call's start byte; `None` at the top level) and whether it is
+        // inside `quote()` or `expression()`.
+        let mut stack = vec![(tree.root_node(), None, false)];
+        while let Some((node, frame, quoted)) = stack.pop() {
+            // Quoted code the scope records no definition in doesn't run.
+            let runs = |target: TsNode<'_>| {
+                !quoted
+                    || definitions.is_none_or(|definitions| {
+                        definitions.contains(&points.at(target.start_byte()))
+                    })
+            };
+            let (mut frame, mut quoted) = (frame, quoted);
+            match node.kind() {
+                "binary_operator" => bindings.assignment(node, frame, points, &runs),
                 "function_definition" => {
                     bindings.parameters(node, points);
-                    Some(node.start_byte())
+                    frame = Some(node.start_byte());
                 }
-                _ => function,
-            };
+                "call" => {
+                    let arguments = call_arguments(node, text);
+                    match base_callee(node, text) {
+                        Some("assign") if runs(node) => {
+                            bindings.assign_call(node, &arguments, frame, points)
+                        }
+                        Some("local")
+                            if matches!(arguments.as_slice(), [(None | Some("expr"), _)]) =>
+                        {
+                            frame = Some(node.start_byte());
+                        }
+                        Some("quote" | "expression") => quoted = true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
             let mut cursor = node.walk();
             stack.extend(
                 node.named_children(&mut cursor)
-                    .map(|child| (child, function)),
+                    .map(|child| (child, frame, quoted)),
             );
         }
         bindings
     }
 
-    fn assignment(&mut self, node: TsNode<'_>, function: Option<usize>, points: &ScopePoints<'_>) {
+    fn assignment(
+        &mut self,
+        node: TsNode<'_>,
+        function: Option<usize>,
+        points: &ScopePoints<'_>,
+        runs: &dyn Fn(TsNode<'_>) -> bool,
+    ) {
         let text = points.text.as_ref();
         let (Some(lhs), Some(op), Some(rhs)) = (
             node.child_by_field_name("lhs"),
@@ -484,6 +530,9 @@ impl LiteralBindings {
         let Some(name) = scope::assignment_identifier_name(target, text) else {
             return;
         };
+        if !runs(target) {
+            return;
+        }
         let name = name.to_string();
         match (is_literal(value), superassignment) {
             (true, false) => {
@@ -495,6 +544,52 @@ impl LiteralBindings {
                 self.other.insert((function, name));
             }
             (false, true) => {
+                self.other_anywhere.insert(name);
+            }
+        }
+    }
+
+    /// `assign("name", value)`: with just those two arguments, a binding of
+    /// `name` in this frame, where the scope puts it (the call's start).
+    /// With more arguments the frame isn't known: a literal value is then no
+    /// binding here, and any other value competes in every frame.
+    fn assign_call(
+        &mut self,
+        call: TsNode<'_>,
+        arguments: &[(Option<&str>, TsNode<'_>)],
+        frame: Option<usize>,
+        points: &ScopePoints<'_>,
+    ) {
+        let text = points.text.as_ref();
+        let named = |name: &str| {
+            arguments
+                .iter()
+                .find(|(given, _)| *given == Some(name))
+                .map(|(_, value)| *value)
+        };
+        let mut positional = arguments
+            .iter()
+            .filter(|(given, _)| given.is_none())
+            .map(|(_, value)| *value);
+        let target = named("x").or_else(|| positional.next());
+        let value = named("value").or_else(|| positional.next());
+        let Some(name) = target
+            .filter(|target| target.kind() == "string")
+            .and_then(|target| literals::string(&text[target.byte_range()]).1.text())
+        else {
+            return;
+        };
+        let literal = value.is_some_and(is_literal);
+        match (arguments.len() == 2 && value.is_some(), literal) {
+            (true, true) => {
+                self.literal
+                    .insert(points.at(call.start_byte()), (frame, name));
+            }
+            (true, false) => {
+                self.other.insert((frame, name));
+            }
+            (false, true) => {}
+            (false, false) => {
                 self.other_anywhere.insert(name);
             }
         }
@@ -528,6 +623,48 @@ impl LiteralBindings {
                     && !self.other_anywhere.contains(&key.1)
             })
     }
+}
+
+/// The name a call's function is written as, when it is a plain name or
+/// `base::name`: what `assign`, `local`, `quote`, and `expression` are
+/// matched by. A workspace function of one of those names is read as base's.
+fn base_callee<'t>(call: TsNode<'_>, text: &'t str) -> Option<&'t str> {
+    let function = call.child_by_field_name("function")?;
+    let name = match function.kind() {
+        "identifier" => function,
+        "namespace_operator" => {
+            let package = function.child_by_field_name("lhs")?;
+            if &text[package.byte_range()] != "base" {
+                return None;
+            }
+            function
+                .child_by_field_name("rhs")
+                .filter(|name| name.kind() == "identifier")?
+        }
+        _ => return None,
+    };
+    Some(&text[name.byte_range()])
+}
+
+/// A call's arguments that have a value, each with its name as written.
+fn call_arguments<'t, 'tree>(
+    call: TsNode<'tree>,
+    text: &'t str,
+) -> Vec<(Option<&'t str>, TsNode<'tree>)> {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .filter(|argument| argument.kind() == "argument")
+        .filter_map(|argument| {
+            let name = argument
+                .child_by_field_name("name")
+                .map(|name| &text[name.byte_range()]);
+            Some((name, argument.child_by_field_name("value")?))
+        })
+        .collect()
 }
 
 /// A literal, which `raven parse` prints as a `number`, `string`, or
@@ -816,11 +953,26 @@ impl<'w> FileResolver<'w> {
         let bindings = match cached {
             Some(bindings) => bindings,
             None => {
+                // Where the scope records a definition in the file.
+                let definitions: Option<HashSet<(u32, u32)>> =
+                    self.snapshot().artifacts_map.get(uri).map(|artifacts| {
+                        artifacts
+                            .timeline
+                            .iter()
+                            .filter_map(|event| match event {
+                                scope::ScopeEvent::Def { symbol, .. } => {
+                                    Some((symbol.defined_line, symbol.defined_column))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                let definitions = definitions.as_ref();
                 let bindings = Rc::new(if *uri == self.names.uri {
-                    LiteralBindings::new(self.points)
+                    LiteralBindings::new(self.points, definitions)
                 } else {
                     self.other_points(uri)
-                        .map(|points| LiteralBindings::new(&points))
+                        .map(|points| LiteralBindings::new(&points, definitions))
                         .unwrap_or_default()
                 });
                 self.literal_bindings
@@ -929,8 +1081,15 @@ impl<'w> FileResolver<'w> {
             None => Some(self.unresolved(stream, name, line, column)),
         };
         // A caller the scope doesn't read (see `hidden_callers`) may define
-        // or attach what the file's own global environment doesn't bind.
-        if settled || !self.hidden_callers {
+        // or attach what the file's own global environment doesn't bind. So
+        // may any caller once the file's own literal was passed over, for a
+        // function body, which runs later: the scope's merged view has the
+        // literal in place of what a caller binds after its `source()` call,
+        // and each caller's own view still has that later binding.
+        let rebound_later = self.global_overwritten.get()
+            && !self.callers.is_empty()
+            && self.inside_late_binding_function(line, column);
+        if settled || !(self.hidden_callers || rebound_later) {
             return resolution;
         }
         let packages = stream.package_snapshot();
