@@ -622,10 +622,11 @@ export class ArrowSliceReader {
         // their fixed-width columns as chunks: one projected read per
         // column beats a request per cell.
         const sparse: number[] = [];
-        const dense: number[] = [];
+        const dense = new Set<number>();
         for (const bi of batchIndices) {
             const batchRows = this.batchStarts[bi + 1] - this.batchStarts[bi];
-            (byBatch.get(bi)!.local.length < batchRows * DENSE_BATCH_SHARE ? sparse : dense).push(bi);
+            if (byBatch.get(bi)!.local.length < batchRows * DENSE_BATCH_SHARE) sparse.push(bi);
+            else dense.add(bi);
         }
         if (fixedCols.length > 0 && sparse.length > 0) {
             this.gather(sparse, byBatch, columns, fixedCols, rows);
@@ -635,7 +636,7 @@ export class ArrowSliceReader {
         }
         const denseCols = [...fixedCols, ...chunkCols];
         for (const bi of batchIndices) {
-            const cis = dense.includes(bi) ? denseCols : chunkCols;
+            const cis = dense.has(bi) ? denseCols : chunkCols;
             if (cis.length === 0) continue;
             if (req.viewportGeneration < this.latestViewportGen) {
                 return { rows: [], stale: true };

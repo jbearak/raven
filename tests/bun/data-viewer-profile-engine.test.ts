@@ -240,8 +240,9 @@ describe('profile engine', () => {
     });
 
     test('integer64: distinct values past 2^53 are counted apart, as R\'s table()', async () => {
-        // bit64::as.integer64(c("9007199254740992", "9007199254740993", "9007199254740993", "1", "0"))
-        const t = new Table({ big: vectorFromArray(BigInt64Array.from([9007199254740992n, 9007199254740993n, 9007199254740993n, 1n, 0n])) });
+        // bit64::as.integer64(c("9007199254740992", "9007199254740993", "9007199254740993", "1", "0", "95"))
+        // (95 sorts before 2^53 as a number but after it as text.)
+        const t = new Table({ big: vectorFromArray(BigInt64Array.from([9007199254740992n, 9007199254740993n, 9007199254740993n, 1n, 0n, 95n])) });
         const p = join(DIR, 'int64.arrow');
         writeFileSync(p, tableToIPC(t, 'file'));
         const r = await ArrowSliceReader.open(p);
@@ -250,15 +251,16 @@ describe('profile engine', () => {
             { value: '9007199254740993', count: 2, error: 0 },
             { value: 0, count: 1, error: 0 },
             { value: 1, count: 1, error: 0 },
+            { value: 95, count: 1, error: 0 },
             { value: '9007199254740992', count: 1, error: 0 },
         ];
         const { profile, counts } = await computeProfile(r, 0);
-        expect(profile.distinct).toEqual({ value: 4, exact: true });
+        expect(profile.distinct).toEqual({ value: 5, exact: true });
         expect(counts!.entries).toEqual(want);
         expect((await countValues(r, 0)).entries).toEqual(want);
         // Rarest first keeps tied values in value order.
         expect(valueCountsFrom(counts!, 'asc', 10).entries.map(e => e.value))
-            .toEqual([0, 1, '9007199254740992', '9007199254740993']);
+            .toEqual([0, 1, 95, '9007199254740992', '9007199254740993']);
         await r.close();
     });
 
