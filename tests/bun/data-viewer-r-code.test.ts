@@ -159,9 +159,11 @@ describe('generateRCode', () => {
         expect(pcre(`^[${String.fromCharCode(0xd7ff)}-${String.fromCharCode(0xe000)}]*$`)).toBeNull();
         expect(pcre('^[a-z]*$')).not.toBeNull();
         // Counts of any-character atoms differ on non-BMP text.
-        for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]'])
+        for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]', 'foo[\\W]{2}bar', '^[\\D]$', '^[a\\W]$'])
             expect([p, pcre(p)]).toEqual([p, null]);
         expect(pcre('^.+$')).not.toBeNull();
+        expect(pcre('[\\D]*')).not.toBeNull();
+        expect(pcre('^[\\w]+$')).not.toBeNull();
         expect(pcre('^[^,]*,.*$')).not.toBeNull();
         for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]', '(?<a$b>x){0,10000}', '((x){0,200}){0,200}'])
             expect([p, pcre(p)]).toEqual([p, null]);

@@ -30,7 +30,7 @@ const FOLD = 'Kk\u212aSs\u017fÅå\u212bß\u1e9eΘθ\u03d1\u03f4Ωω\u2126\u1f80
 const STRINGS = [
     '', 'a', 'A', 'ab', 'AB', 'abc', 'xyz', 'file_10', 'File_2.csv', '9', '١', 'é', 'É', 'ﬀ', 'İ', 'ı', 'µ', 'μ', 'Μ',
     ...Array.from(FOLD), 'kelvin', 'KELVIN', '\u212aelvin', 'stress', 'STRESS', '\u017ftress', 'kiss', 'Straße', 'STRA\u1e9eE',
-    '😀', 'a😀b', '😀😀', '😀a', 'x😀', '𐐀', '𐐨',
+    '😀', 'a😀b', '😀😀', '😀a', 'x😀', '𐐀', '𐐨', 'foo😀bar', 'foo😀😀bar',
     'a\rb', 'a\nb', 'a\u2028b', 'a\u2029b', 'a\n', 'a\r\n', '\n', 'x y', 'x\u00a0y', 'x\u3000y', 'x\ufeffy', 'x\ty', 'x\u0085y', 'x\u000by',
     'a,b', ',', 'a-b', 'aa', 'a{ 2 }', 'a{,2}', 'a{2}', 'a]b', 'a^b', 'a$b', 'a\\b', 'foo bar', 'bar', 'FOO',
 ];
@@ -41,6 +41,8 @@ const PATTERNS = [
     '^[^k]*$', '^[^a-z]*$', '[k-m]', '[r-t]', '^[a-zA-Z]*$', '[\\w]', '^[\\w]+$', 'å', 'Å', 'θ', '\u03d1', 'Θ', 'ω', 'Ω', '[α-ω]', '^[θ-ω]$',
     'ß', '\u1e9e', '\u1f80', '\u1f88', 'é', 'É', 'µ', 'μ', 'ı', 'i', 'I',
     '^.$', '^..$', 'a.b', '[^a]', '^[^a]$', '\\S', '😀', '[😀]', '^.+.+$',
+    // Class escapes inside brackets consume half an emoji in JS, as outside.
+    'foo[\\W]{2}bar', '^[\\D]$', '^[\\Wa]$', '[\\D]*', 'foo[\\W]+bar',
     '(?:ab|k)s', 'sk*', '^(?<n>k)$', '(?<=k)s', '(?<!s)k', '(?=a)a', '(a|b)+', '(?:a.*)+', 'a{2}', 'a{1,}', 'x{', '}', ']', 'a]',
     '[\\]]', '[-a]', '[a-]', '\\.', '\\-', '\\/', 'file_\\d+', '^file_\\d+\\.csv$', 'a\\$b', '\\^', 'a\\\\b', '[$^]', '\\t', '\\n', '\\r',
     'foo|bar', '^(foo|bar)$', ',', '^[^,]*,.*$', '^a{ 2 }$', '^a{,2}$', '^a{2}$', 'a{2,}',

@@ -619,6 +619,8 @@ function readClass(p: string, start: number):
     if (p[i] === ']') return { reason: '`[]` means something else in R' };
     let body = '';
     let lastChar: number | null = null;
+    /** `\W` or `\D` in the class: in JS each matches a lone surrogate. */
+    let surrogateEscape = false;
     while (i < p.length && p[i] !== ']') {
         const c = p[i];
         const code = c.charCodeAt(0);
@@ -633,6 +635,7 @@ function readClass(p: string, start: number):
                 return { reason: `the escape \\${e ?? ''} in a class means something else in R` };
             }
             const isSet = /[dDwWs]/.test(e);
+            if (e === 'W' || e === 'D') surrogateEscape = true;
             // `[\d-z]`: a union with `-` in JS, an error in PCRE.
             if (isSet && p[i + 2] === '-' && p[i + 3] !== ']') {
                 return { reason: 'a range next to a class escape means something else in R' };
@@ -676,9 +679,11 @@ function readClass(p: string, start: number):
         js,
         inner: jsInner,
         end: i + 1,
-        // A range across the surrogates holds both halves of every emoji
-        // in JS but no emoji in R; it is refused above.
-        anyUnit: negated,
+        // A negated class, or one holding `\W` or `\D`, matches a lone
+        // surrogate in JS, as `\W` and `\D` outside a class do. A range
+        // across the surrogates holds both halves of every emoji in JS but
+        // no emoji in R; it is refused above.
+        anyUnit: negated || surrogateEscape,
     };
 }
 
