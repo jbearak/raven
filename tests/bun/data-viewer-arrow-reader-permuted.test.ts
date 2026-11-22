@@ -163,13 +163,16 @@ describe('getRows with permutation: bulk windows (a large sorted copy)', () => {
         return calls;
     };
 
-    test('a densely covered batch reads chunks, with the same cells as the gather', async () => {
+    test('a densely covered batch reads fixed-width columns as chunks; strings still gather', async () => {
+        // A fresh reader, read first: the chunks come from disk, not a warm cache.
         const r = await ArrowSliceReader.open(path);
         const calls = spy(r);
-        const plain = await r.getRows({ start: 0, end: N, columns, viewportGeneration: 1 });
         const reverse = Uint32Array.from({ length: N }, (_, i) => N - 1 - i);
         const out = await r.getRows({ start: 0, end: N, columns, viewportGeneration: 1, permutation: reverse });
-        expect(calls.gather).toBe(0);
+        // One gather, for the one string column only.
+        expect(calls.gather).toBe(1);
+        expect(calls.gatherColumn).toBe(1);
+        const plain = await r.getRows({ start: 0, end: N, columns, viewportGeneration: 1 });
         expect(out.rows).toEqual([...plain.rows].reverse());
         await r.close();
     });
@@ -181,7 +184,8 @@ describe('getRows with permutation: bulk windows (a large sorted copy)', () => {
         // Every 64th row, last first: under a quarter of each batch.
         const picks = Uint32Array.from({ length: N / 64 }, (_, i) => N - 1 - i * 64);
         const out = await r.getRows({ start: 0, end: picks.length, columns, viewportGeneration: 1, permutation: picks });
-        expect(calls.gather).toBe(1);
+        // Fixed-width columns, then strings: each column gathered once.
+        expect(calls.gather).toBe(2);
         expect(calls.gatherColumn).toBe(columns.length);
         expect(out.rows).toEqual([...picks].map(p => plain.rows[p]));
         await r.close();

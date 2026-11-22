@@ -256,6 +256,9 @@ describe('profile engine', () => {
         expect(profile.distinct).toEqual({ value: 4, exact: true });
         expect(counts!.entries).toEqual(want);
         expect((await countValues(r, 0)).entries).toEqual(want);
+        // Rarest first keeps tied values in value order.
+        expect(valueCountsFrom(counts!, 'asc', 10).entries.map(e => e.value))
+            .toEqual([0, 1, '9007199254740992', '9007199254740993']);
         await r.close();
     });
 

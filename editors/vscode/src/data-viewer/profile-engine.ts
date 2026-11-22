@@ -729,7 +729,8 @@ function labelledLevels(col: ColumnSchema, declared: Map<string, number>): Colum
 export function valueCountsFrom(s: CountSummary, order: 'desc' | 'asc', limit: number): ValueCounts {
     const sorted = order === 'desc'
         ? s.entries
-        : [...s.entries].sort((a, b) => a.count - b.count || compareKeys(a.value, b.value));
+        // Stable: ties keep the summary's order (by value).
+        : [...s.entries].sort((a, b) => a.count - b.count);
     const entries = sorted.slice(0, limit);
     return {
         columnIndex: s.columnIndex,

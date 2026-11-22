@@ -30,7 +30,9 @@
  *     other are coalesced. Column types the gather doesn't decode fall
  *     back to a projected chunk read for that column, and a batch the
  *     window covers densely (a quarter of its rows or more, as in a
- *     large sorted copy) is read as viewport chunks instead.
+ *     large sorted copy) reads its fixed-width columns as viewport
+ *     chunks instead. Strings always gather: the gather reads at most
+ *     what a cell shows, a chunk every string in full.
  *   - **Null counts** ({@link ArrowSliceReader.nullCounts}) sum each
  *     batch header's `FieldNode.null_count`, without reading any data.
  *     They are never computed on the open path.
@@ -606,41 +608,42 @@ export class ArrowSliceReader {
             return { rows, stale: false, originalRowIndices };
         }
 
-        // Batches the window covers densely (a large sorted copy) read as
-        // chunks: one projected read per column beats a request per cell.
-        const sparse: number[] = [];
-        for (const bi of batchIndices) {
-            const batchRows = this.batchStarts[bi + 1] - this.batchStarts[bi];
-            if (byBatch.get(bi)!.local.length < batchRows * DENSE_BATCH_SHARE) {
-                sparse.push(bi);
-                continue;
-            }
-            if (req.viewportGeneration < this.latestViewportGen) {
-                return { rows: [], stale: true };
-            }
-            const chunks = await this.viewportChunks(bi, columns);
-            this.encodeFromChunks(byBatch.get(bi)!, columns, chunks, rows);
-        }
-
-        // Columns the gather can decode, and the ones that need a chunk.
-        const gatherCols: number[] = [];
+        // Columns the gather decodes, split by whether a chunk read could
+        // replace it; strings stay on the gather, which reads at most
+        // what a cell shows (a chunk holds every string in full).
+        const fixedCols: number[] = [];
+        const stringCols: number[] = [];
         const chunkCols: number[] = [];
         for (let ci = 0; ci < columns.length; ci++) {
-            (this.cols[columns[ci]].gather ? gatherCols : chunkCols).push(ci);
+            const kind = this.cols[columns[ci]].gather;
+            (kind ? (kind.k === 'utf8' ? stringCols : fixedCols) : chunkCols).push(ci);
         }
-        if (gatherCols.length > 0 && sparse.length > 0) {
-            this.gather(sparse, byBatch, columns, gatherCols, rows);
+        // Batches the window covers densely (a large sorted copy) read
+        // their fixed-width columns as chunks: one projected read per
+        // column beats a request per cell.
+        const sparse: number[] = [];
+        const dense: number[] = [];
+        for (const bi of batchIndices) {
+            const batchRows = this.batchStarts[bi + 1] - this.batchStarts[bi];
+            (byBatch.get(bi)!.local.length < batchRows * DENSE_BATCH_SHARE ? sparse : dense).push(bi);
         }
-        for (const bi of sparse) {
-            if (chunkCols.length === 0) break;
+        if (fixedCols.length > 0 && sparse.length > 0) {
+            this.gather(sparse, byBatch, columns, fixedCols, rows);
+        }
+        if (stringCols.length > 0) {
+            this.gather(batchIndices, byBatch, columns, stringCols, rows);
+        }
+        const denseCols = [...fixedCols, ...chunkCols];
+        for (const bi of batchIndices) {
+            const cis = dense.includes(bi) ? denseCols : chunkCols;
+            if (cis.length === 0) continue;
             if (req.viewportGeneration < this.latestViewportGen) {
                 return { rows: [], stale: true };
             }
-            const sub = chunkCols.map(ci => columns[ci]);
-            const chunks = await this.viewportChunks(bi, sub);
+            const chunks = await this.viewportChunks(bi, cis.map(ci => columns[ci]));
             const g = byBatch.get(bi)!;
-            for (let k = 0; k < chunkCols.length; k++) {
-                const ci = chunkCols[k];
+            for (let k = 0; k < cis.length; k++) {
+                const ci = cis[k];
                 const info = this.cols[columns[ci]];
                 for (let j = 0; j < g.local.length; j++) {
                     rows[g.out[j]][ci] = encodeArrowCell(chunks[k], g.local[j], info.arrowType);
