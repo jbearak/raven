@@ -24028,6 +24028,23 @@ impl Backend {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let packages_enabled = state.cross_file_config.packages_enabled;
+            let consumed_context_uris = std::cell::RefCell::new(Vec::new());
+
+            // A self-contained file declined the caller's directory above; its
+            // own backward directives still give it one, as in ordinary
+            // on-demand indexing.
+            if non_r_document.is_none() && cross_file_meta.standalone {
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut cross_file_meta,
+                    file_uri,
+                    workspace_root.as_ref(),
+                    |parent_uri| {
+                        consumed_context_uris.borrow_mut().push(parent_uri.clone());
+                        state.get_enriched_metadata(parent_uri)
+                    },
+                    state.cross_file_config.max_chain_depth,
+                );
+            }
 
             let (parent_content, attempted_parents) = collect_backward_parent_content_with(
                 file_uri,
@@ -24041,6 +24058,7 @@ impl Backend {
                         .or_else(|| state.cross_file_file_cache.get(parent_uri))
                 },
             );
+            consumed_context_uris.borrow_mut().extend(attempted_parents);
 
             let workspace_index_version = state.workspace_index.version();
 
@@ -24056,9 +24074,10 @@ impl Backend {
                         .clone(),
                 )
             };
-            let Some(analysis_basis) =
-                state.attach_analysis_context_authorities(analysis_basis, attempted_parents)
-            else {
+            let Some(analysis_basis) = state.attach_analysis_context_authorities(
+                analysis_basis,
+                consumed_context_uris.into_inner(),
+            ) else {
                 if let Some(claim) = &claim {
                     state
                         .workspace_index
@@ -39634,6 +39653,78 @@ mod project_config_initialize_tests {
         collector.abort();
     }
 
+    /// A self-contained file indexed on demand through a caller with a
+    /// `# raven: cd` takes no directory from that caller, but its own
+    /// `# raven: sourced-by` still gives it one.
+    #[tokio::test]
+    async fn on_demand_self_contained_file_keeps_its_backward_directory() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["module", "runner", "wd"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        // The closed runner is indexed (through `top.R`) before the forward
+        // chain reaches `init.R`, so `init.R`'s backward directive can see it.
+        fs::write(
+            base.join("runner/main.R"),
+            "# raven: cd ../wd\n# raven: run ../module/init.R\n",
+        )
+        .unwrap();
+        let top_text = "source(\"runner/main.R\")\n";
+        fs::write(base.join("top.R"), top_text).unwrap();
+        let init_path = base.join("module/init.R");
+        let top_uri = Url::from_file_path(base.join("top.R")).unwrap();
+        let init_uri = Url::from_file_path(&init_path).unwrap();
+        for (init_text, expected) in [
+            ("# raven: self-contained\nsource(\"helpers.R\")\n", None),
+            (
+                "# raven: self-contained\n# raven: sourced-by ../runner/main.R\nsource(\"helpers.R\")\n",
+                Some(base.join("wd").to_string_lossy().into_owned()),
+            ),
+        ] {
+            fs::write(&init_path, init_text).unwrap();
+            let (service, _socket) = tower_lsp::LspService::new(Backend::new);
+            let backend = service.inner();
+            backend
+                .initialize(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&base).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            backend.state.write().await.workspace_scan_complete = true;
+            open_doc(backend, &top_uri, "r", 1, top_text).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let metadata = loop {
+                if let Some(metadata) = backend
+                    .state
+                    .read()
+                    .await
+                    .workspace_index
+                    .get_metadata(&init_uri)
+                {
+                    break metadata;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "init.R indexed on demand"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                metadata.inherited_working_directory, expected,
+                "{init_text:?}"
+            );
+        }
+    }
+
     /// An open file follows its directory when it changes through a CLOSED
     /// intermediate file: `main.R` (`# raven: cd a`) sources the closed
     /// `mods/middle.R`, which sources the open `mods/child.R`. Editing the
@@ -39657,7 +39748,8 @@ mod project_config_initialize_tests {
         fs::write(base.join("mods/child.R"), child_text).unwrap();
         fs::write(base.join("a/constants.R"), "old_value <- 1\n").unwrap();
         fs::write(base.join("b/constants.R"), "special_value <- 2\n").unwrap();
-        fs::write(base.join("mods/constants.R"), "special_value <- 2\n").unwrap();
+        // Without an inherited directory the child would find this one.
+        fs::write(base.join("mods/constants.R"), "other_value <- 2\n").unwrap();
         let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
         let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
 

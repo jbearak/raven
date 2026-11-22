@@ -12581,6 +12581,7 @@ pub(crate) fn enrich_open_metadata_with_inherited_wd(
         max_depth,
         memo: HashMap::new(),
         on_path: HashSet::from([uri.clone()]),
+        met_cycle: false,
     };
     walk.enrich(metadata, uri, &forward_parents.direct, max_depth);
 }
@@ -12593,6 +12594,9 @@ struct ForwardWdWalk<'a, F> {
     max_depth: usize,
     memo: HashMap<Url, Option<Arc<crate::cross_file::CrossFileMetadata>>>,
     on_path: HashSet<Url>,
+    /// Whether the walk since this was last cleared met a parent already on
+    /// the path. Such a result depends on the path, so it is not memoized.
+    met_cycle: bool,
 }
 
 impl<F> ForwardWdWalk<'_, F>
@@ -12646,17 +12650,18 @@ where
     /// `parent`'s metadata with its inherited directory re-derived, or its
     /// stored metadata when no ancestor edges were captured for it or the
     /// depth runs out. `None` (proposes nothing) for a parent already on the
-    /// current path.
+    /// current path; a result that met one is not memoized.
     fn parent_metadata(
         &mut self,
         parent: &Url,
         depth: usize,
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        if self.on_path.contains(parent) {
+            self.met_cycle = true;
+            return None;
+        }
         if let Some(memo) = self.memo.get(parent) {
             return memo.clone();
-        }
-        if self.on_path.contains(parent) {
-            return None;
         }
         let stored = (self.get_metadata)(parent)?;
         let ancestors = self.ancestors;
@@ -12668,11 +12673,15 @@ where
         }
         let mut fresh = (*stored).clone();
         fresh.inherited_working_directory = None;
+        let outer_met_cycle = std::mem::take(&mut self.met_cycle);
         self.on_path.insert(parent.clone());
         self.enrich(&mut fresh, parent, grandparents, depth - 1);
         self.on_path.remove(parent);
         let fresh = Arc::new(fresh);
-        self.memo.insert(parent.clone(), Some(fresh.clone()));
+        if !self.met_cycle {
+            self.memo.insert(parent.clone(), Some(fresh.clone()));
+        }
+        self.met_cycle |= outer_met_cycle;
         Some(fresh)
     }
 }
