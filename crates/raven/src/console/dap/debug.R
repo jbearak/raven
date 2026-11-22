@@ -985,7 +985,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # Outside a UTF-8 locale R counts a multibyte character's every byte,
     # so non-ASCII text goes raw there.
     env$split_exprs <- function(text) internal(tryCatch({
-        if (!isTRUE(l10n_info()[["UTF-8"]]) && grepl("[^\\x01-\\x7f]", text, useBytes = TRUE)) return("")
+        if (!isTRUE(l10n_info()[["UTF-8"]]) && any(charToRaw(text) > as.raw(127L))) return("")
         ex <- parse(text = text, keep.source = TRUE)
         sr <- attr(ex, "srcref")
         if (length(ex) == 0L || length(sr) != length(ex)) return("")

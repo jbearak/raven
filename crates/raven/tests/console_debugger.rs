@@ -2270,3 +2270,29 @@ fn user_output_that_looks_like_a_probe_announcement_is_shown() {
         c.text()
     );
 }
+
+#[test]
+fn ascii_sends_still_bind_breakpoints_outside_a_utf8_locale() {
+    if !r_available() {
+        return;
+    }
+    // Outside UTF-8, only non-ASCII sends fall back to raw feeding.
+    let c = Console::spawn_with_env(&[("LC_ALL", "C"), ("LANG", "C")]);
+    let a = c.write_file("a.R", F_R);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": a}, "breakpoints": [{"line": 3}]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send("cat('utf8:', l10n_info()[['UTF-8']], '\\n')", None);
+    c.expect("utf8: FALSE");
+    let m = d.mark();
+    c.send(F_R, Some(&a));
+    let bp = d.event("breakpoint", m);
+    assert_eq!(bp["body"]["breakpoint"]["verified"], true, "{bp}");
+    let m = d.mark();
+    c.send("f(1)", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("f".to_string(), 3));
+}
