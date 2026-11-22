@@ -306,12 +306,14 @@ describe('View() writer (real R)', () => {
         const r = await runR([
             'df <- data.frame(h = as.difftime(c(1, 2), units = "hours"))',
             'attr(df$h, "label") <- "Hours worked"',
+            'attr(df$h, "labels") <- c(short = 1)',
             'View(df)',
         ].join('\n'));
         const reader = await ArrowSliceReader.open(r.files[0]);
         const f = fieldsMd(reader);
         expect(f.h['raven.variable_label']).toBe('Hours worked');
         expect(f.h['raven.original_class']).toBe('difftime');
+        expect(JSON.parse(f.h['raven.value_labels'])).toEqual({ '1': 'short' });
         await reader.close();
     }, 60_000);
 });
