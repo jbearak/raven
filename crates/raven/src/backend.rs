@@ -39756,7 +39756,23 @@ mod project_config_initialize_tests {
         follow_directory_through_closed_parent("x <- 1\n", "# raven: sourced-by middle.R\n").await;
     }
 
+    /// As above, with the child adding the directive only after the
+    /// parent's `cd` changed: the edit that adds it re-derives the child
+    /// through the newly named closed parent, not its stale index entry.
+    #[tokio::test]
+    async fn an_open_file_rederives_through_a_sourced_by_parent_it_adds() {
+        follow_directory_through_closed_parent_with("x <- 1\n", "", true).await;
+    }
+
     async fn follow_directory_through_closed_parent(middle_text: &str, child_header: &str) {
+        follow_directory_through_closed_parent_with(middle_text, child_header, false).await;
+    }
+
+    async fn follow_directory_through_closed_parent_with(
+        middle_text: &str,
+        child_header: &str,
+        add_directive: bool,
+    ) {
         use futures_util::{SinkExt, StreamExt};
         use tower::{Service, ServiceExt};
         use tower_lsp::jsonrpc::Request;
@@ -39865,6 +39881,23 @@ mod project_config_initialize_tests {
         };
         until(true, "special_value is undefined under a/").await;
 
+        if add_directive {
+            change_doc(backend, &main_uri, 2, &main_text("b")).await;
+            change_doc(
+                backend,
+                &child_uri,
+                2,
+                &format!("# raven: sourced-by middle.R\n{child_text}"),
+            )
+            .await;
+            until(
+                false,
+                "special_value is defined under b/ once the child names middle.R",
+            )
+            .await;
+            collector.abort();
+            return;
+        }
         change_doc(backend, &main_uri, 2, &main_text("b")).await;
         until(false, "special_value is defined under b/").await;
         change_doc(backend, &main_uri, 3, &main_text("a")).await;

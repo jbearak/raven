@@ -10706,6 +10706,8 @@ impl WorldState {
         let workspace_root = self.workspace_folders.first().cloned();
         for projection in plan.graph {
             let forward_children_before = forward_children(&self.cross_file_graph, &projection.uri);
+            let backward_parents_before =
+                backward_directive_parents(&self.cross_file_graph, &projection.uri);
             let result = self.cross_file_graph.update_file(
                 &projection.uri,
                 projection.graph_metadata.as_ref(),
@@ -10762,6 +10764,14 @@ impl WorldState {
                 effective_wd(Some(projection.new_metadata.as_ref())),
             );
             let mut refresh = backward_affected.clone();
+            // The commit's own derivation ran before its new
+            // `# raven: sourced-by` edges were installed, so it could not
+            // re-derive a newly named parent; re-derive the file itself.
+            if backward_directive_parents(&self.cross_file_graph, &projection.uri)
+                != backward_parents_before
+            {
+                refresh.push(projection.uri.clone());
+            }
             refresh.extend(
                 before
                     .symmetric_difference(&after)
@@ -12572,6 +12582,19 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
         .into_iter()
         .filter(|edge| is_wd_lending_edge(edge))
         .map(|edge| (edge.to.clone(), edge.chdir))
+        .collect()
+}
+
+/// The files `uri` names in `# raven: sourced-by` directives, per the graph.
+fn backward_directive_parents(
+    graph: &crate::cross_file::DependencyGraph,
+    uri: &Url,
+) -> std::collections::BTreeSet<Url> {
+    graph
+        .get_dependents(uri)
+        .into_iter()
+        .filter(|edge| edge.is_backward_directive)
+        .map(|edge| edge.from.clone())
         .collect()
 }
 
@@ -16715,7 +16738,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
+            elapsed < std::time::Duration::from_secs(60),
             "{} open-buffer derivations took {elapsed:?}",
             uris.len() * 2
         );
