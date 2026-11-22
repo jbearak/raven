@@ -251,23 +251,30 @@ local({
 /// Calls that put a binding in the global environment, by default or by
 /// argument, define it after a `local()` block, as they do in R. The same
 /// calls aimed at the block's own frame keep the binding in the block. Each
-/// of those is in its own file: after a call that may bind any name (such as
-/// `data()`), Raven no longer proves a later `local` is base's.
+/// of those is in its own file, and the positive cases use `base::local()`:
+/// after a call that may bind any name (such as `data()`), Raven no longer
+/// proves a later bare `local` is base's.
 #[test]
 fn global_destination_calls_inside_local_define_name_after_the_block() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
         "main.R",
-        r#"local({ data(raven_dataset, package = "ravenpkg") })
+        r#"base::local({ data(raven_dataset, package = "ravenpkg") })
 print(raven_dataset)
-local({ delayedAssign("delayed_global", 42, assign.env = globalenv()) })
+base::local({ delayedAssign("delayed_global", 42, assign.env = globalenv()) })
 print(delayed_global)
-local({ delayedAssign("delayed_partial", 42, assign = .GlobalEnv) })
-print(delayed_partial)
-local({ connection <- textConnection("captured", "w"); close(connection) })
+base::local({ connection <- textConnection("captured", "w"); close(connection) })
 print(captured)
 "#,
+    );
+    // An earlier `delayedAssign()` anywhere in the file stops Raven proving
+    // a later `.GlobalEnv` unshadowed, so this one gets its own file.
+    write(
+        dir.path(),
+        "partial.R",
+        "base::local({ delayedAssign(\"delayed_partial\", 42, assign = .GlobalEnv) })\n\
+         print(delayed_partial)\n",
     );
     write(
         dir.path(),

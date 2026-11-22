@@ -14243,6 +14243,11 @@ mod tests {
             ("kept <- 1\nlocal({ kept <- 2; rm(kept) })\n", "kept", true),
             // `globalenv` rebound earlier: not proven global.
             (
+                "globalenv <- function() parent.frame()\nkept <- 1\nlocal({ kept <- 2; rm(kept, envir = globalenv()) })\n",
+                "kept",
+                true,
+            ),
+            (
                 "globalenv <- function() new.env()\nlocal({ delayedAssign(\"dv\", 1, assign.env = globalenv()) })\n",
                 "dv",
                 false,

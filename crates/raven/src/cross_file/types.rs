@@ -929,13 +929,18 @@ impl ForwardSource {
     /// is encoded as `system_file` Some + empty `path`, not by `system_file`
     /// presence alone.
     ///
-    /// A URL (`source("https://...")`, `source("file:///abs/x.R")`) is exempt
-    /// too: R's `source()` reads it, but Raven doesn't resolve URLs to files.
-    /// `sys.source()` rejects URLs in R, so its URL paths stay diagnosable.
+    /// A URL in an AST-detected `source()` call (`source("https://...")`,
+    /// `source("file:///abs/x.R")`) is exempt too: R's `source()` reads it,
+    /// but Raven doesn't resolve URLs to files. `sys.source()` rejects URLs in
+    /// R, and directives and generated batch members name local files, so
+    /// their URL paths stay diagnosable.
     pub fn exempt_from_missing_file_diagnostics(&self) -> bool {
         self.resolved_uri.is_some()
             || (self.system_file.is_some() && self.path.is_empty())
-            || (!self.is_sys_source && super::source_detect::is_url_source_path(&self.path))
+            || (!self.is_sys_source
+                && !self.is_directive
+                && self.tar_source_ordinal.is_none()
+                && super::source_detect::is_url_source_path(&self.path))
     }
 
     /// Check if symbols from this source lend outward as global bindings.

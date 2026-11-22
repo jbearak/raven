@@ -120,9 +120,10 @@ pub struct RmCall {
     pub column: u32,
     /// Symbol names to remove
     pub symbols: Vec<String>,
-    /// The call names the global environment as its target (`envir =
-    /// globalenv()` / `.GlobalEnv`, or `pos = 1`), so in R the removal takes
-    /// effect there even from inside a `local()` block.
+    /// The call provably targets the global environment (`pos = 1`, or
+    /// `envir =` an unshadowed `globalenv()` / `.GlobalEnv`), so in R the
+    /// removal takes effect there even from inside a `local()` block. Set by
+    /// the frame-aware detector, which has the file's bindings.
     pub targets_global: bool,
 }
 
@@ -1250,8 +1251,9 @@ fn visit_node_for_rm(
                     )
                 });
         if (evaluation_frame.is_caller_or_global() || external_global_escape)
-            && let Some(rm_call) = try_parse_rm_call(node, content)
+            && let Some(mut rm_call) = try_parse_rm_call(node, content)
         {
+            rm_call.targets_global = rm_call_targets_global(node, content, capture_bindings);
             // Only add if there are symbols to remove.
             if !rm_call.symbols.is_empty() {
                 rm_calls.push(FramedRmCall {
@@ -1285,6 +1287,26 @@ fn visit_node_for_rm(
             rm_calls,
         );
     }
+}
+
+/// Whether an `rm()` call's destination is provably the global environment:
+/// `pos = 1`, or `envir =` an unshadowed `globalenv()` / `.GlobalEnv`.
+fn rm_call_targets_global(
+    node: Node,
+    content: &str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings,
+) -> bool {
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let bindings = capture_bindings.get();
+    let deferred_use = !bindings.is_source_ordered_at(node);
+    super::binding::remove_call_has_global_destination(
+        arguments,
+        content,
+        !bindings.named_alias_may_shadow_assuming_base_assign_at("globalenv", node, deferred_use),
+        !bindings.named_alias_may_shadow_assuming_base_assign_at(".GlobalEnv", node, deferred_use),
+    )
 }
 
 fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
@@ -1327,7 +1349,7 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
         line: start.row as u32,
         column,
         symbols,
-        targets_global: super::binding::arguments_explicitly_target_global(args_node, content),
+        targets_global: false,
     })
 }
 
