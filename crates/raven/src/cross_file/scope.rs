@@ -1361,7 +1361,10 @@ fn current_frame_source_reaches_global(
 /// name is overridden, and anything else is first-wins, or overrides under
 /// execution-order merging. A net removal acts like this file's own `rm()`
 /// at the `source()` call, with the call's `visibility`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the resolver state each call site already holds"
+)]
 fn merge_global_effects_into_point_scope(
     scope: &mut ScopeAtPosition,
     forward_contributed: &mut HashSet<Arc<str>>,

@@ -168,7 +168,7 @@ rm(x)
 x  # Warning: undefined variable
 ```
 
-Raven understands `rm(x)`, `rm(x, y)`, and `rm(list = c("x", "y"))`. Dynamic forms like `rm(list = ls())` are skipped.
+Raven understands `rm(x)`, `rm(x, y)`, and `rm(list = c("x", "y"))`, bare or as `base::rm()`. Dynamic forms like `rm(list = ls())` are skipped.
 
 ## Path resolution
 
