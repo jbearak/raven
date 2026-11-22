@@ -9844,6 +9844,126 @@ fn self_nse_package_for_file(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Optio
     crate::package_state::is_package_workspace_r_file(&path, root).then(|| name.clone())
 }
 
+/// [`NseAnalysis::infix_sites`] for the file at `uri`: for each infix
+/// operator call under `root` that some package declares (judged file-wide,
+/// so a file with none costs one tree walk), what the operator reaches at the
+/// call, read from the same streaming scope and position-aware package set
+/// (`inherited_packages`, `loaded_packages`, the package's `full_imports`)
+/// the undefined-variable collector uses for package exports. `None` when no
+/// such call exists or the file has no scope artifacts; the analysis then
+/// keeps its file-wide behavior.
+fn infix_sites_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    root: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+    cancel: &DiagCancelToken,
+) -> Option<HashMap<usize, InfixSite>> {
+    use crate::cross_file::scope::{ScopeLayer, package_name_from_uri};
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    analysis.package_library?;
+    if !text.contains(":=") && !text.contains('%') {
+        return None;
+    }
+    // (operator, operator token) for each declared operator call.
+    let mut calls: Vec<(&str, Node)> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "binary_operator"
+            && let Some(op) = declarable_infix_operator(node, text)
+            && let Some(operator) = node.child_by_field_name("operator")
+            && declared_infix_operator(op, operator.start_byte(), analysis) != (None, None)
+        {
+            calls.push((op, operator));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    calls.sort_by_key(|(_, operator)| operator.start_byte());
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let line_text = |row: usize| -> &str {
+        let start = line_starts.get(row).copied().unwrap_or(text.len());
+        let end = line_starts
+            .get(row + 1)
+            .map_or(text.len(), |next| next.saturating_sub(1));
+        text.get(start..end).unwrap_or("")
+    };
+    snapshot.with_scope_stream(uri, cancel, |stream| {
+        let stream = stream?;
+        let mut sites = HashMap::with_capacity(calls.len());
+        for (op, operator) in calls {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let position = operator.start_position();
+            let line = position.row as u32;
+            let column = byte_offset_to_utf16_column(line_text(position.row), position.column);
+            stream.advance_to(line, column);
+            // As the undefined-variable collector: a same-file binding made
+            // later is no binding here, unless R binds it late.
+            let found = stream.symbol_with_layer(op).filter(|(symbol, _)| {
+                stream.is_deferred_binding(symbol)
+                    || !is_forward_reference_in_same_file(symbol, uri, line, column)
+            });
+            let site = match found {
+                Some((symbol, _)) if package_name_from_uri(&symbol.source_uri).is_some() => {
+                    let package = package_name_from_uri(&symbol.source_uri).unwrap_or_default();
+                    InfixSite::Packages(vec![package.to_string()])
+                }
+                // The file's own top level: `declared_infix_operator` reads
+                // its aliases and shadows. Package-mode contributions are the
+                // package's own sources, whose declaration is the self
+                // package's.
+                Some((symbol, ScopeLayer::Global)) if symbol.source_uri == *uri => {
+                    attached_at(stream, snapshot, analysis)
+                }
+                Some((_, ScopeLayer::Contributions)) => attached_at(stream, snapshot, analysis),
+                Some(_) => InfixSite::Shadowed,
+                None => attached_at(stream, snapshot, analysis),
+            };
+            sites.insert(operator.start_byte(), site);
+        }
+        Some(sites)
+    })
+}
+
+/// [`InfixSite::Packages`] at the stream's cursor: the attached packages in
+/// the file-wide in-play order, then any others, sorted.
+fn attached_at(
+    stream: &mut SnapshotScopeStream<'_>,
+    snapshot: &DiagnosticsSnapshot,
+    analysis: &NseAnalysis,
+) -> InfixSite {
+    let scope = stream.package_snapshot();
+    let attached: HashSet<&String> = scope
+        .inherited_packages
+        .iter()
+        .chain(scope.loaded_packages.iter())
+        .chain(snapshot.scope_contribution.full_imports.iter())
+        .collect();
+    let mut packages: Vec<String> = analysis
+        .in_play_packages
+        .iter()
+        .filter(|package| attached.contains(package))
+        .cloned()
+        .collect();
+    let mut rest: Vec<String> = attached
+        .into_iter()
+        .filter(|package| !analysis.in_play_packages.contains(package))
+        .cloned()
+        .collect();
+    rest.sort();
+    packages.extend(rest);
+    InfixSite::Packages(packages)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
@@ -9907,7 +10027,7 @@ fn collect_undefined_variables_from_snapshot(
             deferred_funcs: Vec::new(),
         }
     };
-    let nse_analysis = NseAnalysis::build(
+    let mut nse_analysis = NseAnalysis::build(
         node,
         text,
         snapshot
@@ -9927,6 +10047,8 @@ fn collect_undefined_variables_from_snapshot(
         &cross_file_nse.deferred_nse,
         &cross_file_nse.deferred_funcs,
     );
+    nse_analysis.infix_sites =
+        infix_sites_from_snapshot(snapshot, uri, node, text, &nse_analysis, cancel);
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
         node,
@@ -20200,6 +20322,30 @@ pub(crate) struct NseAnalysis<'a> {
     /// helpers are visible through the completed support environment. Equal to
     /// `directive_nse` for every other topology.
     deferred_directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
+    /// What each package-declared infix operator reaches at its call site,
+    /// keyed by the operator token's start byte (see [`InfixSite`] and
+    /// [`infix_sites_from_snapshot`]). `None` outside the diagnostics
+    /// pipeline, where [`declared_infix_operator`] falls back to the
+    /// file-wide package set.
+    infix_sites: Option<HashMap<usize, InfixSite>>,
+}
+
+/// What a declarable infix operator (`:=`, `%op%`) reaches at one call
+/// site, read from the position-aware scope the undefined-variable collector
+/// uses: R looks the operator up from the call, so a package's declaration
+/// applies only where its operator is the one found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InfixSite {
+    /// A binding that is not a package's, other than the file's own top
+    /// level (which [`declared_infix_operator`] handles with the file's
+    /// aliases): an enclosing function's definition, a sourced file's, or a
+    /// caller's. No package declaration applies.
+    Shadowed,
+    /// The packages that may provide the operator here, in lookup order: a
+    /// selective import's package when one binds it, otherwise the packages
+    /// attached at this position (this file's earlier `library()` calls,
+    /// what callers lend, the package's own imports).
+    Packages(Vec<String>),
 }
 
 impl<'a> NseAnalysis<'a> {
@@ -20333,6 +20479,7 @@ impl<'a> NseAnalysis<'a> {
             base_exports,
             directive_nse: HashMap::new(),
             deferred_directive_nse: HashMap::new(),
+            infix_sites: None,
         };
         // Issue #433, second (context-aware) inference pass: a local function
         // that forwards its `...` directly into a covered verb's data-mask
@@ -23078,14 +23225,23 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
 /// that declares either.
 ///
 /// An infix operator cannot be namespace-qualified, so the provider is found
-/// the way R's search path would: a top-level `` `op` <- pkg::`op` `` alias
-/// names it outright; any other top-level binding of `` `op` `` shadows every
-/// package; otherwise the in-play packages, the package under development,
-/// and the owner of the export among in-play packages' dependencies are tried
-/// in that order. A `pkg::` qualifier elsewhere in the file does not count:
-/// it does not put `op` on the search path.
+/// the way R's search path would, from the call at `operator_start` (the
+/// operator token's start byte): a binding the call's scope reaches first
+/// that is not a package's (an enclosing function's `` `op` <- ``, a sourced
+/// file's) shadows every package ([`InfixSite::Shadowed`]); a top-level
+/// `` `op` <- pkg::`op` `` alias names the provider outright; any other
+/// top-level binding of `` `op` `` shadows every package; otherwise the
+/// packages attached at the call, the package under development, and the
+/// owner of the export among those packages' dependencies are tried in that
+/// order. A `pkg::` qualifier elsewhere in the file does not count: it does
+/// not put `op` on the search path, and neither does a `library()` call
+/// after the operator's call.
+///
+/// Without [`NseAnalysis::infix_sites`] (the collector tests that build an
+/// analysis by hand), the attached packages are the file-wide in-play set.
 fn declared_infix_operator(
     op: &str,
+    operator_start: usize,
     analysis: &NseAnalysis,
 ) -> (
     Option<crate::nse_declarations::OperatorForm>,
@@ -23098,6 +23254,15 @@ fn declared_infix_operator(
     if raven_models_infix_operator(op, analysis) {
         return none;
     }
+    let site = analysis
+        .infix_sites
+        .as_ref()
+        .and_then(|sites| sites.get(&operator_start));
+    let attached = match site {
+        Some(InfixSite::Shadowed) => return none,
+        Some(InfixSite::Packages(packages)) => packages,
+        None => &analysis.in_play_packages,
+    };
     let lookup = |pkg: &str| {
         let found = (
             lib.declared_operator_form(pkg, op),
@@ -23120,14 +23285,13 @@ fn declared_infix_operator(
     if analysis.local_callee_shadows.contains(&key) {
         return none;
     }
-    analysis
-        .in_play_packages
+    attached
         .iter()
         .map(String::as_str)
         .chain(analysis.self_nse_package.as_deref())
         .find_map(lookup)
         .or_else(|| {
-            lib.find_package_owner_for_symbol(op, &analysis.in_play_packages)
+            lib.find_package_owner_for_symbol(op, attached)
                 .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
                 .and_then(|owner| lookup(&owner))
         })
@@ -23159,13 +23323,14 @@ fn collect_declared_infix_usages<'a>(
     let Some(op) = declarable_infix_operator(node, text) else {
         return false;
     };
-    let (Some(lhs), Some(rhs)) = (
+    let (Some(lhs), Some(rhs), Some(operator)) = (
         node.child_by_field_name("lhs"),
         node.child_by_field_name("rhs"),
+        node.child_by_field_name("operator"),
     ) else {
         return false;
     };
-    let (form, policy) = declared_infix_operator(op, analysis);
+    let (form, policy) = declared_infix_operator(op, operator.start_byte(), analysis);
     if let Some(crate::nse_declarations::OperatorForm::SubsetAssign { masked_arguments }) = &form
         && lhs.kind() == "subset"
     {
@@ -32301,6 +32466,73 @@ d[, nested] := sum(nested_maen(income))
         let shadowed = format!("library(datakit)\n`:=` <- function(lhs, rhs) NULL\n{body}");
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), &shadowed).await;
         assert!(flagged.iter().any(|n| n == "age"), "shadowed: {flagged:?}");
+    }
+
+    /// R looks `:=` up from the call, so a definition an enclosing function
+    /// makes shadows the attached package's operator there, and the
+    /// declaration does not apply: the value is an ordinary argument. A call
+    /// outside that function still reaches the package's operator.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_yields_to_a_function_local_definition() {
+        let code = r#"library(datakit)
+run <- function(d) {
+  `:=` <- function(lhs, rhs) lhs + rhs
+  d[, 1] := missing_amount
+}
+d <- data.frame(n = 1)
+d[n > 1, older] := 1
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["missing_amount"]);
+    }
+
+    /// A top-level definition shadows the package's operator in the function
+    /// bodies that call it, as well as at top level.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_yields_to_a_file_level_definition() {
+        let code = r#"library(datakit)
+`:=` <- function(lhs, rhs) lhs + rhs
+run <- function(d) {
+  d[, 1] := missing_amount
+}
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["missing_amount"]);
+    }
+
+    /// The package's operator is reached only after its `library()` call,
+    /// read from the same position-aware package scope as its other exports:
+    /// a top-level call before it is ordinary, and a function body, which
+    /// runs later, sees the package as it sees the package's functions.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_waits_for_the_library_call() {
+        let code = r#"d <- data.frame(n = 1)
+d[, 1] := missing_amount
+read_dta("early.dta")
+run <- function(d) {
+  d[n > 1, older] := 1
+  read_dta("late.dta")
+}
+library(datakit)
+library(dtaparser)
+d[n > 1, older] := 1
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["missing_amount", "read_dta"]);
+    }
+
+    /// The masked case stays masked inside a function body, with a misspelled
+    /// call head in the masked value still reported.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_masks_columns_inside_a_function() {
+        let code = r#"library(datakit)
+run <- function(d) {
+  d[n > 1, x, by = g] := pasteO(x)
+  d
+}
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["pasteO"]);
     }
 
     /// With `undefinedVariableInBracketIndices` off, no index of the
