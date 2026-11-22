@@ -295,6 +295,13 @@ export class DataViewerPanel {
      *  commit protocol). Created lazily in process when no factory set it. */
     private engineValue: DataEngine | undefined;
     private engineFactory: EngineFactory | undefined;
+    /** Set while {@link installEngine} awaits the factory. Webview
+     *  messages wait for it ({@link handle}), so nothing reaches the
+     *  engine getter's in-process fallback during startup: a paint
+     *  announced from that temporary engine names a transform generation
+     *  the installed engine never committed, and every row request for it
+     *  is dropped. */
+    private engineStarting: Promise<void> | undefined;
     /** Whether the webview acks announcements with `adopted` (from its
      *  `webviewReady`). */
     private adoptsTransforms = false;
@@ -375,6 +382,7 @@ export class DataViewerPanel {
         extensionUri: vscode.Uri,
         disposeHook: () => void,
         source: ViewSource = {},
+        engineFactory?: EngineFactory,
     ): Promise<DataViewerPanel> {
         const webviewPanel = vscode.window.createWebviewPanel(
             'raven.dataViewer',
@@ -395,12 +403,38 @@ export class DataViewerPanel {
             store, toolbarStore, sortStore, filterStore, settings, disposeHook,
         );
         panel.source = source;
-        panel.engineFactory = workerEngineFactory(extensionUri, line => panel.log(line));
-        panel.setEngine(panel.engineFactory
-            ? await panel.engineFactory(reader, filePath)
-            : new LocalEngine(reader));
+        panel.engineFactory = engineFactory ?? workerEngineFactory(extensionUri, line => panel.log(line));
+        await panel.installEngine(reader, filePath);
         panel.trace('create', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         return panel;
+    }
+
+    /** Whether the panel has been disposed (the tab closed). A panel
+     *  closed while {@link create} was starting its engine is returned
+     *  disposed; the manager must not register it. */
+    get isDisposed(): boolean { return this.disposed; }
+
+    /** Start the engine for `reader` and install it. Webview messages
+     *  wait for this ({@link engineStarting}). If the tab closed or the
+     *  reader changed meanwhile, the new engine is disposed instead of
+     *  installed, so its threads never outlive the panel. */
+    private async installEngine(reader: ArrowSliceReader, filePath: string): Promise<void> {
+        const starting = (async () => {
+            const engine = this.engineFactory
+                ? await this.engineFactory(reader, filePath)
+                : new LocalEngine(reader);
+            if (this.disposed || reader !== this.reader) {
+                await engine.dispose().catch(() => undefined);
+                return;
+            }
+            this.setEngine(engine);
+        })();
+        this.engineStarting = starting;
+        try {
+            await starting;
+        } finally {
+            if (this.engineStarting === starting) this.engineStarting = undefined;
+        }
     }
 
     /** The engine for the current reader. */
@@ -524,7 +558,7 @@ export class DataViewerPanel {
         // The new dataset gets its own threads; the old ones are released
         // (every pending adoption with them) before the new paint.
         this.engineValue = undefined;
-        if (this.engineFactory) this.setEngine(await this.engineFactory(reader, filePath));
+        await this.installEngine(reader, filePath);
         await prevEngine?.dispose().catch(() => undefined);
         this.trace('replace', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         // Honor a cancel of the previous dataset's restore by forgetting its
@@ -536,7 +570,7 @@ export class DataViewerPanel {
         if (restoreCancelled && prevSchemaHash !== undefined) {
             await this.forgetPersistedPrefsGuarded(prevSchemaHash).catch(() => undefined);
         }
-        if (this.webviewReady) await this.sendReplace();
+        if (this.webviewReady && !this.disposed) await this.sendReplace();
         await prevReader.close().catch(() => undefined);
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
     }
@@ -1711,6 +1745,12 @@ export class DataViewerPanel {
 
     private async handle(m: WebviewToExtension): Promise<void> {
         if (this.disposed) return;
+        // Messages wait for an engine being installed (create or replace),
+        // in arrival order: each awaits the same promise.
+        if (this.engineStarting) {
+            await this.engineStarting.catch(() => undefined);
+            if (this.disposed) return;
+        }
         try {
             await this.handleInner(m);
         } catch (err) {
