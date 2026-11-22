@@ -9915,15 +9915,15 @@ fn infix_sites_from_snapshot(
                     || !is_forward_reference_in_same_file(symbol, uri, line, column)
             });
             // As the collector, too: a closure late-binds a definition its
-            // enclosing function makes after it, before calling it.
-            let late_bound = found.is_none()
-                && nested_closure_late_binding_resolves(
-                    op,
-                    line,
-                    column,
-                    &artifacts.function_scope_tree,
-                    &late_defs,
-                );
+            // enclosing function makes after it, before calling it, over any
+            // binding further out.
+            let late_bound = nested_closure_late_binding_resolves(
+                op,
+                line,
+                column,
+                &artifacts.function_scope_tree,
+                &late_defs,
+            );
             let site = match found {
                 _ if late_bound => InfixSite::Shadowed,
                 Some((symbol, _)) if package_name_from_uri(&symbol.source_uri).is_some() => {
@@ -11062,14 +11062,6 @@ fn default_expression_resolves_lazily(
     default_body_binding_precedes_force(node, text, name)
 }
 
-/// True when a usage inside a nested closure can resolve `name` from a later
-/// binding in an active enclosing function scope.
-///
-/// This intentionally excludes same-function forward uses: `f <- function() {
-/// later(); later <- function() 1 }` still runs `later()` before the binding is
-/// installed. It only covers nested closures whose body is textually before a
-/// sibling binding in an enclosing function, because R resolves closure free
-/// variables at call time through that enclosing environment.
 /// Each function-local definition in `artifacts`, by name: its function
 /// scope and position, sorted by position. The input to
 /// [`nested_closure_late_binding_resolves`].
@@ -11097,6 +11089,14 @@ fn function_defs_by_name(
     map
 }
 
+/// True when a usage inside a nested closure can resolve `name` from a later
+/// binding in an active enclosing function scope.
+///
+/// This intentionally excludes same-function forward uses: `f <- function() {
+/// later(); later <- function() 1 }` still runs `later()` before the binding is
+/// installed. It only covers nested closures whose body is textually before a
+/// sibling binding in an enclosing function, because R resolves closure free
+/// variables at call time through that enclosing environment.
 fn nested_closure_late_binding_resolves(
     name: &str,
     usage_line: u32,
@@ -32494,6 +32494,7 @@ d[, nested] := sum(nested_maen(income))
     #[tokio::test]
     async fn declared_subset_assign_operator_yields_to_a_function_local_definition() {
         let code = r#"library(datakit)
+`:=` <- datakit::`:=`
 run <- function(d) {
   `:=` <- function(lhs, rhs) lhs + rhs
   d[, 1] := missing_amount
