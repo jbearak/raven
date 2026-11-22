@@ -263,7 +263,8 @@ struct RState {
     step_probe_armed: bool,
     plans: HashMap<String, (String, annotate::Plan)>,
     /// Output lines held until the next prompt decides whether the stop
-    /// they belong to is shown (`Called from:` before a hidden stop).
+    /// they belong to is shown (`Called from:` before a hidden stop), or
+    /// whether a probe's `debug at` announcement was really R's.
     held: Vec<String>,
     line_buf: String,
     filter_mode: FilterMode,
@@ -1347,21 +1348,19 @@ pub fn split_submission(code: &str, loc: &Location) -> Option<VecDeque<Segment>>
         if l1 == 0 || l2 < l1 || l2 as usize > lines.len() {
             return None;
         }
+        // R's columns are display columns (a tab advances to the next
+        // multiple of 8); map them back to character indexes of the lines.
+        let from = display_col_to_char(lines[(l1 - 1) as usize], c1)?;
+        let to = display_col_to_char(lines[(l2 - 1) as usize], c2)? + 1;
         let mut text = String::new();
         for l in l1..=l2 {
-            let line = lines[(l - 1) as usize];
-            let chars: Vec<char> = line.chars().collect();
-            let from = if l == l1 {
-                (c1.saturating_sub(1)) as usize
-            } else {
-                0
-            };
-            let to = if l == l2 {
-                (c2 as usize).min(chars.len())
-            } else {
-                chars.len()
-            };
-            text.extend(chars[from.min(chars.len())..to.max(from).min(chars.len())].iter());
+            let chars: Vec<char> = lines[(l - 1) as usize].chars().collect();
+            let a = if l == l1 { from } else { 0 };
+            let b = if l == l2 { to } else { chars.len() };
+            if a > b {
+                return None;
+            }
+            text.extend(&chars[a..b]);
             if l != l2 {
                 text.push('\n');
             }
@@ -1388,11 +1387,30 @@ pub fn split_submission(code: &str, loc: &Location) -> Option<VecDeque<Segment>>
             text,
             path: path.clone(),
             line,
-            col: first_col + c1.saturating_sub(1),
+            col: first_col + from as u32,
             echo,
         });
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// The 0-based character index in `line` of the character R's parser puts
+/// at 1-based display column `col` (srcref elements 5 and 6). R counts one
+/// column per character, except that a tab advances to the next multiple
+/// of 8 (R's byte columns are no help: they drift on non-ASCII text inside
+/// string literals). `None` when no character sits at that column.
+fn display_col_to_char(line: &str, col: u32) -> Option<usize> {
+    let mut at = 0u32;
+    for (i, ch) in line.chars().enumerate() {
+        at = if ch == '\t' { (at + 8) & !7 } else { at + 1 };
+        if at == col {
+            return Some(i);
+        }
+        if at > col {
+            return None;
+        }
+    }
+    None
 }
 
 /// The text to feed for `seg`: wrapped in `{ #line … }` with probes for its
@@ -1508,7 +1526,7 @@ pub fn on_repl_prompt(level: u32, more: bool) -> Option<String> {
             }
         })?;
         if step {
-            release_held(false);
+            release_held(false, false);
             return Some("n\n".into());
         }
     }
@@ -1693,7 +1711,7 @@ fn print_traceback(json: &str) {
 }
 
 fn on_top_level(more: bool) -> Option<String> {
-    release_held(true);
+    release_held(true, true);
     // A pause or Stop that arrived as R finished on its own must not change
     // what a later Ctrl-C does.
     if let Some(h) = handle() {
@@ -1788,7 +1806,7 @@ fn on_captured() -> Option<String> {
     })
     .unwrap_or(false);
     if jmc {
-        release_held(false);
+        release_held(false, false);
         return Some("f\n".into());
     }
     // Step Into first stops on the function's whole body, at its opening
@@ -1803,7 +1821,7 @@ fn on_captured() -> Option<String> {
     let stepped_in =
         with_r(|r| r.resumed && r.last_user_resume.as_deref() == Some("s")).unwrap_or(false);
     if on_body && stepped_in && !fbp {
-        release_held(false);
+        release_held(false, false);
         return Some("n\n".into());
     }
     let mut sources: Vec<(i64, String)> = Vec::new();
@@ -1857,7 +1875,7 @@ fn on_captured() -> Option<String> {
             .as_ref()
             .is_some_and(|s| frames_equal(&s.frames, &frames));
         if same {
-            release_held(true);
+            release_held(true, false);
             if let Some(out) = outbox() {
                 out.event(
                     "invalidated",
@@ -1931,7 +1949,7 @@ fn on_captured() -> Option<String> {
         r.resumed = false;
         r.had_stop = true;
     });
-    release_held(!own_browser);
+    release_held(!own_browser, false);
     let _ = call_helper("on_stop", &[]);
     if configured && let Some(out) = outbox() {
         send_stopped(out, &stop);
@@ -2194,7 +2212,9 @@ fn sync_source_hook(h: &Handle) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterMode {
     Pass,
-    /// Dropping a probe's announcement until the next prompt.
+    /// Holding what looks like a probe's announcement until the next
+    /// prompt: dropped at a browser prompt, shown at a top-level one (the
+    /// user printed it; R announces a step only before `Browse>`).
     Drop,
     /// Holding a `Called from:` announcement until the next prompt.
     Hold,
@@ -2207,10 +2227,10 @@ const DROP: &[&str] = &[
 const HOLD: &str = "Called from: ";
 
 /// Filter R's stdout so the debugger's own steps stay invisible: a probe's
-/// `debug at` announcement is dropped, and a `Called from:` announcement is
-/// held until the next prompt shows whether its stop is hidden. Both run
-/// until that prompt (R prints them just before reading), which also covers
-/// deparsed calls that span several lines.
+/// `debug at` announcement and a `Called from:` announcement are held until
+/// the next prompt shows whether they were the debugger's (see
+/// [`release_held`]). Both run until that prompt (R prints them just before
+/// reading), which also covers deparsed calls that span several lines.
 pub fn filter_output(text: &str) -> String {
     if !active() {
         return text.to_string();
@@ -2219,8 +2239,7 @@ pub fn filter_output(text: &str) -> String {
         let mut out = String::new();
         for piece in text.split_inclusive('\n') {
             match r.filter_mode {
-                FilterMode::Drop => continue,
-                FilterMode::Hold => {
+                FilterMode::Drop | FilterMode::Hold => {
                     r.held.push(piece.to_string());
                     continue;
                 }
@@ -2237,7 +2256,8 @@ pub fn filter_output(text: &str) -> String {
                 continue;
             }
             if DROP.iter().any(|p| r.line_buf.starts_with(p)) {
-                r.line_buf.clear();
+                let line = std::mem::take(&mut r.line_buf);
+                r.held.push(line);
                 r.filter_mode = FilterMode::Drop;
             } else if r.line_buf.starts_with(HOLD) {
                 let line = std::mem::take(&mut r.line_buf);
@@ -2251,18 +2271,23 @@ pub fn filter_output(text: &str) -> String {
 }
 
 /// At a prompt: write held lines (`show`) or drop them, plus any partial
-/// line held back as a possible match.
-fn release_held(show: bool) {
-    let held = with_r(|r| {
+/// line held back as a possible match. Lines held from a probe-like
+/// `debug at` are R's step announcement only when a browser prompt follows;
+/// at the top-level prompt (`top_level`) they were the user's own output,
+/// and are always shown.
+fn release_held(show: bool, top_level: bool) {
+    let (held, probe) = with_r(|r| {
+        let probe = r.filter_mode == FilterMode::Drop;
         r.filter_mode = FilterMode::Pass;
         let mut v = std::mem::take(&mut r.held);
         let partial = std::mem::take(&mut r.line_buf);
-        if !partial.is_empty() && !DROP.iter().any(|p| partial.starts_with(p)) {
+        if !partial.is_empty() {
             v.push(partial);
         }
-        v
+        (v, probe)
     })
     .unwrap_or_default();
+    let show = if probe { top_level } else { show };
     if show {
         for l in held {
             super::output::get().write(l.as_bytes(), 0);
@@ -2279,6 +2304,27 @@ mod tests {
         assert_eq!(strip_verbatim(r"\\?\C:\w\a.R".into()), r"C:\w\a.R");
         assert_eq!(strip_verbatim(r"\\?\UNC\srv\s\a.R".into()), r"\\srv\s\a.R");
         assert_eq!(strip_verbatim("/w/a.R".into()), "/w/a.R");
+    }
+
+    /// Columns as R 4.x's parser reports them (srcref elements 5 and 6) for
+    /// these lines.
+    #[test]
+    fn display_columns_map_to_characters_across_tabs_and_non_ascii() {
+        // `\tlongname <- 42`: R gives first col 9, last col 22.
+        let l = "\tlongname <- 42";
+        assert_eq!(display_col_to_char(l, 9), Some(1));
+        assert_eq!(display_col_to_char(l, 22), Some(14));
+        // A tab mid-line advances to the next multiple of 8.
+        let l = "\"\t\u{e9}\" -> q; w";
+        assert_eq!(display_col_to_char(l, 15), Some(8));
+        assert_eq!(display_col_to_char(l, 18), Some(11));
+        // Two tabs, then text.
+        assert_eq!(display_col_to_char("\t\ty", 17), Some(2));
+        // One column per character, multibyte or not.
+        assert_eq!(display_col_to_char("\u{65e5}\u{672c} <- 1; x", 10), Some(9));
+        // No character there: inside a tab's span, or past the end.
+        assert_eq!(display_col_to_char("\tx", 4), None);
+        assert_eq!(display_col_to_char("x", 2), None);
     }
 
     #[test]
