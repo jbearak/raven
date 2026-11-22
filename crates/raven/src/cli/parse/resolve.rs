@@ -437,8 +437,8 @@ impl<'t> ScopePoints<'t> {
 ///   outer `mean` a literal.
 /// - An assignment inside `quote()` or `expression()` doesn't run, so it is
 ///   no binding, but only when the scope agrees: it records no definition
-///   there. Where the scope can't tell the call is base's and records one,
-///   the assignment still counts.
+///   there. Where the scope does record one, the assignment still counts,
+///   and so does one in a `quote()` passed straight to `eval()`, which runs.
 #[derive(Default)]
 struct LiteralBindings {
     /// Each literal assignment's target: its scope position, and the
@@ -490,7 +490,9 @@ impl LiteralBindings {
                         {
                             frame = Some(node.start_byte());
                         }
-                        Some("quote" | "expression") => quoted = true,
+                        Some("quote" | "expression") if !is_eval_argument(node, text) => {
+                            quoted = true;
+                        }
                         _ => {}
                     }
                 }
@@ -644,6 +646,18 @@ fn base_callee<'t>(call: TsNode<'_>, text: &'t str) -> Option<&'t str> {
         _ => return None,
     };
     Some(&text[name.byte_range()])
+}
+
+/// Whether `node` is an argument of an `eval()` call, which runs what it
+/// quotes: `eval(quote(mean <- function(x) 0))`.
+fn is_eval_argument(node: TsNode<'_>, text: &str) -> bool {
+    let call = node
+        .parent()
+        .filter(|argument| argument.kind() == "argument")
+        .and_then(|argument| argument.parent())
+        .and_then(|arguments| arguments.parent())
+        .filter(|call| call.kind() == "call");
+    call.is_some_and(|call| base_callee(call, text) == Some("eval"))
 }
 
 /// A call's arguments that have a value, each with its name as written.

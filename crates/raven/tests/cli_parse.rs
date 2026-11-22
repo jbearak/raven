@@ -760,9 +760,8 @@ fn a_function_body_past_its_literal_reads_the_callers_later_rebinding() {
 
 /// Code that `quote()` or `expression()` captures doesn't run, so an
 /// assignment in it is no competing binding: R returns 2.5 (base's `mean`)
-/// for each call here. `bquote()`'s `.()` does run its operand. (Without
-/// package data for base the scope can't tell `quote` is base's, and reads
-/// the assignment as run; hence the workspace without package awareness.)
+/// for the first two calls. A `quote()` passed straight to `eval()` does
+/// run, and so does the operand of `bquote()`'s `.()`.
 #[test]
 fn quoted_assignments_are_not_competing_bindings() {
     let (_tmp, ws) = workspace();
@@ -776,6 +775,9 @@ fn quoted_assignments_are_not_competing_bindings() {
             "sum <- 7\n",
             "e <- base::expression(sum <- function(x) 0)\n",
             "sum(1:4)\n",
+            "min <- 7\n",
+            "eval(quote(min <- function(x) 0))\n",
+            "min(1:4)\n",
         )
         .as_bytes(),
     );
@@ -789,6 +791,12 @@ fn quoted_assignments_are_not_competing_bindings() {
     let docs = documents(&output);
     assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
     assert_eq!(*resolution_of(&docs[0], "sum", 5), package("base"));
+    // Not base's: the name's latest binding, as before.
+    assert_eq!(
+        *resolution_of(&docs[0], "min", 8),
+        serde_json::json!({"kind": "workspace", "path": "main.R",
+            "range": {"start": {"line": 6, "character": 0}, "end": {"line": 6, "character": 3}}})
+    );
     assert_eq!(
         *resolution_of(&docs[1], "max", 2),
         serde_json::json!({"kind": "workspace", "path": "bquote.R",
