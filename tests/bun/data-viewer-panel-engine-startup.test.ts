@@ -253,6 +253,39 @@ describe('engine startup in replace()', () => {
         expect(manager.getPanelNames()).toEqual([]);
     });
 
+    test('a repaint queued before the replace and released while the new engine starts waits for it', async () => {
+        const { panels, gates, create, copy, openReader } = await setup();
+        const creating = create(copy('a.arrow'));
+        await until(() => gates.length === 1);
+        await gates[0].release();
+        const panel: any = await creating;
+        const wv = panels[0].webview;
+        wv.deliver({ type: 'webviewReady', adoptsTransforms: true });
+        await until(() => wv.posted.some(m => m.type === 'init'));
+        await flush();
+        // Hold the send chain, then queue the timeout's repaint behind it.
+        let releaseChain!: () => void;
+        void panel.enqueue(() => new Promise<void>(r => { releaseChain = r; }));
+        gates[0].engine.coordinator.onAdoptionTimeout(gates[0].engine.coordinator.committed.gen);
+        const path = copy('b.arrow');
+        const replacing = panel.replace(await openReader(path), path);
+        await until(() => gates.length === 2);
+        const before = wv.posted.length;
+        releaseChain();
+        await flush();
+        // No paint and no in-process fallback while the new engine starts.
+        expect(wv.posted.length).toBe(before);
+        expect(panel.engineValue).toBeUndefined();
+        await gates[1].release();
+        await replacing;
+        await until(() => wv.posted.some(m => m.type === 'replace'));
+        const paint = wv.posted.filter(m => m.type === 'init' || m.type === 'replace').at(-1);
+        expect(panel.engineValue).toBe(gates[1].engine);
+        expect(paint.transformGeneration).toBe(gates[1].engine.coordinator.committed.gen);
+        const r = await rowsFor(wv, paint, 303);
+        expect(r.rows.map((x: any[]) => x[0])).toEqual([1, 2, 3, 4, 5]);
+    });
+
     test('an adoption timeout from the engine being replaced paints nothing', async () => {
         const { panels, gates, create, copy, openReader } = await setup();
         const creating = create(copy('a.arrow'));

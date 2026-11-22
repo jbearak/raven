@@ -490,9 +490,13 @@ export class DataViewerPanel {
         this.generation += 1;
         const generation = this.generation;
         this.abortInteractiveTransforms();
-        await this.enqueue(() => this.postPaint(
-            'replace', generation, this.currentSchemaHash(), this.lastToolbar ?? this.defaultToolbar(),
-        )).catch(() => undefined);
+        await this.enqueue(async () => {
+            // A replace or reload since the timeout owns the next paint.
+            if (this.disposed || generation !== this.generation) return;
+            await this.postPaint(
+                'replace', generation, this.currentSchemaHash(), this.lastToolbar ?? this.defaultToolbar(),
+            );
+        }).catch(() => undefined);
     }
 
     private log(line: string): void {
@@ -909,7 +913,14 @@ export class DataViewerPanel {
     // *impl* directly so it never awaits a job queued behind itself.
     private enqueue<T>(fn: () => Promise<T>): Promise<T> {
         return this.enqueueSerial(
-            () => this.sendChain, (tail) => { this.sendChain = tail; }, fn,
+            () => this.sendChain, (tail) => { this.sendChain = tail; },
+            // A paint queued before a replace may reach the head while the
+            // new engine starts; it must not install on the getter's
+            // in-process fallback ({@link engineStarting}).
+            async () => {
+                if (this.engineStarting) await this.engineStarting.catch(() => undefined);
+                return fn();
+            },
         );
     }
 
