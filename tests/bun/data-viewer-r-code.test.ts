@@ -205,4 +205,19 @@ describe('generateRCode', () => {
             expect(code).not.toContain('9007199254740992');
         }
     });
+
+    test('numeric sets: Inf as Inf, NaN and null left out (never 0)', () => {
+        const cols = [col('x', 'Float64', { typeTag: '<dbl+lbl>', valueLabels: { 5: 'five' } }), col('y', 'Float64', { typeTag: '<dbl>' })];
+        const r = gen({
+            columns: cols,
+            filter: { entries: [
+                { id: 'a', columnIndex: 0, predicate: { kind: 'setIn', values: [Infinity, null as unknown as number] }, enabled: true, includeMissing: false },
+                { id: 'b', columnIndex: 1, predicate: { kind: 'setIn', values: ['-Infinity', NaN] }, enabled: true, includeMissing: false },
+            ], labelsOnWhenFiltered: true },
+        }, 'base');
+        const code = 'code' in r ? r.code : r.error;
+        expect(code).toContain('unclass(x) %in% Inf');
+        expect(code).toContain('y %in% -Inf');
+        expect(code).not.toContain('Not translated');
+    });
 });

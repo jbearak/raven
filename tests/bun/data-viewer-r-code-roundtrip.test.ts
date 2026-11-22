@@ -456,3 +456,21 @@ df$lab <- lab`,
         { name: 'labelled: not odd', filters: [{ ci: 3, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
         { name: 'sort by big desc', sort: [{ ci: 1, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
     ]);
+
+// Infinite values picked in Value Counts: a labelled double (labels on 5)
+// and a plain one.
+edgeSuite('Copy as R code round trip: infinite set values (real R)',
+    `df <- data.frame(id = 1:5)
+x <- c(Inf, 0, 5, -Inf, NaN)
+attr(x, "labels") <- c(five = 5)
+df$x <- x
+df$y <- c(Inf, 0, 5, -Inf, NaN)`,
+    ['df', 'dtobj'],
+    [
+        { name: 'labelled: Inf', filters: [{ ci: 1, p: { kind: 'setIn', values: [Infinity] } }] },
+        { name: 'labelled: not -Inf', filters: [{ ci: 1, p: { kind: 'setNotIn', values: [-Infinity] } }] },
+        { name: 'labelled: NaN or missing', filters: [{ ci: 1, p: { kind: 'setIn', values: [NaN] }, includeMissing: true }] },
+        { name: 'plain: Inf, -Inf (text from Value Counts)', filters: [{ ci: 2, p: { kind: 'setIn', values: ['Infinity', '-Infinity'] } }] },
+        { name: 'plain: < Inf', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
+        { name: 'plain: between -Inf and 0', filters: [{ ci: 2, p: { kind: 'numBetween', lo: -Infinity, hi: 0, inclusive: true } }] },
+    ]);

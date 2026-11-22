@@ -701,28 +701,30 @@ function setCode(ctx: Ctx, ci: number, values: readonly (string | number)[], lab
         const keys = values.map(int64SetKey).filter((k): k is string => k !== undefined);
         return `${x} %in% bit64::as.integer64(${keys.length > 0 ? rVector(keys.map(rString)) : 'character(0)'})`;
     }
-    if (col.valueLabels && isNumericType(t)) {
-        const nums = values.filter(isNumberLike).map(Number).filter(v => !Number.isNaN(v)).map(rNumber);
-        return `${x} %in% ${nums.length > 0 ? rVector(nums) : 'numeric(0)'}`;
-    }
+    if (col.valueLabels && isNumericType(t)) return numericSet(x, values);
     if (col.valueLabels && labelsOn) {
         return `${labelled(ctx, ci)} %in% ${rVector(values.map(v => rString(String(v))))}`;
     }
     if (t === 'Utf8' || t === 'LargeUtf8') {
         return `${x} %in% ${rVector(values.map(v => rString(String(v))))}`;
     }
-    if (isNumericType(t)) {
-        if (!values.every(isNumberLike)) return null;
-        const nums = values.map(v => Number(v));
-        if (nums.some(Number.isNaN)) return null;
-        return `${x} %in% ${rVector(nums.map(rNumber))}`;
-    }
+    if (isNumericType(t)) return numericSet(x, values);
     if (t === 'Bool') {
         const want = values.map(v => String(v).toLowerCase());
         if (want.some(v => v !== 'true' && v !== 'false')) return null;
         return `${x} %in% ${rVector(want.map(v => (v === 'true' ? 'TRUE' : 'FALSE')))}`;
     }
     return null;
+}
+
+/** `x %in% c(...)` over a numeric column's set values. NaN is left out:
+ *  the viewer treats NaN as missing, which no value matches (R's `%in%`
+ *  would match it). So is anything that isn't a number, such as a `null`
+ *  (an `Inf` a lossy transport turned into one, which `Number()` would
+ *  make 0). `Inf` and `-Inf` are written as such. */
+function numericSet(x: string, values: readonly (string | number)[]): string {
+    const nums = values.filter(isNumberLike).map(Number).filter(v => !Number.isNaN(v)).map(rNumber);
+    return `${x} %in% ${nums.length > 0 ? rVector(nums) : 'numeric(0)'}`;
 }
 
 /** Date and date-time comparisons, in the instants the engine compares

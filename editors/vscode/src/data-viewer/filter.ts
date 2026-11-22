@@ -158,6 +158,13 @@ async function acceptorFor(
         return (i) => values[i] === want;
     }
 
+    // A bound that isn't a number (a `null` from a lossy transport) matches
+    // nothing; comparing with it would coerce it to 0.
+    if ((predicate.kind === 'numCompare' && typeof predicate.value !== 'number')
+        || ((predicate.kind === 'numBetween' || predicate.kind === 'numNotBetween')
+            && (typeof predicate.lo !== 'number' || typeof predicate.hi !== 'number'))) {
+        return () => false;
+    }
     if (predicate.kind === 'numCompare') {
         const values = await loadNumeric(reader, columnIndex, signal);
         const v = predicate.value;
