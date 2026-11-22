@@ -22,13 +22,15 @@
  *     by (batch, column); scans (sort, filter, histogram) bypass it so a
  *     full-column pass never evicts the viewport.
  *   - **Permuted windows** (sorted or filtered) gather individual
- *     elements: rows are grouped by batch, and each value and validity
+ *     elements, one column at a time: rows are grouped by batch, and each value and validity
  *     bit is read at its computed offset with synchronous `readSync`
  *     (page-cache hits; a libuv round trip per read would dominate). The
  *     validity read is skipped when the batch header reports
  *     `null_count == 0` for that column, and reads within 4 KiB of each
  *     other are coalesced. Column types the gather doesn't decode fall
- *     back to a projected chunk read for that column.
+ *     back to a projected chunk read for that column, and a batch the
+ *     window covers densely (a quarter of its rows or more, as in a
+ *     large sorted copy) is read as viewport chunks instead.
  *   - **Null counts** ({@link ArrowSliceReader.nullCounts}) sum each
  *     batch header's `FieldNode.null_count`, without reading any data.
  *     They are never computed on the open path.
@@ -86,6 +88,9 @@ export const DEFAULT_CHUNK_CACHE_BYTES = 128 * 1024 * 1024;
 export const DEFAULT_HEADER_CACHE_BYTES = 32 * 1024 * 1024;
 /** Element-gather reads closer than this are merged into one read. */
 export const GATHER_COALESCE_GAP = 4096;
+/** A permuted window that wants at least this share of a batch's rows
+ *  reads that batch as projected chunks instead of gathering elements. */
+const DENSE_BATCH_SHARE = 0.25;
 /** Projected chunk reads of adjacent buffers closer than this are merged. */
 const CHUNK_COALESCE_GAP = 64 * 1024;
 
@@ -600,16 +605,32 @@ export class ArrowSliceReader {
             return { rows, stale: false, originalRowIndices };
         }
 
+        // Batches the window covers densely (a large sorted copy) read as
+        // chunks: one projected read per column beats a request per cell.
+        const sparse: number[] = [];
+        for (const bi of batchIndices) {
+            const batchRows = this.batchStarts[bi + 1] - this.batchStarts[bi];
+            if (byBatch.get(bi)!.local.length < batchRows * DENSE_BATCH_SHARE) {
+                sparse.push(bi);
+                continue;
+            }
+            if (req.viewportGeneration < this.latestViewportGen) {
+                return { rows: [], stale: true };
+            }
+            const chunks = await this.viewportChunks(bi, columns);
+            this.encodeFromChunks(byBatch.get(bi)!, columns, chunks, rows);
+        }
+
         // Columns the gather can decode, and the ones that need a chunk.
         const gatherCols: number[] = [];
         const chunkCols: number[] = [];
         for (let ci = 0; ci < columns.length; ci++) {
             (this.cols[columns[ci]].gather ? gatherCols : chunkCols).push(ci);
         }
-        if (gatherCols.length > 0) {
-            this.gather(batchIndices, byBatch, columns, gatherCols, rows);
+        if (gatherCols.length > 0 && sparse.length > 0) {
+            this.gather(sparse, byBatch, columns, gatherCols, rows);
         }
-        for (const bi of batchIndices) {
+        for (const bi of sparse) {
             if (chunkCols.length === 0) break;
             if (req.viewportGeneration < this.latestViewportGen) {
                 return { rows: [], stale: true };
@@ -655,53 +676,68 @@ export class ArrowSliceReader {
         gatherCols: number[],
         rows: Cell[][],
     ): void {
+        const headers = batchIndices.map(bi => {
+            this.onBatchLoad?.(bi);
+            return this.headerSync(bi);
+        });
+        // One column at a time: the per-element read requests then live
+        // for one column, not the whole selection (a 16k-row copy of 64
+        // columns would otherwise hold a million of them at once).
+        for (const ci of gatherCols) {
+            this.gatherColumn(batchIndices, headers, byBatch, columns[ci], ci, rows);
+        }
+    }
+
+    private gatherColumn(
+        batchIndices: number[],
+        headers: ParsedHeader[],
+        byBatch: Map<number, { local: number[]; out: number[] }>,
+        column: number,
+        ci: number,
+        rows: Cell[][],
+    ): void {
         type Elem = {
             out: number;
-            ci: number;
-            info: ColumnInfo;
             local: number;
             validity?: ReadRequest;
             value: ReadRequest;
             bytes?: ReadRequest;
             dataPos: number;
         };
+        const info = this.cols[column];
+        const kind = info.gather!;
+        const { nodeIndex, bufferIndex } = info.layout;
         const elems: Elem[] = [];
         const phase1: ReadRequest[] = [];
-        for (const bi of batchIndices) {
-            const h = this.headerSync(bi);
-            const g = byBatch.get(bi)!;
-            this.onBatchLoad?.(bi);
-            for (const ci of gatherCols) {
-                const info = this.cols[columns[ci]];
-                const kind = info.gather!;
-                const { nodeIndex, bufferIndex } = info.layout;
-                const vBuf = bufferIndex;
-                const dBuf = bufferIndex + 1;
-                const hasValidity = h.nodeNullCount[nodeIndex] > 0 && h.bufferLength[vBuf] > 0;
-                const vBase = h.bodyOffset + h.bufferOffset[vBuf];
-                const dBase = h.bodyOffset + h.bufferOffset[dBuf];
-                const strData = kind.k === 'utf8' ? h.bodyOffset + h.bufferOffset[bufferIndex + 2] : 0;
-                for (let j = 0; j < g.local.length; j++) {
-                    const r = g.local[j];
-                    let value: ReadRequest;
-                    switch (kind.k) {
-                        case 'bool': value = { pos: dBase + (r >> 3), len: 1 }; break;
-                        case 'utf8': value = kind.large
-                            ? { pos: dBase + r * 8, len: 16 }
-                            : { pos: dBase + r * 4, len: 8 };
-                            break;
-                        case 'date32': value = { pos: dBase + r * 4, len: 4 }; break;
-                        case 'ts': value = { pos: dBase + r * 8, len: 8 }; break;
-                        default: value = { pos: dBase + r * kind.width, len: kind.width };
-                    }
-                    const e: Elem = { out: g.out[j], ci, info, local: r, value, dataPos: strData };
-                    phase1.push(value);
-                    if (hasValidity) {
-                        e.validity = { pos: vBase + (r >> 3), len: 1 };
-                        phase1.push(e.validity);
-                    }
-                    elems.push(e);
+        for (let b = 0; b < batchIndices.length; b++) {
+            const h = headers[b];
+            const g = byBatch.get(batchIndices[b])!;
+            const vBuf = bufferIndex;
+            const dBuf = bufferIndex + 1;
+            const hasValidity = h.nodeNullCount[nodeIndex] > 0 && h.bufferLength[vBuf] > 0;
+            const vBase = h.bodyOffset + h.bufferOffset[vBuf];
+            const dBase = h.bodyOffset + h.bufferOffset[dBuf];
+            const strData = kind.k === 'utf8' ? h.bodyOffset + h.bufferOffset[bufferIndex + 2] : 0;
+            for (let j = 0; j < g.local.length; j++) {
+                const r = g.local[j];
+                let value: ReadRequest;
+                switch (kind.k) {
+                    case 'bool': value = { pos: dBase + (r >> 3), len: 1 }; break;
+                    case 'utf8': value = kind.large
+                        ? { pos: dBase + r * 8, len: 16 }
+                        : { pos: dBase + r * 4, len: 8 };
+                        break;
+                    case 'date32': value = { pos: dBase + r * 4, len: 4 }; break;
+                    case 'ts': value = { pos: dBase + r * 8, len: 8 }; break;
+                    default: value = { pos: dBase + r * kind.width, len: kind.width };
                 }
+                const e: Elem = { out: g.out[j], local: r, value, dataPos: strData };
+                phase1.push(value);
+                if (hasValidity) {
+                    e.validity = { pos: vBase + (r >> 3), len: 1 };
+                    phase1.push(e.validity);
+                }
+                elems.push(e);
             }
         }
         const read = (buf: Uint8Array, pos: number) =>
@@ -710,22 +746,23 @@ export class ArrowSliceReader {
 
         // Phase 2: string bytes, capped at what encodeString can show
         // (it truncates to TRUNC_LIMIT_BYTES; +4 keeps the cut identical).
-        const phase2: ReadRequest[] = [];
-        for (const e of elems) {
-            if (e.info.gather!.k !== 'utf8' || isNullElem(e)) continue;
-            const dv = viewOf(e.value);
-            const large = (e.info.gather as { large: boolean }).large;
-            const o0 = large ? Number(dv.getBigInt64(0, true)) : dv.getInt32(0, true);
-            const o1 = large ? Number(dv.getBigInt64(8, true)) : dv.getInt32(4, true);
-            const len = Math.min(o1 - o0, TRUNC_LIMIT_BYTES + 4);
-            if (len <= 0) continue;
-            e.bytes = { pos: e.dataPos + o0, len };
-            phase2.push(e.bytes);
+        if (kind.k === 'utf8') {
+            const phase2: ReadRequest[] = [];
+            for (const e of elems) {
+                if (isNullElem(e)) continue;
+                const dv = viewOf(e.value);
+                const o0 = kind.large ? Number(dv.getBigInt64(0, true)) : dv.getInt32(0, true);
+                const o1 = kind.large ? Number(dv.getBigInt64(8, true)) : dv.getInt32(4, true);
+                const len = Math.min(o1 - o0, TRUNC_LIMIT_BYTES + 4);
+                if (len <= 0) continue;
+                e.bytes = { pos: e.dataPos + o0, len };
+                phase2.push(e.bytes);
+            }
+            coalescedReadSync(read, phase2, GATHER_COALESCE_GAP);
         }
-        coalescedReadSync(read, phase2, GATHER_COALESCE_GAP);
 
         for (const e of elems) {
-            rows[e.out][e.ci] = isNullElem(e) ? null : this.decodeElem(e);
+            rows[e.out][ci] = isNullElem(e) ? null : this.decodeElem(info, e);
         }
 
         function isNullElem(e: Elem): boolean {
@@ -734,8 +771,8 @@ export class ArrowSliceReader {
         }
     }
 
-    private decodeElem(e: { info: ColumnInfo; local: number; value: ReadRequest; bytes?: ReadRequest }): Cell {
-        const kind = e.info.gather!;
+    private decodeElem(info: ColumnInfo, e: { local: number; value: ReadRequest; bytes?: ReadRequest }): Cell {
+        const kind = info.gather!;
         const dv = viewOf(e.value);
         switch (kind.k) {
             case 'int':
