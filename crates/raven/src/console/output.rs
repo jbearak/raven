@@ -23,6 +23,14 @@
 //!   ordered by timing only: R goes quiet the moment it hands over, the
 //!   buffer is out within about `QUIET_FLUSH`, and a child needs well over
 //!   that before it can write.
+//! * A forked child (`parallel::mclapply`, `mcparallel`) inherits the
+//!   buffer, its lock, and stdout's lock, but not the flusher thread, and
+//!   either lock may have been held by a thread that does not exist in the
+//!   child. So after a `fork()` (detected by a `pthread_atfork` handler that
+//!   only sets a flag) the child never touches [`Output`]'s state: each write
+//!   goes straight to fd 1 or 2 with `write(2)`, unstyled, and every flush is
+//!   a no-op. The inherited buffer is the parent's pending output; the parent
+//!   writes it, so the child must not.
 //! * Trade-offs: compiled code that writes to fd 1 *during* a burst can land
 //!   up to `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses the
 //!   buffered tail.
@@ -577,8 +585,51 @@ pub fn get() -> &'static Output {
     OUTPUT.get().expect("console output not initialised")
 }
 
+/// Set in a child process created by `fork()` after [`init`]; see the module
+/// doc. Only ever written by the `pthread_atfork` child handler.
+static FORKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process is a `fork()` child of the console (e.g. an `mclapply`
+/// worker): it must not touch the console's shared state; see the module doc.
+pub fn forked() -> bool {
+    FORKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(unix)]
+extern "C" fn mark_forked() {
+    // Async-signal-safe: a single atomic store.
+    FORKED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Output from a forked child: straight to the terminal, bypassing every lock
+/// the child may have inherited held. `otype` is R's: 0 = stdout, 1 = stderr.
+#[cfg(unix)]
+pub fn write_forked(mut bytes: &[u8], otype: i32) {
+    let fd = if otype == 0 { 1 } else { 2 };
+    while !bytes.is_empty() {
+        // SAFETY: writes from a valid slice to a descriptor the process owns.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        bytes = &bytes[n as usize..];
+    }
+}
+
+/// Windows has no `fork()`, so [`forked`] is never true there.
+#[cfg(not(unix))]
+pub fn write_forked(_bytes: &[u8], _otype: i32) {}
+
 pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
     use std::io::IsTerminal;
+    // SAFETY: registers a plain extern "C" fn that only stores to an atomic.
+    #[cfg(unix)]
+    unsafe {
+        libc::pthread_atfork(None, None, Some(mark_forked));
+    }
     let merged = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     let out = OUTPUT.get_or_init(|| Output {
         inner: Mutex::new(Inner {
@@ -655,6 +706,10 @@ extern "C" fn flush_before_child() {
 }
 
 extern "C" fn flush_at_exit() {
+    // A forked child's buffer is the parent's pending output; see module doc.
+    if forked() {
+        return;
+    }
     if let Some(out) = OUTPUT.get() {
         // try_lock: never deadlock if exit() interrupted a write.
         if let Ok(mut g) = out.inner.try_lock() {
@@ -705,11 +760,18 @@ impl Output {
     }
 
     pub fn set_headers(&self, headers: Headers) {
+        if forked() {
+            return;
+        }
         self.lock().stderr_class.headers = headers;
     }
 
     /// `otype` is R's: 0 = stdout, 1 = stderr.
     pub fn write(&self, bytes: &[u8], otype: i32) {
+        if forked() {
+            write_forked(bytes, otype);
+            return;
+        }
         let mut g = self.lock();
         let inner = &mut *g;
         let is_err = otype != 0;
@@ -772,6 +834,9 @@ impl Output {
     /// printed while the editor is showing (e.g. a progress bar in a
     /// `later()` callback).
     pub fn flush(&self) {
+        if forked() {
+            return;
+        }
         let mut g = self.lock();
         let inner = &mut *g;
         if inner.editor_sink.is_some() && !inner.pending_editor_line.is_empty() {
@@ -785,11 +850,17 @@ impl Output {
     /// Give queued editor lines another chance at the printer's channel
     /// (called from the editor's idle loop, after reedline has drained it).
     pub fn pump_editor(&self) {
+        if forked() {
+            return;
+        }
         drain_editor_queue(&mut self.lock());
     }
 
     /// A prompt is about to be shown: flush and reset condition state.
     pub fn at_prompt(&self) {
+        if forked() {
+            return;
+        }
         let mut g = self.lock();
         let inner = &mut *g;
         inner.values.close(&mut inner.buf);
@@ -800,6 +871,9 @@ impl Output {
 
     /// Route output to the editor (Some) or back to the terminal (None).
     pub fn set_editor_sink(&self, sink: Option<std::sync::mpsc::SyncSender<String>>) {
+        if forked() {
+            return;
+        }
         let mut g = self.lock();
         if sink.is_none() {
             // Output that arrived while editing but hasn't been printed yet

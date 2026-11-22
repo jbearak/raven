@@ -12,6 +12,9 @@
 //!
 //! * Only the main thread touches R. The socket thread (`ipc`) and the
 //!   output flusher never do.
+//! * A `fork()` child of R (`parallel::mclapply` workers) has only the main
+//!   thread. Its console output bypasses every lock and buffer shared with
+//!   the threads it lost and goes straight to the terminal (`output`).
 //! * Every R operation the console starts itself goes through `shim.c`, which
 //!   runs it under `R_ToplevelExec` so an R error or interrupt (a `longjmp`)
 //!   can never cross a Rust frame. Callbacks R invokes (`WriteConsoleEx`, …)
@@ -89,7 +92,8 @@ Options:
                         (on Windows, a named pipe derived from PATH)
   --help                Show this help
 
-Every other option is passed to R unchanged (e.g. --no-save, --vanilla, -q)."
+Every other option is passed to R unchanged (e.g. --no-save, --vanilla, -q).
+With -e EXPR, -f FILE, or --file=FILE, plain R runs the program and exits."
     );
 }
 
@@ -174,8 +178,10 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
     };
 
-    // A console needs a terminal. Anything else (pipes, CI) gets plain R.
-    let interactive = sys::stdin_and_stdout_are_terminals();
+    // A console needs a terminal. Anything else (pipes, CI) gets plain R,
+    // and so does a program given on the command line (`-e`, `-f`), which
+    // plain R runs and then exits.
+    let interactive = sys::stdin_and_stdout_are_terminals() && !runs_a_program(&opts.r_args);
     let mut opts = opts;
     if interactive && !sys::prepare_terminal() {
         opts.color = ColorMode::Off;
@@ -207,6 +213,17 @@ pub fn main(args: Vec<OsString>) -> i32 {
     }
     // SAFETY: as above; R is initialised but its main loop not set up.
     unsafe { start_r(lib, opts) }
+}
+
+/// R's arguments name a program to run (`-e EXPR`, `-f FILE`, `--file=FILE`)
+/// rather than asking for an interactive session. Arguments after `--args`
+/// belong to that program, not to R.
+fn runs_a_program(r_args: &[OsString]) -> bool {
+    r_args
+        .iter()
+        .map(|a| a.to_string_lossy())
+        .take_while(|a| a != "--args")
+        .any(|a| a == "-e" || a == "-f" || a.starts_with("--file="))
 }
 
 /// Run plain R instead (same installation when known), after saying why.
@@ -682,6 +699,12 @@ unsafe extern "C" fn write_console_ex(buf: *const c_char, len: c_int, otype: c_i
         }
         // SAFETY: R passes a buffer of `len` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len as usize) };
+        // A forked worker (`mclapply`) must not touch state shared with
+        // threads it did not inherit (the debugger's, the output buffer's).
+        if output::forked() {
+            output::write_forked(bytes, otype);
+            return;
+        }
         if otype == 0 && dap::active() {
             let text = dap::filter_output(&String::from_utf8_lossy(bytes));
             if !text.is_empty() {
@@ -1442,6 +1465,16 @@ mod tests {
         assert!(is_browser_prompt("Browse[12]> "));
         assert!(!is_browser_prompt("Browse[]> "));
         assert!(!is_browser_prompt("> "));
+    }
+
+    #[test]
+    fn program_arguments_are_recognised() {
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(runs_a_program(&args(&["-e", "1"])));
+        assert!(runs_a_program(&args(&["--vanilla", "-f", "x.R"])));
+        assert!(runs_a_program(&args(&["--file=x.R"])));
+        assert!(!runs_a_program(&args(&["--no-save", "-q"])));
+        assert!(!runs_a_program(&args(&["--args", "-e", "1"])));
     }
 
     #[test]

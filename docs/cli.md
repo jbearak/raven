@@ -813,7 +813,7 @@ raven console --no-save -q     # R's options pass through unchanged
 
 On Unix, `--ipc` and `--dap` sockets are Unix sockets at `PATH`. On Windows they are named pipes named after `PATH` (`\\.\pipe\raven-` followed by `PATH` with every character other than letters, digits, `.`, `_` and `-` replaced by `-`), and the console creates an empty file at `PATH` once the pipe is listening. A `PATH` that already starts with `\\.\pipe\` is used as the pipe name.
 
-Every other argument goes to R. If stdin or stdout isn't a terminal, or the console can't embed your R (for example R built without `--enable-R-shlib`), it runs plain R with the same arguments instead.
+Every other argument goes to R. If R's arguments name a program to run (`-e EXPR`, `-f FILE`, or `--file=FILE`), stdin or stdout isn't a terminal, or the console can't embed your R (for example R built without `--enable-R-shlib`), it runs plain R with the same arguments instead.
 
 ## `raven --stdio`
 
