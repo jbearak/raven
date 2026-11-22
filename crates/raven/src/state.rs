@@ -12973,7 +12973,7 @@ fn derive_closed_descendant_metadata(
 fn derive_open_candidate_metadata(
     base_open_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     current_open_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
-    entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
+    closed_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     workspace_root: Option<&Url>,
     max_depth: usize,
     unstable: &HashSet<Url>,
@@ -12998,17 +12998,17 @@ fn derive_open_candidate_metadata(
                 current_open_metadata
                     .get(parent_uri)
                     .cloned()
-                    .or_else(|| entries.get(parent_uri).map(|entry| entry.metadata.clone()))
+                    .or_else(|| closed_metadata.get(parent_uri).cloned())
             },
             max_depth,
         );
         next.insert(uri, Arc::new(metadata));
     }
 
-    let parents: Vec<_> = entries
+    let parents: Vec<_> = closed_metadata
         .iter()
         .filter(|(uri, _)| !current_open_metadata.contains_key(*uri))
-        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .map(|(uri, metadata)| (uri.clone(), metadata.clone()))
         // Open parents as of the previous round, like closed ones in
         // `derive_closed_descendant_metadata`: `next` has not received this
         // round's forward directories yet.
@@ -13175,6 +13175,17 @@ pub(crate) fn derive_workspace_dependency_graph(
         context.max_depth,
         initial,
         |unstable| {
+            // Open files read closed parents as of the previous round, as
+            // closed files read open ones, so neither half sees the other's
+            // update from this round. (`raven check` opens nothing.)
+            let previous_closed: HashMap<_, _> = if base_open_metadata.is_empty() {
+                HashMap::new()
+            } else {
+                entries
+                    .iter()
+                    .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+                    .collect()
+            };
             let closed_changed = derive_closed_descendant_metadata(
                 &base_closed_metadata,
                 entries,
@@ -13186,7 +13197,7 @@ pub(crate) fn derive_workspace_dependency_graph(
             let (next_open_metadata, open_changed) = derive_open_candidate_metadata(
                 &base_open_metadata,
                 &open_metadata,
-                entries,
+                &previous_closed,
                 workspace_root,
                 context.max_depth,
                 unstable,
@@ -16705,28 +16716,51 @@ tarchetypes::tar_render(nested, "nested.Rmd")
     /// inherited in the previous round, as a closed one does.
     #[test]
     fn open_overlays_derive_the_closed_directories() {
-        let layouts: [&[(&str, &str)]; 2] = [
-            &[
-                ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
-                ("r2.R", "# raven: cd b\nsource(\"../mods/y.R\")\n"),
-                (
-                    "mods/x.R",
-                    "source(\"../mods/y.R\")\nsource(\"../mods/child.R\")\n",
-                ),
-                (
-                    "mods/y.R",
-                    "source(\"../mods/x.R\")\nsource(\"../mods/child.R\")\n",
-                ),
-                ("mods/child.R", "source(\"constants.R\")\n"),
-            ],
-            &[
-                ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
-                ("mods/x.R", "source(\"../mods/y.R\")\n"),
-                ("mods/y.R", "source(\"../mods/child.R\")\n"),
-                ("mods/child.R", "source(\"constants.R\")\n"),
-            ],
+        // Each layout, and the files opened in it.
+        type Layout<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+        let layouts: [Layout; 3] = [
+            (
+                &[
+                    ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
+                    ("r2.R", "# raven: cd b\nsource(\"../mods/y.R\")\n"),
+                    (
+                        "mods/x.R",
+                        "source(\"../mods/y.R\")\nsource(\"../mods/child.R\")\n",
+                    ),
+                    (
+                        "mods/y.R",
+                        "source(\"../mods/x.R\")\nsource(\"../mods/child.R\")\n",
+                    ),
+                    ("mods/child.R", "source(\"constants.R\")\n"),
+                ],
+                &["mods/x.R", "mods/y.R", "mods/child.R"],
+            ),
+            (
+                &[
+                    ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
+                    ("mods/x.R", "source(\"../mods/y.R\")\n"),
+                    ("mods/y.R", "source(\"../mods/child.R\")\n"),
+                    ("mods/child.R", "source(\"constants.R\")\n"),
+                ],
+                &["mods/x.R", "mods/y.R", "mods/child.R"],
+            ),
+            // A cycle through a closed file: open files must read it as of
+            // the previous round, as it reads them.
+            (
+                &[
+                    ("r1.R", "# raven: cd a\nsource(\"../mods/x.R\")\n"),
+                    ("r2.R", "# raven: cd b\nsource(\"../mods/y.R\")\n"),
+                    (
+                        "mods/x.R",
+                        "source(\"../mods/y.R\")\nsource(\"../mods/z.R\")\n",
+                    ),
+                    ("mods/y.R", "source(\"../mods/x.R\")\n"),
+                    ("mods/z.R", "source(\"../mods/y.R\")\n"),
+                ],
+                &["mods/x.R", "mods/y.R"],
+            ),
         ];
-        for layout in layouts {
+        for (layout, opened) in layouts {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             for dir in ["a", "b", "mods"] {
@@ -16738,10 +16772,9 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             let (closed, _) = derive_closed_workspace(&root, 20);
             let root_uri = Url::from_directory_path(&root).unwrap();
             let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
-            let overlays: Vec<_> = layout
+            let overlays: Vec<_> = opened
                 .iter()
-                .filter(|(file, _)| file.starts_with("mods/"))
-                .map(|(file, _)| {
+                .map(|file| {
                     let uri = Url::from_file_path(root.join(file)).unwrap();
                     let entry = &entries[&uri];
                     WorkspaceGraphOverlay {
@@ -16765,6 +16798,17 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             };
             let (_, open) =
                 derive_workspace_dependency_graph(&mut entries, None, &overlays, &context, false);
+            for (file, _) in layout {
+                let uri = Url::from_file_path(root.join(file)).unwrap();
+                let derived = open.get(&uri).map_or_else(
+                    || entries[&uri].metadata.inherited_working_directory.clone(),
+                    |metadata| metadata.inherited_working_directory.clone(),
+                );
+                assert_eq!(
+                    derived, closed[&uri].metadata.inherited_working_directory,
+                    "{file} with {opened:?} open"
+                );
+            }
             for overlay in &overlays {
                 assert_eq!(
                     open[&overlay.uri].inherited_working_directory,
