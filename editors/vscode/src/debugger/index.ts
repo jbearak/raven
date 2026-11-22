@@ -317,7 +317,9 @@ class ConsoleLink {
         this.reconciled = true;
         // Confirmed cleared; another window sharing this console may arm
         // them again, and this link's later mirrors mustn't clear them.
-        for (const p of this.discovered) this.mirrored.delete(p);
+        // A file the editor has breakpoints in again stays tracked.
+        const kept = Object.keys(editor_breakpoints().files);
+        for (const p of this.discovered) if (!kept.includes(p)) this.mirrored.delete(p);
         this.discovered.clear();
         this.mirrored_once();
     }

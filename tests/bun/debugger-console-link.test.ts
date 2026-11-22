@@ -332,6 +332,28 @@ describe('breakpoints across a detach and reattach', () => {
         expect(con.files.get(real(b_r))).toEqual([4]);
     });
 
+    test('a file re-added during reconciliation is still cleared when removed later', async () => {
+        const { con, sock } = await console_at();
+        // The console reports this file under the path the editor uses.
+        const c_r = path.join(real(root), 'c.R');
+        fs.writeFileSync(c_r, 'x <- 1\ny <- 2\n');
+        set_breakpoints([line_bp(c_r, 2)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 1);
+        detach(t1);
+        set_breakpoints([]);
+        attach(sock);
+        // Re-added while the reattach reconciles: the stale c.R has just
+        // been cleared and the clearing mirror isn't answered yet.
+        await until(() => con.files.size === 0, 5_000);
+        set_breakpoints([line_bp(c_r, 1)]);
+        await until(() => con.files.get(c_r)?.[0] === 1);
+        await settle();
+        set_breakpoints([]);
+        await until(() => con.files.size === 0);
+        expect(con.files.size).toBe(0);
+    });
+
     test('a symlinked breakpoint re-added after its real path was cleared stays armed', async () => {
         const { con, sock } = await console_at();
         set_breakpoints([line_bp(a_r, 3)]);
