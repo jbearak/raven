@@ -360,6 +360,7 @@ describe("every send to Raven's console goes through its ordered socket", () => 
         await send.deliver_to_target(target, 'length(x)', { how: 'text' });
         await settle(50);
         expect(terminal.typed).toEqual([]);
+        expect(server.received).toEqual([]);
         open();
         await settle(200);
         expect(server.received).toEqual(['x <- 1', 'length(x)']);
