@@ -37,7 +37,6 @@ mock.module('vscode', () => ({
     // Debugger (tests/bun/debugger-console-link.test.ts).
     SourceBreakpoint: class {},
     FunctionBreakpoint: class {},
-    Disposable: class { constructor(private fn: () => void = () => undefined) {} dispose() { this.fn(); } },
     MarkdownString: class {},
     DebugAdapterNamedPipeServer: class {},
     StatusBarAlignment: { Left: 1, Right: 2 },

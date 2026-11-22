@@ -79,11 +79,6 @@ mock.module('vscode', () => ({
     },
 }));
 
-// Opening a console isn't exercised; keep the terminal manager's imports out.
-mock.module('../../editors/vscode/src/send-to-r/r-terminal-manager', () => ({
-    get_or_create_raven_console: async () => { throw new Error('not in this test'); },
-}));
-
 const { register_debugger } = await import('../../editors/vscode/src/debugger/index');
 const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
 
@@ -217,20 +212,28 @@ function raw_request(sock: string, msg: object): Promise<void> {
 const consoles: FakeConsole[] = [];
 
 /** A Perch-style terminal: closing it detaches; the console keeps running. */
+const attached = new Set<object>();
 function attach(sock: string): object {
     const terminal = { name: 'R', show() {} };
     ipc.register_console_terminal(terminal as never, sock, { owns_dir: false });
+    attached.add(terminal);
     return terminal;
 }
 function detach(terminal: object): void {
+    attached.delete(terminal);
     for (const l of close_listeners) l(terminal);
     ipc.forget_console_terminal(terminal as never);
 }
 
+const context = { subscriptions: [] as Array<{ dispose(): void }>, workspaceState: { get: () => undefined, update: async () => undefined } };
 beforeAll(() => {
-    register_debugger({ subscriptions: [], workspaceState: { get: () => undefined, update: async () => undefined } } as never);
+    register_debugger(context as never);
 });
 afterAll(() => {
+    // console-ipc is shared by every test file in the run: leave no
+    // debugger listener or registered console behind.
+    for (const d of context.subscriptions) d.dispose();
+    for (const t of attached) ipc.forget_console_terminal(t as never);
     for (const c of consoles) c.close();
     fs.rmSync(root, { recursive: true, force: true });
 });
