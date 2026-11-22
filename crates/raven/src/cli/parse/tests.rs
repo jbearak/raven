@@ -1244,3 +1244,43 @@ fn requested_paths_resolve_lexically_against_the_root() {
 }
 
 mod errors_and_directives;
+
+/// A writer that fails every write and flush with `kind`, as stdout does on a
+/// full disk (`/dev/full`) or a closed pipe.
+struct FailingWriter(std::io::ErrorKind);
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(self.0.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(self.0.into())
+    }
+}
+
+#[test]
+fn failed_output_is_an_operator_error_and_a_closed_pipe_is_not() {
+    use std::io::ErrorKind::{BrokenPipe, StorageFull};
+    // A short line sits in the buffer until the final flush; a long one is
+    // written straight through. Both paths must report the failure.
+    let short = || vec![("{}".to_string(), false)].into_iter();
+    let long = || vec![("x".repeat(64 * 1024), false)].into_iter();
+    let unreadable = || vec![("{}".to_string(), true)].into_iter();
+    assert_eq!(
+        print_documents(FailingWriter(StorageFull), short()),
+        EXIT_OPERATOR_ERROR
+    );
+    assert_eq!(
+        print_documents(FailingWriter(StorageFull), long()),
+        EXIT_OPERATOR_ERROR
+    );
+    assert_eq!(print_documents(FailingWriter(BrokenPipe), short()), EXIT_OK);
+    assert_eq!(print_documents(FailingWriter(BrokenPipe), long()), EXIT_OK);
+    assert_eq!(
+        print_documents(FailingWriter(BrokenPipe), unreadable()),
+        EXIT_UNREADABLE
+    );
+    let mut written = Vec::new();
+    assert_eq!(print_documents(&mut written, short()), EXIT_OK);
+    assert_eq!(written, b"{}\n");
+}

@@ -443,6 +443,10 @@ jobs:
       - name: Console unit tests
         run: cargo test -p raven --features test-support --lib 'console::'
 
+      # `raven graph`/`raven parse` paths under a canonical `\\?\C:\...` root.
+      - name: Windows path display tests
+        run: cargo test -p raven --features test-support --lib 'cli::graph::tests::verbatim_root'
+
       - name: Console end-to-end tests (ConPTY)
         run: cargo test -p raven --features test-support --test console_windows -- --nocapture
 

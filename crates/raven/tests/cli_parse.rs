@@ -115,6 +115,26 @@ fn unreadable_files_get_error_documents_in_order_and_exit_3() {
     assert_eq!(docs[4]["statements"][0]["text"], "b <- 2");
 }
 
+/// stdout that can't be written (a full disk) loses every document, so the
+/// run is an operator error, unlike a closed pipe.
+#[cfg(target_os = "linux")]
+#[test]
+fn unwritable_stdout_is_an_operator_error() {
+    let (_tmp, ws) = workspace();
+    write(&ws, "ok.R", b"x <- 1\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+        .args(["parse", "--workspace", ws.to_str().unwrap(), "ok.R"])
+        .stdout(std::fs::File::create("/dev/full").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("raven parse: cannot write output"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn syntax_errors_still_exit_0() {
     let (_tmp, ws) = workspace();
@@ -536,6 +556,140 @@ fn workspace_local_and_dynamic_calls() {
         *resolution_of(doc, "f", 5),
         serde_json::json!({"kind": "unresolved", "reason": "not_found"})
     );
+}
+
+/// R's function lookup passes over a binding that isn't a function, so a
+/// call skips a name bound to a literal and finds the next binding. A
+/// binding whose value isn't known (a parameter, a call's result, or a name
+/// some assignment in the same function gives a non-literal) is still the
+/// callee, and a value keeps no resolution.
+#[test]
+fn a_call_passes_over_a_literal_binding() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "mean <- 7\n",
+            "mean(1:3)\n",
+            "helper <- function(x) x\n",
+            "g <- function() { helper <- \"a\"; helper(1) }\n",
+            "h <- function() { mean <- function(x) x; mean(1) }\n",
+            "f <- function(sum = 9) sum(1:3)\n",
+            "k <- foo()\n",
+            "k(1)\n",
+            "maybe <- function(x) x\n",
+            "if (TRUE) maybe <- NULL\n",
+            "maybe(1)\n",
+            "lapply(1, mean)\n",
+            "(NULL) -> c\n",
+            "c(1)\n",
+            "source(\"child.R\")\n",
+            "p <- function(`mean`) { if (TRUE) mean <- 7; mean(1) }\n",
+        )
+        .as_bytes(),
+    );
+    write(&ws, "child.R", b"mean(2)\n");
+    let docs = parse_isolated(&ws, &["main.R", "child.R"], None);
+    let doc = by_path(&docs, "main.R");
+    let range = |line: u64, start: u64, end: u64| {
+        serde_json::json!({"start": {"line": line, "character": start},
+                           "end": {"line": line, "character": end}})
+    };
+    let workspace = |line: u64, start: u64, end: u64| serde_json::json!({"kind": "workspace", "path": "main.R", "range": range(line, start, end)});
+    assert_eq!(*resolution_of(doc, "mean", 1), package("base"));
+    assert_eq!(*resolution_of(doc, "helper", 3), workspace(2, 0, 6));
+    assert_eq!(
+        *resolution_of(doc, "mean", 4),
+        serde_json::json!({"kind": "local", "range": range(4, 18, 22)})
+    );
+    assert_eq!(
+        *resolution_of(doc, "sum", 5),
+        serde_json::json!({"kind": "local", "range": range(5, 14, 17)})
+    );
+    assert_eq!(*resolution_of(doc, "k", 7), workspace(6, 0, 1));
+    assert_eq!(*resolution_of(doc, "maybe", 10), workspace(9, 10, 15));
+    assert_eq!(*resolution_of(doc, "c", 13), package("base"));
+    // `mean` as a value is the literal: no package object.
+    let value = identifiers(doc, "mean", 11);
+    assert_eq!(value.len(), 1);
+    assert!(value[0].get("resolution").is_none(), "{}", value[0]);
+    // A parameter's value comes from the caller, whatever its function assigns.
+    assert_eq!(
+        *resolution_of(doc, "mean", 15),
+        serde_json::json!({"kind": "local", "range": range(15, 34, 38)})
+    );
+    // A caller's literal binding is passed over too.
+    assert_eq!(
+        *resolution_of(by_path(&docs, "child.R"), "mean", 0),
+        package("base")
+    );
+}
+
+/// A file's own literal binding overwrites the global environment's, so no
+/// caller's earlier function binding of the name survives it either.
+#[test]
+fn a_literal_binding_hides_the_callers_definitions() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"mean <- function(x) 99\nsource(\"c.R\")\n");
+    write(&ws, "b.R", b"source(\"c.R\")\n");
+    write(&ws, "c.R", b"# raven: sourced-by a.R\nmean <- 7\nmean(1)\n");
+    let docs = parse_isolated(&ws, &["c.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
+}
+
+/// The overwrite is of the global environment only: a caller's named import
+/// is on the search path and still found, and read late (inside a function),
+/// a caller that binds the name again after `source()` wins.
+#[test]
+fn a_literal_overwrite_keeps_caller_imports_and_later_rebindings() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"source(\"c.R\")\n");
+    write(
+        &ws,
+        "b.R",
+        b"import::from(ravenpkga, onlya)\nsource(\"c.R\")\nmean <- function(x) 99\n",
+    );
+    write(
+        &ws,
+        "c.R",
+        b"# raven: sourced-by a.R\nonlya <- 7\nonlya()\nmean <- 7\nf <- function() mean(1)\n",
+    );
+    let docs = parse_isolated(&ws, &["c.R"], None);
+    let range = serde_json::json!({"start": {"line": 2, "character": 0},
+                                   "end": {"line": 2, "character": 4}});
+    assert_eq!(
+        *resolution_of(&docs[0], "onlya", 2),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": {"kind": "unresolved", "reason": "not_found"}},
+            {"path": "b.R", "resolution": package("ravenpkga")}]})
+    );
+    assert_eq!(
+        *resolution_of(&docs[0], "mean", 4),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": package("base")},
+            {"path": "b.R", "resolution": {"kind": "workspace", "path": "b.R", "range": range}}]})
+    );
+}
+
+/// Read late, a caller's binding made before its `source()` call is still
+/// overwritten, even when the call is inside a function.
+#[test]
+fn a_literal_overwrite_read_late_hides_earlier_caller_bindings() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "a.R",
+        b"mean <- function(x) 99\ng <- function() source(\"c.R\")\n",
+    );
+    write(&ws, "b.R", b"source(\"c.R\")\n");
+    write(
+        &ws,
+        "c.R",
+        b"# raven: sourced-by a.R\nmean <- 7\nf <- function() mean(1)\n",
+    );
+    let docs = parse_isolated(&ws, &["c.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
 }
 
 /// The `target` range of top-level statement `index`'s assignment.
