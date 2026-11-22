@@ -65,7 +65,7 @@ Each column header has up to three lines and a thin bar along its bottom edge:
   ▔▔▔▔                    share of NA values
 ```
 
-- The **type** line uses the same short tags as tibble: `<int>`, `<dbl>`, `<chr>`, `<lgl>`, `<fct>`, `<ord>`, `<date>`, `<dttm>`, `<drtn>`, `<cpl>`, and `<list>`. Columns with value labels add `+lbl` (`<dbl+lbl>`). A date-time column names the time zone its values are shown in (`<dttm America/New_York>`), and a duration names its unit (`<drtn secs>`).
+- The **type** line uses the same short tags as tibble: `<int>`, `<dbl>`, `<chr>`, `<lgl>`, `<fct>`, `<ord>`, `<date>`, `<dttm>`, `<drtn>`, `<cpl>`, and `<list>`. Columns with value labels add `+lbl` (`<dbl+lbl>`). A date-time column names the time zone its values are shown in (`<dttm America/New_York>`), and a duration names its unit and shows its values in that unit, as R prints them (`<drtn hours>` over `1.5`).
 - The **label** line shows the variable label (`attr(col, "label")`). It appears only when at least one column has a label, and the Labels toggle doesn't hide it.
 - The **missing bar** fills in proportion to the column's share of NA values. Raven counts them in the background after the grid first appears; until the count is done, the bar is dashed.
 - The **summary band** appears while the Σ toggle is on. See [Column summaries](#column-summaries).
@@ -409,7 +409,7 @@ The code returns the same rows in the same order as the grid:
 - A frame's row names become a `rowname` column with `tibble::rownames_to_column()` (dplyr) or `keep.rownames` (data.table) when a filter or sort uses them; base R uses `rownames()`.
 - The comment at the top names the packages the code needs.
 
-Copy as R code works for data frames and matrices. Raven needs the expression you passed to `View()`, so a panel opened before updating Raven, or from an expression longer than 64 KiB, can't produce code until you call `View()` again. A filter Raven can't write faithfully (for example, a value list on a date column) is left out and named in a comment rather than approximated.
+Copy as R code works for data frames and matrices. Raven needs the expression you passed to `View()`, so a panel opened before updating Raven, or from an expression too long to send (over 64 KiB once encoded), can't produce code until you call `View()` again. A filter Raven can't write faithfully (for example, a value list on a date column) is left out and named in a comment rather than approximated.
 
 ### Refresh
 

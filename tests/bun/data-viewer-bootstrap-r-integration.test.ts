@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'bun';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync } from 'node:fs';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import {
     generate_profile_source,
     write_profile_file,
 } from '../../editors/vscode/src/plot/r-bootstrap-profile';
+import { RSessionServer, type RSessionEvent } from '../../editors/vscode/src/r-session-server';
 
 const R_BIN = process.env.RAVEN_TEST_R_BIN ?? 'R';
 
@@ -81,7 +82,7 @@ function viewExpectError(viewCall: string): string {
 
 type CapturedRequest = { headers: string; body: string };
 
-async function start_capture_server(): Promise<{
+async function start_capture_server(status = 200): Promise<{
     port: number;
     requests: CapturedRequest[];
     waitForRequest: (
@@ -116,7 +117,7 @@ async function start_capture_server(): Promise<{
             }
         });
         socket.on('close', () => sockets.delete(socket));
-        socket.write('HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n');
+        socket.write(`HTTP/1.0 ${status} X\r\nContent-Length: 0\r\n\r\n`);
     });
     const port = await new Promise<number>(resolve => {
         server.listen(0, '127.0.0.1', () => {
@@ -607,6 +608,212 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
                 expect(got.body).toContain('"panelName":"mtcars"');
             } finally {
                 await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    /** The single /view-data body R sent, parsed (fails the test when the
+     *  body is not valid JSON, as the session server would reject it). */
+    async function viewDataBody(
+        rCode: string,
+        status = 200,
+    ): Promise<{ body: Record<string, unknown>; bytes: number; r: Awaited<ReturnType<typeof spawnR>> }> {
+        const cap = await start_capture_server(status);
+        try {
+            const r = await spawnR(cap, rCode);
+            const posts = cap.requests.filter(req => req.headers.includes('POST /view-data'));
+            expect(posts.length).toBe(1);
+            const raw = posts[0].body;
+            return { body: JSON.parse(raw), bytes: Buffer.byteLength(raw, 'utf8'), r };
+        } finally {
+            await cap.close();
+        }
+    }
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'an expression near 64 KiB still opens the viewer: the whole body fits the server cap',
+        async () => {
+            const { body, bytes } = await viewDataBody(
+                // The audit's repro, View(data.frame(x = "<65,400 a's>"), ...),
+                // built with call() since R's console caps an input line at 4 KiB.
+                'eval(call("View", call("data.frame", x = strrep("a", 65400L)), title = "Long literal")); Sys.sleep(0.2)',
+            );
+            // MAX_BODY_BYTES in r-session-server/index.ts.
+            expect(bytes).toBeLessThanOrEqual(64 * 1024);
+            expect(body.panelName).toBe('Long literal');
+            expect(body.expression ?? '').toBe('');
+            expect(body.nrow).toBe(1);
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'an expression whose escaped form passes 64 KiB is dropped, not sent',
+        async () => {
+            // 30,000 quotes deparse to 60,002 bytes (under 64 KiB) but
+            // escape to 120,000+ in the JSON body.
+            const { body, bytes } = await viewDataBody(
+                'eval(call("View", call("c", strrep(\'"\', 30000L)))); Sys.sleep(0.2)',
+            );
+            expect(bytes).toBeLessThanOrEqual(64 * 1024);
+            expect(body.expression ?? '').toBe('');
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'a quote in the expression yields valid JSON that round-trips',
+        async () => {
+            const { body } = await viewDataBody(
+                `View(data.frame(s = 'a"b'), title = 'quoted'); Sys.sleep(0.2)`,
+            );
+            expect(body.panelName).toBe('quoted');
+            expect(body.expression).toBe('data.frame(s = "a\\"b")');
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'every character JSON must escape round-trips through panelName and expression',
+        async () => {
+            // backslash, quote, newline, tab, CR, BS, FF, U+0001, U+001F,
+            // DEL, é, U+2028, an astral emoji.
+            const cps = [97, 92, 98, 34, 99, 10, 9, 13, 8, 12, 1, 31, 127, 233, 0x2028, 0x1f600, 122];
+            const { body } = await viewDataBody(
+                `t <- intToUtf8(c(${cps.join(', ')})); View(data.frame(s = t), title = t); Sys.sleep(0.2)`,
+            );
+            const t = String.fromCodePoint(...cps);
+            expect(body.panelName).toBe(t);
+            expect(body.expression).toBe('data.frame(s = t)');
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'non-syntactic names are captured with backticks, so Refresh re-evaluates them',
+        async () => {
+            const a = await viewDataBody('`my table` <- data.frame(a = 1); View(`my table`); Sys.sleep(0.2)');
+            expect(a.body.expression).toBe('`my table`');
+            const b = await viewDataBody('`a+b` <- data.frame(a = 1); View(`a+b`); Sys.sleep(0.2)');
+            expect(b.body.expression).toBe('`a+b`');
+            // The panel title stays the readable name.
+            expect(b.body.panelName).toBe('a+b');
+        },
+        30_000,
+    );
+
+    /** TRUE when `expr` (R source) evaluates, after `setup`, to the same
+     *  object as `obj`. */
+    async function evaluatesTo(setup: string, expr: string, obj: string): Promise<boolean> {
+        const cap = await start_capture_server();
+        try {
+            const r = await spawnR(
+                cap,
+                `${setup}; cat("RAVEN_SAME=", identical(eval(parse(text = Sys.getenv("RAVEN_EXPR"))), ${obj}), "\\n", sep = "")`,
+                { RAVEN_EXPR: expr },
+            );
+            return r.stdout.includes('RAVEN_SAME=TRUE');
+        } finally {
+            await cap.close();
+        }
+    }
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'the captured expression is R source that evaluates to the viewed object',
+        async () => {
+            const cases: Array<[setup: string, call: string, obj: string]> = [
+                ['`my table` <- data.frame(a = 1)', 'View(`my table`)', '`my table`'],
+                ['`a+b` <- data.frame(a = 1); a <- 1; b <- 2', 'View(`a+b`)', '`a+b`'],
+                ['invisible(0)', 'View(local({ a <- 1; data.frame(a) }))', 'data.frame(a = 1)'],
+                ['`if` <- NULL; l <- list(`x y` = data.frame(z = 1))', 'View(l$`x y`)', 'l$`x y`'],
+            ];
+            for (const [setup, call, obj] of cases) {
+                const { body } = await viewDataBody(`${setup}; ${call}; Sys.sleep(0.2)`);
+                const expr = String(body.expression);
+                expect({ call, ok: await evaluatesTo(setup, expr, obj) }).toEqual({ call, ok: true });
+            }
+        },
+        60_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'an empty title falls back to "View" (the server needs a panel name)',
+        async () => {
+            const { body } = await viewDataBody('View(mtcars, title = ""); Sys.sleep(0.2)');
+            expect(body.panelName).toBe('View');
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'a title too long for the request is truncated, and the viewer still opens',
+        async () => {
+            const { body, bytes } = await viewDataBody(
+                'View(mtcars, title = strrep("t", 70000L)); Sys.sleep(0.2)',
+            );
+            expect(bytes).toBeLessThanOrEqual(64 * 1024);
+            expect(body.expression ?? '').toBe('');
+            const title = String(body.panelName);
+            expect(title.startsWith('ttt')).toBe(true);
+            expect(title.endsWith('…')).toBe(true);
+            expect(Buffer.byteLength(title, 'utf8')).toBeLessThanOrEqual(256);
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'a refused /view-data request leaves no Arrow file behind',
+        async () => {
+            const { r } = await viewDataBody(
+                'View(mtcars); Sys.sleep(0.2); cat("RAVEN_LEFT=", length(list.files(Sys.getenv("RAVEN_DATA_VIEWER_DIR"), pattern = "[.]arrow$")), "\\n", sep = "")',
+                400,
+            );
+            expect(r.stdout).toContain('RAVEN_LEFT=0');
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'against the real session server, each audited View() opens the viewer',
+        async () => {
+            const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-e2e-'));
+            const dvDir = realpathSync(join(tmp, '.'));
+            mkdirSync(join(dvDir, 'dv'));
+            const server = new RSessionServer(join(dvDir, 'dv'));
+            await server.start();
+            const events: RSessionEvent[] = [];
+            server.onEvent(e => events.push(e));
+            try {
+                const profile_path = await write_profile_file(tmp, generate_profile_source());
+                const proc = spawn({
+                    cmd: [R_BIN, '--quiet', '--no-save', '--no-restore', '-e', [
+                        'eval(call("View", call("data.frame", x = strrep("a", 65400L)), title = "Long literal"))',
+                        `View(data.frame(s = 'a"b'), title = 'quoted')`,
+                        '`my table` <- data.frame(a = 1); View(`my table`)',
+                        'Sys.sleep(0.3)',
+                    ].join('\n')],
+                    cwd: tmp,
+                    env: {
+                        ...process.env,
+                        R_PROFILE_USER: profile_path,
+                        RAVEN_ORIGINAL_R_PROFILE_USER: '',
+                        RAVEN_SESSION_PORT: String(server.port),
+                        RAVEN_SESSION_TOKEN: server.token,
+                        RAVEN_R_SESSION_ID: 'e2e',
+                        RAVEN_DATA_VIEWER_DIR: join(dvDir, 'dv'),
+                    },
+                    stdout: 'pipe', stderr: 'pipe',
+                });
+                await proc.exited;
+                const opened = events.filter(e => e.type === 'view-data-requested') as
+                    Extract<RSessionEvent, { type: 'view-data-requested' }>[];
+                expect(opened.map(e => e.panelName)).toEqual(['Long literal', 'quoted', 'my table']);
+                expect(opened.map(e => e.expression)).toEqual([
+                    undefined, 'data.frame(s = "a\\"b")', '`my table`',
+                ]);
+            } finally {
+                await server.stop();
             }
         },
         30_000,

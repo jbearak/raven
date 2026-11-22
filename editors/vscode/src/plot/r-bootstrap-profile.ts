@@ -109,10 +109,12 @@ local({
 
     # ----- helpers ---------------------------------------------------------
 
+    # POST body_str; returns the HTTP status, or NA when there was no
+    # answer (no session server, or it didn't reply within the timeout).
     .raven_post <- function(path, body_str) {
         port <- as.integer(Sys.getenv("RAVEN_SESSION_PORT"))
         token <- Sys.getenv("RAVEN_SESSION_TOKEN")
-        if (is.na(port) || port <= 0L || !nzchar(token)) return(invisible(NULL))
+        if (is.na(port) || port <= 0L || !nzchar(token)) return(NA_integer_)
         tryCatch({
             con <- socketConnection(host = "127.0.0.1", port = port,
                                      blocking = TRUE, open = "r+b", timeout = 2)
@@ -130,19 +132,49 @@ local({
             writeBin(charToRaw(hdr), con)
             writeBin(body_bytes, con)
             flush(con)
-            invisible(NULL)
+            status_line <- readLines(con, n = 1L, warn = FALSE)
+            if (length(status_line) == 0L) return(NA_integer_)
+            suppressWarnings(as.integer(strsplit(status_line, " ", fixed = TRUE)[[1L]][2L]))
         }, error = function(e) {
             .raven_log(paste0("data viewer POST failed: ", conditionMessage(e)))
+            NA_integer_
         })
     }
 
+    # JSON string literal for each element of x (NA -> ""). Escapes the
+    # quote, backslash and every control character, and writes all other
+    # non-ASCII as \\u escapes (a surrogate pair past U+FFFF), so the body
+    # is pure ASCII: valid JSON whatever the text, and a byte length that
+    # doesn't depend on the session's encoding. Built from intToUtf8() so
+    # the R source needs no backslash escapes inside this template.
     .raven_json_str <- function(x) {
-        x <- gsub("\\\\\\\\", "\\\\\\\\\\\\\\\\", x, fixed = TRUE)
-        x <- gsub("\\"", "\\\\\\"", x, fixed = TRUE)
-        x <- gsub("\\n", "\\\\n", x, fixed = TRUE)
-        x <- gsub("\\r", "\\\\r", x, fixed = TRUE)
-        x <- gsub("\\t", "\\\\t", x, fixed = TRUE)
-        paste0("\\"", x, "\\"")
+        bs <- intToUtf8(92L)
+        q <- intToUtf8(34L)
+        named <- c("8" = "b", "9" = "t", "10" = "n", "12" = "f", "13" = "r",
+                   "34" = q, "92" = bs)
+        one <- function(s) {
+            if (is.na(s)) return(paste0(q, q))
+            cp <- utf8ToInt(enc2utf8(s))
+            if (anyNA(cp)) cp <- utf8ToInt(iconv(s, "", "UTF-8", sub = "?"))
+            if (anyNA(cp)) cp <- 63L
+            plain <- cp >= 32L & cp < 127L & cp != 34L & cp != 92L
+            if (all(plain)) return(paste0(q, intToUtf8(cp), q))
+            out <- character(length(cp))
+            out[plain] <- intToUtf8(cp[plain], multiple = TRUE)
+            key <- as.character(cp)
+            nm <- !plain & key %in% names(named)
+            out[nm] <- paste0(bs, named[key[nm]])
+            u <- !plain & !nm & cp <= 65535L
+            out[u] <- sprintf("%su%04x", bs, cp[u])
+            a <- !plain & !nm & cp > 65535L
+            v <- cp[a] - 65536L
+            out[a] <- sprintf("%su%04x%su%04x", bs, 55296L + v %/% 1024L,
+                              bs, 56320L + v %% 1024L)
+            paste0(q, paste(out, collapse = ""), q)
+        }
+        x <- as.character(x)
+        if (length(x) == 0L) return(paste0(q, q))
+        vapply(x, one, character(1L), USE.NAMES = FALSE)
     }
 
     .raven_truncate_utf8 <- function(s, max_bytes = 1024L) {
@@ -274,6 +306,16 @@ local({
     .raven_encode_col <- function(col) {
         cls <- class(col)
         if (is.factor(col)) return(col)
+        # difftime: the numbers in the column's own units, as R prints them
+        # and as its "<drtn unit>" type tag says (arrow would write a
+        # Duration in seconds).
+        # Labels are kept, as for haven_labelled below.
+        if (inherits(col, "difftime")) {
+            x <- as.numeric(unclass(col))
+            attr(x, "label") <- attr(col, "label", exact = TRUE)
+            attr(x, "labels") <- attr(col, "labels", exact = TRUE)
+            return(x)
+        }
         if ("haven_labelled" %in% cls) {
             x <- unclass(col)
             # exact = TRUE: a bare attr(col, "label") partial-matches the
@@ -456,7 +498,9 @@ local({
         tbl <- arrow::arrow_table(df)
         per_field <- list()
         for (nm in names(df)) {
-            md <- c(.raven_field_metadata(nm, df[[nm]]), extra_field_md[[nm]])
+            md <- .raven_field_metadata(nm, df[[nm]])
+            # extra_field_md (from the columns before encoding) wins.
+            for (k in names(extra_field_md[[nm]])) md[[k]] <- extra_field_md[[nm]][[k]]
             if (length(md) > 0L) per_field[[nm]] <- md
         }
         chunk_rows <- .raven_chunk_rows(df)
@@ -509,11 +553,18 @@ local({
             }
             s
         }
-        # The expression itself, untruncated (Copy as R code and Refresh
-        # re-evaluate it). Omitted past 64 KiB.
-        expr_text <- tryCatch(deparse1(substitute(x), collapse = " "),
+        if (length(panel_name) != 1L || is.na(panel_name) || !nzchar(panel_name)) {
+            panel_name <- "View"
+        }
+        # The expression itself, untruncated, as R source that evaluates to
+        # x (Copy as R code and Refresh re-evaluate it): backtick = TRUE
+        # quotes a non-syntactic name such as \`my table\`, which deparse
+        # leaves bare when x is a symbol, and deparse's lines are joined
+        # with newlines because a multi-line call (local({ a <- 1; a }))
+        # doesn't parse joined with spaces. Dropped below if the request
+        # would not fit.
+        expr_text <- tryCatch(deparse1(substitute(x), collapse = "\n", backtick = TRUE),
                               error = function(e) "")
-        if (nchar(expr_text, type = "bytes") > 65536L) expr_text <- ""
 
         # Type dispatch: matrix and data.frame are tested first (a
         # data.frame is also a list). Then an atomic / factor /
@@ -602,6 +653,10 @@ local({
         for (nm in names(df)) {
             col <- df[[nm]]
             md <- list("raven.type_tag" = .raven_type_tag(col))
+            # Encoding turns a difftime into a plain number; keep its class.
+            if (inherits(col, "difftime")) {
+                md[["raven.original_class"]] <- paste(class(col), collapse = "/")
+            }
             ssd <- .raven_subsecond_digits(col)
             if (!is.null(ssd)) md[["raven.subsecond_digits"]] <- as.character(ssd)
             if (identical(nm, rowname_col)) md[["raven.rowname"]] <- "true"
@@ -617,23 +672,41 @@ local({
                                    format(as.numeric(Sys.time()) * 1e6, scientific = FALSE),
                                    "-", Sys.getpid(), "-", .raven_view_seq, ".arrow"))
 
+        # The session server refuses a body over 64 KiB (MAX_BODY_BYTES in
+        # r-session-server/index.ts), so the budget is the whole encoded
+        # request. An expression that doesn't fit is dropped (the viewer
+        # opens without Copy as R code and Refresh), then an over-long
+        # title is truncated; the viewer itself is never lost to size.
+        # Built before the file is written, so nothing is left behind.
+        make_body <- function(expr, name) paste0(
+            "{",
+            "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+            "\\"panelName\\":", .raven_json_str(name), ",",
+            "\\"expression\\":", .raven_json_str(expr), ",",
+            "\\"sourceKind\\":", .raven_json_str(source_kind), ",",
+            "\\"filePath\\":", .raven_json_str(path), ",",
+            "\\"nrow\\":", as.character(nr),
+            "}"
+        )
+        max_body <- 65536L
+        body <- make_body(expr_text, panel_name)
+        if (nchar(body, type = "bytes") > max_body) body <- make_body("", panel_name)
+        if (nchar(body, type = "bytes") > max_body) {
+            body <- make_body("", .raven_truncate_utf8(panel_name, 256L))
+        }
+
         tryCatch(
             .raven_write_arrow(df, path, extra_field_md = extra_md),
             error = function(e) {
                 stop("data viewer write failed: ", conditionMessage(e), call. = FALSE)
             })
 
-        body <- paste0(
-            "{",
-            "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
-            "\\"panelName\\":", .raven_json_str(panel_name), ",",
-            "\\"expression\\":", .raven_json_str(expr_text), ",",
-            "\\"sourceKind\\":", .raven_json_str(source_kind), ",",
-            "\\"filePath\\":", .raven_json_str(path), ",",
-            "\\"nrow\\":", as.character(nr),
-            "}"
-        )
-        .raven_post("/view-data", body)
+        status <- .raven_post("/view-data", body)
+        if (!is.na(status) && (status < 200L || status > 299L)) {
+            # Refused: nothing will ever read the file.
+            unlink(path)
+            .raven_log(paste0("the data viewer refused this View() (HTTP ", status, ")"))
+        }
         invisible(NULL)
     }
 
@@ -681,11 +754,40 @@ local({
         })
     }
 
+    # JSON string literal for each element of x (NA -> ""). Escapes the
+    # quote, backslash and every control character, and writes all other
+    # non-ASCII as \\u escapes (a surrogate pair past U+FFFF), so the body
+    # is pure ASCII: valid JSON whatever the text, and a byte length that
+    # doesn't depend on the session's encoding. Built from intToUtf8() so
+    # the R source needs no backslash escapes inside this template.
     .raven_json_str <- function(x) {
-        # Tiny JSON-string escaper (subset sufficient for our payloads).
-        x <- gsub("\\\\\\\\", "\\\\\\\\\\\\\\\\", x, fixed = TRUE)
-        x <- gsub("\\"", "\\\\\\"", x, fixed = TRUE)
-        paste0("\\"", x, "\\"")
+        bs <- intToUtf8(92L)
+        q <- intToUtf8(34L)
+        named <- c("8" = "b", "9" = "t", "10" = "n", "12" = "f", "13" = "r",
+                   "34" = q, "92" = bs)
+        one <- function(s) {
+            if (is.na(s)) return(paste0(q, q))
+            cp <- utf8ToInt(enc2utf8(s))
+            if (anyNA(cp)) cp <- utf8ToInt(iconv(s, "", "UTF-8", sub = "?"))
+            if (anyNA(cp)) cp <- 63L
+            plain <- cp >= 32L & cp < 127L & cp != 34L & cp != 92L
+            if (all(plain)) return(paste0(q, intToUtf8(cp), q))
+            out <- character(length(cp))
+            out[plain] <- intToUtf8(cp[plain], multiple = TRUE)
+            key <- as.character(cp)
+            nm <- !plain & key %in% names(named)
+            out[nm] <- paste0(bs, named[key[nm]])
+            u <- !plain & !nm & cp <= 65535L
+            out[u] <- sprintf("%su%04x", bs, cp[u])
+            a <- !plain & !nm & cp > 65535L
+            v <- cp[a] - 65536L
+            out[a] <- sprintf("%su%04x%su%04x", bs, 55296L + v %/% 1024L,
+                              bs, 56320L + v %% 1024L)
+            paste0(q, paste(out, collapse = ""), q)
+        }
+        x <- as.character(x)
+        if (length(x) == 0L) return(paste0(q, q))
+        vapply(x, one, character(1L), USE.NAMES = FALSE)
     }
 
     # 2. Start httpgd device, post session-ready, and register the

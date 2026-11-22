@@ -34,6 +34,13 @@
 import { mock } from 'bun:test';
 
 mock.module('vscode', () => ({
+    // Debugger (tests/bun/debugger-console-link.test.ts).
+    SourceBreakpoint: class {},
+    FunctionBreakpoint: class {},
+    MarkdownString: class {},
+    DebugAdapterNamedPipeServer: class {},
+    StatusBarAlignment: { Left: 1, Right: 2 },
+    debug: {},
     commands: {
         registerCommand: () => ({ dispose: () => {} }),
         executeCommand: async () => undefined,
