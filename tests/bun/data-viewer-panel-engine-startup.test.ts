@@ -84,28 +84,29 @@ async function setup() {
         Uri: { joinPath: (base: any, ...parts: string[]) => ({ fsPath: [base?.fsPath ?? '', ...parts].join('/') }) },
         ViewColumn: { Active: -1 },
     }));
-    mock.module(`${SRC}/worker-engine`, () => ({
-        WorkerEngine: {
-            start: (opts: { filePath: string }) => new Promise(resolve => {
-                // Open now, as a real thread would: a close during startup
-                // unlinks the file.
-                const opening = arrowMod.ArrowSliceReader.open(opts.filePath);
-                const gate: Gate = {
-                    disposed: false,
-                    release: async () => {
-                        const reader = await opening;
-                        const engine = new LocalEngine(reader);
-                        const dispose = engine.dispose.bind(engine);
-                        engine.dispose = async () => { gate.disposed = true; await gate.holdDispose; await dispose(); await reader.close(); };
-                        gate.engine = engine;
-                        resolve(engine);
-                        await flush();
-                    },
-                };
-                gates.push(gate);
-            }),
-        },
-    }));
+    // Patched on the real class (restored after the test): a module mock
+    // would outlive this file in bun's shared process.
+    const { WorkerEngine } = await import(`${SRC}/worker-engine`);
+    const realStart = WorkerEngine.start;
+    cleanups.push(() => { WorkerEngine.start = realStart; });
+    WorkerEngine.start = ((opts: { filePath: string }) => new Promise(resolve => {
+        // Open now, as a real thread would: a close during startup
+        // unlinks the file.
+        const opening = arrowMod.ArrowSliceReader.open(opts.filePath);
+        const gate: Gate = {
+            disposed: false,
+            release: async () => {
+                const reader = await opening;
+                const engine = new LocalEngine(reader);
+                const dispose = engine.dispose.bind(engine);
+                engine.dispose = async () => { gate.disposed = true; await gate.holdDispose; await dispose(); await reader.close(); };
+                gate.engine = engine;
+                resolve(engine);
+                await flush();
+            },
+        };
+        gates.push(gate);
+    })) as any;
     const panelMod = await import(`${SRC}/panel`);
     const { DataViewerManager } = await import(`${SRC}/manager`);
     const { LayoutStore } = await import(`${SRC}/layout-state`);

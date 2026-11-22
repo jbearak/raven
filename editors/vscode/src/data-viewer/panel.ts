@@ -383,7 +383,6 @@ export class DataViewerPanel {
         extensionUri: vscode.Uri,
         disposeHook: () => void,
         source: ViewSource = {},
-        engineFactory?: EngineFactory,
     ): Promise<DataViewerPanel> {
         const webviewPanel = vscode.window.createWebviewPanel(
             'raven.dataViewer',
@@ -404,7 +403,7 @@ export class DataViewerPanel {
             store, toolbarStore, sortStore, filterStore, settings, disposeHook,
         );
         panel.source = source;
-        panel.engineFactory = engineFactory ?? workerEngineFactory(extensionUri, line => panel.log(line));
+        panel.engineFactory = workerEngineFactory(extensionUri, line => panel.log(line));
         await panel.installEngine(reader, filePath);
         panel.trace('create', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         return panel;
