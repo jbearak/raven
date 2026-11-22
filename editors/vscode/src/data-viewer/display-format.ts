@@ -294,6 +294,15 @@ export function formatTimestamp(ms: number, us: number, zone: string, digits: nu
     return { text, offset };
 }
 
+/** Fractional digits a timestamp needs to show all its precision (0, 3
+ *  or 6). Used when the file names no column-wide digits: files written
+ *  by an older `View()` lack `raven.subsecond_digits`, and dropping
+ *  `.125` there would hide precision that is in the data. */
+export function subsecondDigitsOf(ms: number, us: number): number {
+    if (us !== 0) return 6;
+    return ((ms % 1000) + 1000) % 1000 !== 0 ? 3 : 0;
+}
+
 // ---------------------------------------------------------------------
 // Type tags and alignment
 // ---------------------------------------------------------------------
@@ -414,7 +423,9 @@ export function formatCell(
                 tooltip: `${cell.s} seconds since 1970-01-01 UTC`,
             };
             case 'ts': {
-                const ts = formatTimestamp(cell.ms, cell.us, col?.timeZone ?? 'UTC', col?.subsecondDigits ?? 0);
+                const ts = formatTimestamp(
+                    cell.ms, cell.us, col?.timeZone ?? 'UTC', col?.subsecondDigits ?? subsecondDigitsOf(cell.ms, cell.us),
+                );
                 return { text: ts.text, missing: false, copyText: ts.text, tooltip: ts.offset };
             }
         }

@@ -121,7 +121,8 @@ export type ColumnSchema = {
      *  Absent for files not written by Raven's `View()`. */
     typeTag?: string;
     /** Fixed fractional-second digits (0, 3 or 6) for a POSIXct or
-     *  difftime column, from `raven.subsecond_digits`. */
+     *  difftime column, from `raven.subsecond_digits`. Absent (older
+     *  writers), each timestamp shows the digits it needs. */
     subsecondDigits?: number;
     /** Display zone for a timestamp column: the Arrow type's zone, else
      *  the R session zone (`raven.session_tz`), else `UTC`. */
