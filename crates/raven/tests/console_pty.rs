@@ -757,3 +757,84 @@ fn falls_back_to_plain_r_when_it_cannot_embed() {
     c.line("1 + 1");
     c.expect("[1] 2");
 }
+
+#[test]
+fn forked_workers_output_reaches_the_terminal() {
+    if !r_available() {
+        return;
+    }
+    // Each forked worker inherits the output buffer but not the thread that
+    // drains it; everything a worker writes must still appear, exactly once.
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    c.line(
+        "invisible(parallel::mclapply(1:2, function(i) { \
+         cat(sprintf('worker %d first\\n', i)); cat(sprintf('worker %d last\\n', i)) }, \
+         mc.cores = 2)); cat('ALL', 'DONE\\n', sep = '')",
+    );
+    let out = c.expect("ALLDONE");
+    let all = strip_ansi(&String::from_utf8_lossy(&c.out));
+    assert!(!all.contains("starting plain R"), "{all}");
+    for i in 1..=2 {
+        for w in ["first", "last"] {
+            let line = format!("worker {i} {w}");
+            assert_eq!(out.matches(&line).count(), 1, "{line:?} in: {out}");
+        }
+    }
+}
+
+impl Console {
+    /// Wait for the console process to exit on its own.
+    fn wait_exit(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.pump();
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                self.pump();
+                return status;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "console did not exit; output:\n{}",
+                    strip_ansi(&String::from_utf8_lossy(&self.out))
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn expression_and_file_arguments_run_and_exit() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&["-e", "cat('EXPR', 'RAN\\n', sep = '')"]);
+    assert!(c.wait_exit().success());
+    let out = c.since_mark();
+    assert!(out.contains("EXPRRAN"), "{out}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("script.R");
+    std::fs::write(&script, "cat('FILE', 'RAN\\n', sep = '')\n").unwrap();
+    let path = script.to_str().unwrap();
+    let file_arg = format!("--file={path}");
+    for args in [vec!["-f", path], vec![file_arg.as_str()]] {
+        let mut c = Console::spawn(&args);
+        assert!(c.wait_exit().success());
+        let out = c.since_mark();
+        assert!(out.contains("FILERAN"), "{args:?}: {out}");
+    }
+}
+
+#[test]
+fn program_arguments_reach_r_unchanged() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&["--args", "--help", "x"]);
+    c.expect("> ");
+    c.line("cat(commandArgs(TRUE), 'END\\n', sep = '|')");
+    let out = c.expect("|END");
+    assert!(out.contains("--help|x|END"), "{out}");
+}
