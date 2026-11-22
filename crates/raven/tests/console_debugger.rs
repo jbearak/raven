@@ -990,6 +990,122 @@ fn session_lifecycle_survives_teardown_races_and_disconnect_semantics() {
     c.expect("after FALSE");
 }
 
+/// One request on a fresh IPC connection; its reply's `status`.
+fn ipc_request(c: &Console, msg: &Value) -> String {
+    let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
+    s.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{msg}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+    v["status"].as_str().unwrap_or("").to_string()
+}
+
+/// The files the console has line breakpoints in, from the summary it
+/// pushes to a subscriber after a mirror that names only a probe path.
+fn armed_files(c: &Console) -> Vec<String> {
+    let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
+    s.set_read_timeout(Some(Duration::from_millis(700)))
+        .unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{}", json!({"v": 1, "id": 1, "op": "subscribe"})).unwrap();
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    let probe = c.dir.join("no-such-probe").to_string_lossy().into_owned();
+    let status = ipc_request(
+        c,
+        &json!({"v": 1, "id": 2, "op": "breakpoints", "files": {probe: []}}),
+    );
+    assert_eq!(status, "ok");
+    // Summaries queued earlier may arrive first: the last one counts.
+    let mut files = Vec::new();
+    loop {
+        line.clear();
+        match r.read_line(&mut line) {
+            Ok(n) if n > 0 => {}
+            _ => break,
+        }
+        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        if v["event"] == "breakpoints" {
+            files = v["breakpoints"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b["source"]["path"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+    }
+    files
+}
+
+#[test]
+fn a_stalled_breakpoint_request_cannot_undo_a_later_one() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let target = c.write_file("b.R", "x <- 1\ny <- 2\n");
+    // A file whose read blocks until the test writes to it, standing in
+    // for a stalled network filesystem.
+    let fifo = c.dir.join("a_stall.R");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let fifo = fifo.to_string_lossy().into_owned();
+    let deadline = Instant::now() + TIMEOUT;
+    while c.ipc_status("breakpoints") != "ok" {
+        assert!(Instant::now() < deadline, "debugger never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let arm = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {&target: [{"line": 1}]}});
+    assert_eq!(ipc_request(&c, &arm), "ok");
+    assert_eq!(armed_files(&c), vec![target.clone()]);
+    // An older request stalls reading its first file, before it reaches
+    // the target...
+    let stalled = {
+        let msg = json!({"v": 1, "id": 2, "op": "breakpoints",
+            "files": {&fifo: [{"line": 1}], &target: [{"line": 2}]}});
+        let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
+        s.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{msg}").unwrap();
+        s
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    // ... a newer one deletes the target's breakpoints ...
+    let clear = json!({"v": 1, "id": 3, "op": "breakpoints", "files": {&target: []}});
+    assert_eq!(ipc_request(&c, &clear), "ok");
+    assert!(armed_files(&c).is_empty());
+    // ... and then the stall ends, and the older request finishes.
+    std::fs::write(&fifo, "z <- 1\n").unwrap();
+    let mut line = String::new();
+    BufReader::new(stalled).read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\""), "{line}");
+    let fifo = std::fs::canonicalize(&fifo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    // It still arms the file no later request named.
+    assert_eq!(
+        armed_files(&c),
+        vec![fifo.clone()],
+        "the older request re-armed deleted breakpoints"
+    );
+    // Deleting a file's breakpoints doesn't read its text: nothing
+    // writes to the FIFO here.
+    let clear = json!({"v": 1, "id": 4, "op": "breakpoints", "files": {&fifo: []}});
+    assert_eq!(ipc_request(&c, &clear), "ok");
+    assert!(armed_files(&c).is_empty());
+}
+
 #[test]
 fn sourcing_with_echo_shows_only_the_users_lines() {
     if !r_available() {

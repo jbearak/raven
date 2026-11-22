@@ -244,6 +244,9 @@ fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
     if !super::dap::ready() {
         return false;
     }
+    // Before any file is read: a read that stalls must not let this
+    // request overwrite one that arrived after it.
+    let ticket = super::dap::breakpoint_ticket();
     if let Some(files) = msg.get("files").and_then(|f| f.as_object()) {
         for (path, bps) in files {
             let wanted = bps
@@ -264,7 +267,7 @@ fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
                         .collect()
                 })
                 .unwrap_or_default();
-            super::dap::set_file_breakpoints(path, wanted);
+            super::dap::set_file_breakpoints(path, wanted, ticket);
         }
     }
     let strings = |k: &str| {
