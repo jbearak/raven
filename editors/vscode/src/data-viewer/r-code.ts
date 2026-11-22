@@ -314,9 +314,16 @@ function predicateCode(
     const num = isInt64(col) ? `bit64::as.double.integer64(${x})` : x;
     if (isInt64(col) && /^num/.test(p.kind)) ctx.needs.add('bit64');
     const str = isFactor(col) ? `as.character(${x})` : x;
+    // A bound that isn't a number (an Inf saved as null) matches nothing
+    // in the viewer.
+    if ((p.kind === 'numCompare' && typeof p.value !== 'number')
+        || ((p.kind === 'numBetween' || p.kind === 'numNotBetween')
+            && (typeof p.lo !== 'number' || typeof p.hi !== 'number'))) {
+        return { code: 'FALSE', trueOnNA: false };
+    }
     switch (p.kind) {
-        case 'isEmpty': return { code: `is.na(${x})`, trueOnNA: true };
-        case 'isNotEmpty': return { code: `!is.na(${x})`, trueOnNA: false };
+        case 'isEmpty': return { code: naCode(ctx, entry.columnIndex), trueOnNA: true };
+        case 'isNotEmpty': return { code: `!${naCode(ctx, entry.columnIndex)}`, trueOnNA: false };
         case 'bool': return { code: p.value ? x : `!${x}`, trueOnNA: false };
         case 'numCompare': {
             const op = p.op === '=' ? '==' : p.op;
@@ -788,10 +795,19 @@ function entryCode(ctx: Ctx, entry: FilterEntry, labelsOn: boolean): string | nu
     if (!pred) return null;
     const kind = entry.predicate.kind;
     if (kind === 'isEmpty' || kind === 'isNotEmpty') return pred.code;
-    const x = colRef(ctx, entry.columnIndex);
-    if (entry.includeMissing) return `is.na(${x}) | ${pred.code}`;
-    if (pred.trueOnNA) return `!is.na(${x}) & ${pred.code}`;
+    const na = naCode(ctx, entry.columnIndex);
+    if (entry.includeMissing) return `${na} | ${pred.code}`;
+    if (pred.trueOnNA) return `!${na} & ${pred.code}`;
     return pred.code;
+}
+
+/** `is.na(x)` for column `ci`. For an integer64 the method is called by
+ *  name: until bit64 is loaded, plain is.na() reads the raw bits. */
+function naCode(ctx: Ctx, ci: number): string {
+    const x = colRef(ctx, ci);
+    if (!isInt64(ctx.input.columns[ci])) return `is.na(${x})`;
+    ctx.needs.add('bit64');
+    return `bit64::is.na.integer64(${x})`;
 }
 
 type SortTerm = {
@@ -997,14 +1013,17 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
             { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName);
         const kept = ambiguousNames(keptNames);
         const names = objectNames(input, rownamesAsColumn, rownameName);
+        // A hidden row-name column that isn't materialized emits no select().
+        const selects = input.hiddenColumns.some(ci => input.columns[ci]
+            && (!input.columns[ci].isRowname || rownamesAsColumn));
         const refused = [...new Set([
             ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
             // tibble::rownames_to_column() refuses any dots name.
             ...(rownamesAsColumn ? names.filter(isDots) : []),
             // select() itself refuses duplicates it leaves behind.
-            ...(input.hiddenColumns.length > 0 ? kept : []),
+            ...(selects ? kept : []),
             ...referenced.filter(isDots),
-            ...(input.hiddenColumns.length > 0 ? keptNames.filter(isDots) : []),
+            ...(selects ? keptNames.filter(isDots) : []),
         ])];
         if (refused.length > 0) {
             const list = refused.map(n => (n === '' ? 'an empty name' : `"${rComment(n)}"`)).join(', ');

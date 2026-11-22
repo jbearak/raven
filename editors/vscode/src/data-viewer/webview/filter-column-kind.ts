@@ -81,12 +81,21 @@ export function kindOptions(kind: ColKind): KindOption[] {
 
 /** Checklist rows for a labelled-numeric column: one per labelled code,
  *  sorted by numeric code ascending. The code is the value the filter
- *  matches on; the label is for display only. */
-export function labelledNumericChoices(col: ColumnSchema): { code: number; label: string }[] {
+ *  matches on; the label is for display only. An integer code a double
+ *  can't hold (an integer64 past 2^53) stays decimal text, as Value
+ *  Counts sends it, so the exact matcher sees that code and no other. */
+export function labelledNumericChoices(col: ColumnSchema): { code: number | string; label: string }[] {
     const vl = col.valueLabels;
     if (!vl) return [];
     return Object.entries(vl)
-        .map(([k, label]) => ({ code: Number(k), label }))
-        .filter(c => Number.isFinite(c.code))
-        .sort((a, b) => a.code - b.code);
+        .map(([k, label]) => {
+            const n = Number(k);
+            const unsafe = /^-?[0-9]+$/.test(k) && !Number.isSafeInteger(n);
+            return { code: unsafe ? k : n, n, label };
+        })
+        .filter(c => Number.isFinite(c.n))
+        .sort((a, b) => a.n - b.n
+            || (typeof a.code === 'string' && typeof b.code === 'string'
+                ? (BigInt(a.code) < BigInt(b.code) ? -1 : 1) : 0))
+        .map(({ code, label }) => ({ code, label }));
 }

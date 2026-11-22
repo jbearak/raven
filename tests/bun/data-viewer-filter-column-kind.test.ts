@@ -90,3 +90,18 @@ describe('labelledNumericChoices', () => {
         expect(labelledNumericChoices(col({ name: 'x', arrowType: 'Int32' }))).toEqual([]);
     });
 });
+
+describe('labelledNumericChoices: integer64 codes past 2^53', () => {
+    test('stay decimal text, distinct and in order', async () => {
+        const { labelledNumericChoices } = await import('../../editors/vscode/src/data-viewer/webview/filter-column-kind');
+        const col = {
+            name: 'lab', arrowType: 'Int64', dictionaryShipped: false, isInteger: true,
+            valueLabels: { '9007199254740993': 'odd', '9007199254740992': 'even', '3': 'three' },
+        };
+        expect(labelledNumericChoices(col as any)).toEqual([
+            { code: 3, label: 'three' },
+            { code: '9007199254740992', label: 'even' },
+            { code: '9007199254740993', label: 'odd' },
+        ]);
+    });
+});

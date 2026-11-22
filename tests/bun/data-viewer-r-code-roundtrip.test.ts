@@ -460,13 +460,18 @@ df$lab <- lab`,
 
 // Comparisons alone, in a session where nothing has loaded bit64 yet:
 // plain as.double() would read an integer64's raw bits.
-edgeSuite('Copy as R code round trip: integer64 comparisons with bit64 not loaded (real R)',
-    `df <- data.frame(id = 1:3)
-df$small <- bit64::as.integer64(c("2", "3", NA))`,
-    ['df'],
-    [
-        { name: 'small >= 2.5', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
-    ]);
+// One R session per case: the first bit64 call loads it for the rest.
+const I64_FRAME = `df <- data.frame(id = 1:3)
+df$small <- bit64::as.integer64(c("2", "3", NA))`;
+const I64_FRESH: EdgeCase[] = [
+    { name: 'small >= 2.5', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
+    { name: 'small not in 3', filters: [{ ci: 1, p: { kind: 'setNotIn', values: ['3'] } }] },
+    { name: 'small > 2 or missing', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 2 }, includeMissing: true }] },
+    { name: 'small is empty', filters: [{ ci: 1, p: { kind: 'isEmpty' } }] },
+];
+for (const c of I64_FRESH) {
+    edgeSuite(`Copy as R code round trip: integer64 with bit64 not loaded, ${c.name} (real R)`, I64_FRAME, ['df'], [c]);
+}
 
 // Infinite values picked in Value Counts: a labelled double (labels on 5)
 // and a plain one.

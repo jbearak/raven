@@ -247,4 +247,22 @@ describe('generateRCode', () => {
         expect(code).toContain('# Requires data.table, bit64');
         expect(code).toContain('bit64::as.double.integer64(big) < 3');
     });
+
+    test('a non-number bound (an Inf saved as null) matches nothing, missing rows by includeMissing', () => {
+        const r = gen({
+            filter: { entries: [
+                { id: 'a', columnIndex: 1, predicate: { kind: 'numCompare', op: '<', value: null as unknown as number }, enabled: true, includeMissing: true },
+                { id: 'b', columnIndex: 2, predicate: { kind: 'numBetween', lo: 1, hi: null as unknown as number, inclusive: true }, enabled: true, includeMissing: false },
+            ], labelsOnWhenFiltered: true },
+        }, 'base');
+        const code = 'code' in r ? r.code : r.error;
+        expect(code).toContain('is.na(mpg) | FALSE');
+        expect(code).not.toContain('null');
+    });
+
+    test('dplyr: hiding only an unmaterialized row-name column emits no select(), so a dots column is fine', () => {
+        const cols = [col('rowname', 'Utf8', { isRowname: true, typeTag: '<chr>' }), col('a', 'Int32', { typeTag: '<int>' }), col('...', 'Int32', { typeTag: '<int>' })];
+        const r = gen({ columns: cols, hiddenColumns: [0] });
+        expect('code' in r && r.code).not.toContain('select(');
+    });
 });
