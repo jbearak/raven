@@ -373,10 +373,16 @@ async function acceptorFor(
  *  when it can't equal any integer (or isn't a value at all: a `null`
  *  from a lossy transport must match nothing, not 0). */
 export function int64SetKey(v: unknown): string | undefined {
-    if (typeof v === 'number') return Number.isInteger(v) ? BigInt(v).toString() : undefined;
-    if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) return BigInt(v.trim()).toString();
-    return undefined;
+    let b: bigint | undefined;
+    if (typeof v === 'number' && Number.isInteger(v)) b = BigInt(v);
+    else if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) b = BigInt(v.trim());
+    // No column value lies outside ±(2^63 − 1): -2^63 is bit64's NA, and
+    // as.integer64() turns it (or anything further out) into NA, which
+    // would match the missing rows in R.
+    if (b === undefined || b > INT64_MAX || b < -INT64_MAX) return undefined;
+    return b.toString();
 }
+const INT64_MAX = (1n << 63n) - 1n;
 
 /** A set-filter value that reads as a number: a number, or numeric text
  *  (`"Infinity"`, `"3"`). Anything else, `null` included, is not one. */

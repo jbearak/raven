@@ -714,7 +714,9 @@ function setCode(ctx: Ctx, ci: number, values: readonly (string | number)[], lab
         // integer64 (`9007199254740993` would read as ...992).
         ctx.needs.add('bit64');
         const keys = values.map(int64SetKey).filter((k): k is string => k !== undefined);
-        return `${x} %in% bit64::as.integer64(${keys.length > 0 ? rVector(keys.map(rString)) : 'character(0)'})`;
+        // bit64's own %in%: before R 4.3, base match() compares the raw
+        // doubles, where every negative integer64 is a NaN and they all match.
+        return `bit64::\`%in%\`(${x}, bit64::as.integer64(${keys.length > 0 ? rVector(keys.map(rString)) : 'character(0)'}))`;
     }
     if (col.valueLabels && isNumericType(t)) return numericSet(x, values);
     if (col.valueLabels && labelsOn) {

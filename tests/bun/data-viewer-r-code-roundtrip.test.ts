@@ -438,7 +438,8 @@ lab <- df$big
 labs <- bit64::as.integer64(c("9007199254740992", "9007199254740993"))
 names(labs) <- c("even", "odd")
 attr(lab, "labels") <- labs
-df$lab <- lab`,
+df$lab <- lab
+df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
     ['df', 'dtobj'],
     [
         { name: 'big in one exact value', filters: [{ ci: 1, p: { kind: 'setIn', values: ['9007199254740993'] } }] },
@@ -456,6 +457,10 @@ df$lab <- lab`,
         { name: 'labelled: not odd', filters: [{ ci: 3, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
         { name: 'sort by big desc', sort: [{ ci: 1, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
         { name: 'sort by label', sort: [{ ci: 3, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
+        { name: 'neg in -1', filters: [{ ci: 4, p: { kind: 'setIn', values: [-1] } }] },
+        { name: 'neg not in -2', filters: [{ ci: 4, p: { kind: 'setNotIn', values: ['-2'] } }] },
+        // -2^63 is bit64's NA: it must not select the missing row.
+        { name: 'neg in -2^63', filters: [{ ci: 4, p: { kind: 'setIn', values: ['-9223372036854775808'] } }] },
     ]);
 
 // Comparisons alone, in a session where nothing has loaded bit64 yet:

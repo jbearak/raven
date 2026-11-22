@@ -199,9 +199,9 @@ describe('generateRCode', () => {
             const code = 'code' in r ? r.code : r.error;
             expect(code).toContain('# Requires ');
             expect(code).toContain('bit64');
-            expect(code).toContain('big %in% bit64::as.integer64(c("9007199254740993", "3"))');
+            expect(code).toContain("bit64::`%in%`(big, bit64::as.integer64(c(\"9007199254740993\", \"3\")))");
             // No unclass(): it would turn an integer64 into raw doubles.
-            expect(code).toContain('lab %in% bit64::as.integer64("9007199254740993")');
+            expect(code).toContain("bit64::`%in%`(lab, bit64::as.integer64(\"9007199254740993\"))");
             expect(code).toContain("bit64::as.double.integer64(big) >= 2.5");
             expect(code).toContain("bit64::as.double.integer64(big) >= 1 & bit64::as.double.integer64(big) <= Inf");
             expect(code).not.toContain('9007199254740992');
@@ -273,5 +273,13 @@ describe('generateRCode', () => {
             filter: { entries: [{ id: 'a', columnIndex: 0, predicate: { kind: 'isEmpty' }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
         }, 'base');
         expect('code' in r && r.code).toContain('is.na(unclass(x))');
+    });
+
+    test('integer64 set keys outside ±(2^63 − 1) are dropped (as.integer64 would make them NA)', () => {
+        const r = gen({
+            columns: [col('big', 'Int64', { typeTag: '<integer64>' })],
+            filter: { entries: [{ id: 'x', columnIndex: 0, predicate: { kind: 'setIn', values: ['-9223372036854775808', '9223372036854775808', '-9223372036854775807'] }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        }, 'base');
+        expect('code' in r && r.code).toContain('bit64::`%in%`(big, bit64::as.integer64("-9223372036854775807"))');
     });
 });
