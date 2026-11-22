@@ -39732,6 +39732,47 @@ mod project_config_initialize_tests {
     /// file has no commit of its own and its index entry still carries `a`.
     #[tokio::test]
     async fn an_open_file_follows_its_directory_through_a_closed_parent() {
+        follow_directory_through_closed_parent("source(\"../mods/child.R\")\n", "").await;
+    }
+
+    /// As above, with the child also naming the closed file in a
+    /// `# raven: sourced-by` directive: the directive reads the closed
+    /// parent's directory, which must be re-derived too rather than read from
+    /// its stale index entry.
+    #[tokio::test]
+    async fn an_open_file_follows_its_directory_through_a_closed_sourced_by_parent() {
+        follow_directory_through_closed_parent(
+            "source(\"../mods/child.R\")\n",
+            "# raven: sourced-by middle.R\n",
+        )
+        .await;
+    }
+
+    /// As above, with the directive the child's only link to the closed
+    /// file: the refresh must reach the child over the backward-directive
+    /// edge.
+    #[tokio::test]
+    async fn an_open_file_follows_its_directory_through_a_closed_sourced_by_only_parent() {
+        follow_directory_through_closed_parent("x <- 1\n", "# raven: sourced-by middle.R\n").await;
+    }
+
+    /// As above, with the child adding the directive only after the
+    /// parent's `cd` changed: the edit that adds it re-derives the child
+    /// through the newly named closed parent, not its stale index entry.
+    #[tokio::test]
+    async fn an_open_file_rederives_through_a_sourced_by_parent_it_adds() {
+        follow_directory_through_closed_parent_with("x <- 1\n", "", true).await;
+    }
+
+    async fn follow_directory_through_closed_parent(middle_text: &str, child_header: &str) {
+        follow_directory_through_closed_parent_with(middle_text, child_header, false).await;
+    }
+
+    async fn follow_directory_through_closed_parent_with(
+        middle_text: &str,
+        child_header: &str,
+        add_directive: bool,
+    ) {
         use futures_util::{SinkExt, StreamExt};
         use tower::{Service, ServiceExt};
         use tower_lsp::jsonrpc::Request;
@@ -39742,9 +39783,10 @@ mod project_config_initialize_tests {
             fs::create_dir_all(base.join(dir)).unwrap();
         }
         let main_text = |dir: &str| format!("# raven: cd {dir}\nsource(\"../mods/middle.R\")\n");
-        let child_text = "source(\"constants.R\")\nprint(special_value)\n";
+        let child_text = format!("{child_header}source(\"constants.R\")\nprint(special_value)\n");
+        let child_text = child_text.as_str();
         fs::write(base.join("main.R"), main_text("a")).unwrap();
-        fs::write(base.join("mods/middle.R"), "source(\"../mods/child.R\")\n").unwrap();
+        fs::write(base.join("mods/middle.R"), middle_text).unwrap();
         fs::write(base.join("mods/child.R"), child_text).unwrap();
         fs::write(base.join("a/constants.R"), "old_value <- 1\n").unwrap();
         fs::write(base.join("b/constants.R"), "special_value <- 2\n").unwrap();
@@ -39839,6 +39881,23 @@ mod project_config_initialize_tests {
         };
         until(true, "special_value is undefined under a/").await;
 
+        if add_directive {
+            change_doc(backend, &main_uri, 2, &main_text("b")).await;
+            change_doc(
+                backend,
+                &child_uri,
+                2,
+                &format!("# raven: sourced-by middle.R\n{child_text}"),
+            )
+            .await;
+            until(
+                false,
+                "special_value is defined under b/ once the child names middle.R",
+            )
+            .await;
+            collector.abort();
+            return;
+        }
         change_doc(backend, &main_uri, 2, &main_text("b")).await;
         until(false, "special_value is defined under b/").await;
         change_doc(backend, &main_uri, 3, &main_text("a")).await;
