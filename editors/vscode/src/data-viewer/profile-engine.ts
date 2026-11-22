@@ -253,7 +253,7 @@ async function profileNumeric(
         mean = posInf && negInf ? NaN : posInf ? Infinity : negInf ? -Infinity : fm;
         if (finite > 1) {
             const v = (s2 - (s1 * s1) / finite) / (finite - 1);
-            sd = posInf || negInf ? NaN : Math.sqrt(Math.max(0, v));
+            sd = Math.sqrt(Math.max(0, v));
         }
         if (e20) {
             histogram = binsFrom(e20, c20);

@@ -450,7 +450,12 @@ export class DataViewerPanel {
     private setEngine(engine: DataEngine): void {
         this.engineValue = engine;
         engine.coordinator.adoptionRequired = this.adoptsTransforms === true;
-        engine.coordinator.onAdoptionTimeout = (gen) => { void this.onAdoptionLost(gen); };
+        // Only the installed engine re-sends state: a superseded engine's
+        // timeout (one being replaced, its successor still starting) would
+        // paint from the getter's in-process fallback.
+        engine.coordinator.onAdoptionTimeout = (gen) => {
+            if (this.engineValue === engine) void this.onAdoptionLost(gen);
+        };
         this.profileScheduler?.dispose();
         const ncol = this.reader.schema.columns.length;
         this.profileScheduler = new ProfileScheduler(

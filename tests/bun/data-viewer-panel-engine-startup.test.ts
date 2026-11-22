@@ -47,10 +47,12 @@ class FakeWebview {
 
 class FakeWebviewPanel {
     webview = new FakeWebview();
+    disposed = false;
     private disposeListeners: (() => void)[] = [];
     onDidDispose(cb: () => void) { this.disposeListeners.push(cb); return { dispose() {} }; }
-    reveal() {}
-    dispose() { this.disposeListeners.forEach(cb => cb()); }
+    // VS Code throws on a disposed panel.
+    reveal() { if (this.disposed) throw new Error('Webview is disposed'); }
+    dispose() { if (this.disposed) return; this.disposed = true; this.disposeListeners.forEach(cb => cb()); }
 }
 
 async function flush(n = 8): Promise<void> {
@@ -70,6 +72,7 @@ afterEach(async () => {
 async function setup() {
     const panels: FakeWebviewPanel[] = [];
     const gates: Gate[] = [];
+    const errors: string[] = [];
     const arrowMod = await import(`${SRC}/arrow-reader`);
     const { LocalEngine } = await import(`${SRC}/engine`);
     mock.module('vscode', () => ({
@@ -77,7 +80,7 @@ async function setup() {
             createWebviewPanel: () => { const p = new FakeWebviewPanel(); panels.push(p); return p; },
             createOutputChannel: () => ({ appendLine() {}, dispose() {} }),
             showWarningMessage: () => Promise.resolve(undefined),
-            showErrorMessage: () => Promise.resolve(undefined),
+            showErrorMessage: (msg: string) => { errors.push(msg); return Promise.resolve(undefined); },
         },
         workspace: { getConfiguration: () => ({ get: (_k: string, d?: unknown) => d }) },
         env: { clipboard: { writeText: async () => {} } },
@@ -139,7 +142,7 @@ async function setup() {
         for (const g of gates) if (!g.engine) await g.release().catch(() => undefined);
         for (const g of gates) await g.engine?.dispose().catch(() => undefined);
     });
-    return { panels, gates, create, copy, openReader, manager };
+    return { panels, gates, errors, create, copy, openReader, manager };
 }
 
 /** Wait until `pred` holds, flushing the event loop between checks. */
@@ -217,12 +220,15 @@ describe('engine startup in create()', () => {
         let finishDispose!: () => void;
         gates[0].holdDispose = new Promise<void>(r => { finishDispose = r; });
         panels[0].dispose();
-        const second = manager.onViewDataRequested({ panelName: 'race', filePath: copy('b.arrow'), nrow: 5, sessionId: 'x' } as any);
-        await until(() => gates.length === 2);
-        await gates[1].release();
-        await second;
-        expect(manager.getPanelNames()).toEqual(['race']);
-        finishDispose();
+        try {
+            const second = manager.onViewDataRequested({ panelName: 'race', filePath: copy('b.arrow'), nrow: 5, sessionId: 'x' } as any);
+            await until(() => gates.length === 2);
+            await gates[1].release();
+            await second;
+            expect(manager.getPanelNames()).toEqual(['race']);
+        } finally {
+            finishDispose();
+        }
         await flush();
         expect(panels.length).toBe(2);
         expect(manager.getPanelNames()).toEqual(['race']);
@@ -230,6 +236,43 @@ describe('engine startup in create()', () => {
 });
 
 describe('engine startup in replace()', () => {
+    test('manager: a tab closed while its replacement starts is neither revealed nor reported as failed', async () => {
+        const { panels, gates, errors, copy, manager } = await setup();
+        const first = manager.onViewDataRequested({ panelName: 'race', filePath: copy('a.arrow'), nrow: 5, sessionId: 'x' } as any);
+        await until(() => gates.length === 1);
+        await gates[0].release();
+        await first;
+        const second = manager.onViewDataRequested({ panelName: 'race', filePath: copy('b.arrow'), nrow: 5, sessionId: 'x' } as any);
+        await until(() => gates.length === 2);
+        panels[0].dispose();
+        await flush();
+        await gates[1].release();
+        await second;
+        expect(errors).toEqual([]);
+        expect(gates[1].disposed).toBe(true);
+        expect(manager.getPanelNames()).toEqual([]);
+    });
+
+    test('an adoption timeout from the engine being replaced paints nothing', async () => {
+        const { panels, gates, create, copy, openReader } = await setup();
+        const creating = create(copy('a.arrow'));
+        await until(() => gates.length === 1);
+        await gates[0].release();
+        const panel: any = await creating;
+        const wv = panels[0].webview;
+        const path = copy('b.arrow');
+        const replacing = panel.replace(await openReader(path), path);
+        await until(() => gates.length === 2);
+        const before = wv.posted.length;
+        gates[0].engine.coordinator.onAdoptionTimeout(1);
+        await flush();
+        expect(wv.posted.length).toBe(before);
+        expect(panel.engineValue).toBeUndefined();
+        await gates[1].release();
+        await replacing;
+        expect(panel.engineValue).toBe(gates[1].engine);
+    });
+
     test('requests during the new engine start wait for it and are answered by it', async () => {
         const { panels, gates, create, copy, openReader } = await setup();
         const creating = create(copy('a.arrow'));

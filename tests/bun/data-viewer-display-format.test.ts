@@ -111,6 +111,11 @@ describe('source display formats', () => {
         ['PERCENT8.1', 1.5, '150.0%'],
         ['PERCENTN8.2', -0.25, '-25.00%'],
         ['PERCENT8.2', -0.00001, '(1e-03%)'],
+        // Unscaled formats keep the bare scientific fallback.
+        ['PCT8.2', 0.00001, '1e-05'],
+        ['DOLLAR10.2', 1e-9, '1e-09'],
+        // A percentage that overflows shows the stored value.
+        ['PERCENT8.2', -Number.MAX_VALUE, '-1.7976931348623157e+308'],
         ['Z5.', 42, '00042'],
         ['Z5.', -42, '-0042'],
     ])('%s: %p → %s', (fmt, x, want) => {

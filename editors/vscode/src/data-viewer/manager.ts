@@ -47,7 +47,8 @@ export class DataViewerManager {
                 if (existing?.isDisposed) this.panels.delete(e.panelName);
                 if (existing && !existing.isDisposed) {
                     await existing.replace(reader, e.filePath, source);
-                    existing.reveal();
+                    // The tab may have closed while the replacement started.
+                    if (!existing.isDisposed) existing.reveal();
                     return;
                 }
                 // The hook removes only this panel: a tab closed while its

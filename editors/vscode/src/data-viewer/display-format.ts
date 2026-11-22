@@ -186,9 +186,14 @@ export function formatNumber(x: number, o: NumberFormatOptions): string {
     }
     if (spec?.kind === 'fixed') {
         const v = x * spec.scale;
+        // Past ±1.8e306 a percentage overflows: show the stored value.
+        if (!Number.isFinite(v)) return formatFullPrecision(x);
         const a = Math.abs(v);
         let body: string;
         if (needsScientific(a, spec.decimals)) {
+            // Unscaled formats keep the bare scientific fallback; a scaled
+            // one keeps its `%`, or the value would read 100 times too small.
+            if (spec.scale === 1) return formatScientific(x, Math.max(1, spec.decimals));
             body = formatScientific(a, Math.max(1, spec.decimals));
         } else {
             const fixed = a.toFixed(usableDecimals(a, spec.decimals));
