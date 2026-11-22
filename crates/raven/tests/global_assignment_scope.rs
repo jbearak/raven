@@ -405,3 +405,74 @@ child_ordinary <- 1
         vec![row("main.R", 4, "child_ordinary")]
     );
 }
+
+/// The caller of a `local()`-block `source(local = TRUE)` sees the net effect
+/// of the child's global definitions and global removals, in order: a global
+/// the child creates and then removes is gone, one it removes and then
+/// recreates is back, and a caller global it removes is gone.
+#[test]
+fn local_source_applies_the_childs_global_removals_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "main.R",
+        r#"pre <- 1
+local({ source("R/child.R", local = TRUE) })
+print(captured)
+print(readded)
+print(pre)
+"#,
+    );
+    write(
+        dir.path(),
+        "R/child.R",
+        r#"con <- textConnection("captured", "w")
+close(con)
+rm(captured, envir = base::globalenv())
+rm(readded, envir = globalenv())
+readded <<- 1
+rm(pre, envir = globalenv())
+"#,
+    );
+    assert_eq!(
+        undefined(dir.path(), &["captured", "readded", "pre"]),
+        vec![row("main.R", 2, "captured"), row("main.R", 4, "pre")]
+    );
+}
+
+/// `delayedAssign()` binds the name R matches to `x`, and the `base::`
+/// spellings of `delayedAssign()` and `rm()` act like the bare ones.
+#[test]
+fn delayed_assign_argument_matching_and_base_qualified_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "matching.R",
+        r#"local({ delayedAssign("wrong", x = "right", assign.env = globalenv()) })
+print(right)
+print(wrong)
+"#,
+    );
+    write(
+        dir.path(),
+        "qualified_delayed.R",
+        r#"local({ base::delayedAssign("raven_x", 42, assign.env = globalenv()) })
+print(raven_x)
+"#,
+    );
+    write(
+        dir.path(),
+        "qualified_rm.R",
+        r#"raven_gone <- 1
+base::local({ base::rm(raven_gone, envir = base::globalenv()) })
+print(raven_gone)
+"#,
+    );
+    assert_eq!(
+        undefined(dir.path(), &["right", "wrong", "raven_x", "raven_gone"]),
+        vec![
+            row("matching.R", 2, "wrong"),
+            row("qualified_rm.R", 2, "raven_gone"),
+        ]
+    );
+}

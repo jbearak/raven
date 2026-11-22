@@ -1320,10 +1320,13 @@ fn rm_call_targets_global(
 
 fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
     let func_node = node.child_by_field_name("function")?;
-    let func_text = node_text(func_node, content);
 
-    // Check if this is rm() or remove()
-    if func_text != "rm" && func_text != "remove" {
+    // Check if this is rm() or remove(), bare or `base::`-qualified.
+    let is_base_callee = func_node.kind() == "identifier"
+        || func_node
+            .child_by_field_name("lhs")
+            .is_some_and(|lhs| node_text(lhs, content) == "base");
+    if !is_base_callee || !matches!(callee_leaf_name(func_node, content), Some("rm" | "remove")) {
         return None;
     }
     if call_is_internal_routine_argument(node, content) {
