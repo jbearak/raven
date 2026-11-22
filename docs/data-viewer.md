@@ -407,9 +407,12 @@ The code returns the same rows in the same order as the grid:
 - Missing values sort last in both directions, with `NaN` before `NA`. dplyr and base R otherwise mix the two, so a sort on a column that might hold `NaN` adds an `is.na(x) & !is.nan(x)` term. Once a column's summary shows it has no `NaN`, the term is left out.
 - Text sorts follow the [text order](#text-order): As dplyr becomes `.locale = "C"`, Alphabetical becomes `.locale` with your VS Code display language, and Natural becomes `stringr::str_rank(x, locale = …, numeric = TRUE)`. Natural and Alphabetical use the same collation library (ICU) in R and in the viewer, but R and VS Code can ship different versions of it, which can order rare characters differently; the code says so in a comment.
 - A frame's row names become a `rowname` column with `tibble::rownames_to_column()` (dplyr) or `keep.rownames` (data.table) when a filter or sort uses them; base R uses `rownames()`.
+- A column whose name is duplicated or empty is read by position, as in `dat[[3]]`, so a filter on the second of two `val` columns reads that column. dplyr can't filter or sort such a frame, so the dplyr choice says so and points you to base R or data.table.
+- The base R code also works when the object is a data.table.
+- A regular expression filter is written for R's `grepl(perl = TRUE)` so it matches what the viewer matches. For example, `.` and `\s` keep the viewer's meaning, and `$` matches only at the very end. A pattern that would match differently in R is left out, such as one that counts characters with `.` (emoji count as two characters in the viewer and one in R).
 - The comment at the top names the packages the code needs.
 
-Copy as R code works for data frames and matrices. Raven needs the expression you passed to `View()`, so a panel opened before updating Raven, or from an expression too long to send (over 64 KiB once encoded), can't produce code until you call `View()` again. A filter Raven can't write faithfully (for example, a value list on a date column) is left out and named in a comment rather than approximated.
+Copy as R code works for data frames and matrices. Raven needs the expression you passed to `View()`, so a panel opened before updating Raven, or from an expression too long to send (over 64 KiB once encoded), can't produce code until you call `View()` again. A filter Raven can't write faithfully (for example, a value list on a date column) is left out and named in a comment rather than approximated. Column names and values from the data appear in the code only as quoted strings, quoted names, or comment text, so a name that holds a line break can't add a line of code.
 
 ### Refresh
 

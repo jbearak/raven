@@ -199,6 +199,8 @@ type Ctx = {
     rownamesAsColumn: boolean;
     needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble'>;
     skipped: string[];
+    /** Why the last untranslatable filter is left out, when known. */
+    skipReason?: string;
     /** Names the R object (with a materialized row name column) has more
      *  than once, or the empty name: a reference by name would read
      *  another column, so these are reached by position. */
@@ -331,15 +333,19 @@ function predicateCode(
             const needle = p.caseSensitive ? p.value : p.value.toLowerCase();
             return { code: `${fn}(${hay}, ${rString(needle)})`, trueOnNA: false };
         }
-        case 'strRegex':
-            // Only patterns that mean the same in the viewer's JavaScript
-            // RegExp (no `u` flag) and in PCRE; anything else is left out
-            // with a "Not translated" comment rather than run differently.
-            if (!pcreCompatible(p.pattern)) return null;
+        case 'strRegex': {
+            // Translated only where R selects the same strings as the
+            // viewer's JavaScript RegExp; otherwise "Not translated".
+            const t = translateRegex(p.pattern, p.caseSensitive);
+            if ('reason' in t) {
+                ctx.skipReason = t.reason;
+                return null;
+            }
             return {
-                code: `grepl(${rString(p.pattern)}, ${str}, perl = TRUE${p.caseSensitive ? '' : ', ignore.case = TRUE'})`,
+                code: `grepl(${rString(t.pcre)}, ${str}, perl = TRUE${p.caseSensitive ? '' : ', ignore.case = TRUE'})`,
                 trueOnNA: false,
             };
+        }
         case 'dateCompare':
         case 'dateBetween':
         case 'dateNotBetween':
@@ -356,41 +362,249 @@ function predicateCode(
 }
 
 /**
- * Whether a JavaScript (non-Unicode-mode) regex pattern means the same in
- * PCRE (`grepl(perl = TRUE)`). Allows the common subset: literals, classes,
- * groups, alternation, quantifiers, anchors, and the escapes both engines
- * read alike. Rejects escapes the engines read differently (`\u0061` and
- * `\cX` are JS escapes but PCRE errors or differs; `\p`/`\k` are literal
- * letters in non-Unicode JS but properties/backrefs in PCRE; `\0` and other
- * octal forms), `[]`/`[^]` (empty/any class in JS, a PCRE error), and
- * POSIX bracket expressions such as `[[:alpha:]]` (PCRE-only).
+ * The viewer's regex filter (a JavaScript `RegExp` without the `u` flag,
+ * `i` when case-insensitive) as a PCRE pattern for `grepl(perl = TRUE)`
+ * that selects the same strings, or why there is none. The two engines
+ * read the shared syntax alike but differ in what some of it matches, so
+ * the pattern is rewritten where that is exact and refused where not:
+ *   - `.` excludes CR, LF, U+2028 and U+2029 in JS (PCRE: only LF), so it
+ *     becomes that class; `$` is the end of input in JS (PCRE: also
+ *     before a final LF), so it becomes `\z`; `\s`/`\S` cover Unicode
+ *     spaces in JS (PCRE: ASCII), so they become JS's set.
+ *   - JS matches UTF-16 code units, PCRE (in R's UTF-8 mode) code points,
+ *     so on a character outside the BMP (an emoji) the number of
+ *     characters an atom consumes differs. Atoms that can match a lone
+ *     surrogate (`.`, negated classes, `\S`, `\W`, `\D`, classes spanning
+ *     the surrogates) are allowed only under `*`, or under one `+` outside
+ *     any quantified group, where the count can't change the outcome; a
+ *     non-BMP character in the pattern is refused.
+ *   - Case-insensitive matching folds a few characters in PCRE (Unicode
+ *     simple case folding) that JS's `toUpperCase` canonicalization keeps
+ *     apart, such as the Kelvin sign and `k` (`FOLD_GROUPS`). An atom
+ *     whose fold group is one of these is guarded so that, on those
+ *     characters only, it matches exactly what JS matches.
+ * Everything outside the shared subset (escapes the engines read
+ * differently, POSIX classes, inline flags, back-references, an invalid
+ * pattern) is refused.
  */
-export function pcreCompatible(pattern: string): boolean {
-    let inClass = false;
-    for (let i = 0; i < pattern.length; i++) {
+export function translateRegex(pattern: string, caseSensitive: boolean): { pcre: string } | { reason: string } {
+    const flags = caseSensitive ? '' : 'i';
+    try {
+        new RegExp(pattern, flags);
+    } catch {
+        return { reason: 'invalid pattern' };
+    }
+    const refuse = (reason: string) => ({ reason });
+    const nonBmp = 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R';
+    let out = '';
+    let plusCount = 0;
+    /** Per open group: does it hold a `+`-quantified any-unit atom? */
+    const groups: boolean[] = [];
+    let i = 0;
+    const n = pattern.length;
+    /** Emit an atom, check the quantifier after it, and copy that. */
+    const atom = (pcre: string, anyUnit: boolean): string | null => {
+        const q = pattern[i];
+        if (anyUnit) {
+            if (q === '*') { /* zero minimum: safe */ }
+            else if (q === '+' && plusCount === 0) {
+                plusCount++;
+                if (groups.length > 0) groups[groups.length - 1] = true;
+            } else return nonBmp;
+        }
+        out += pcre;
+        return null;
+    };
+    while (i < n) {
         const c = pattern[i];
+        const code = c.charCodeAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) return refuse(nonBmp);
         if (c === '\\') {
-            const next = pattern[i + 1];
-            if (next === undefined) return false;
-            if (!/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(next)) return false;
+            const e = pattern[i + 1];
+            if (e === undefined || !/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(e)) {
+                return refuse(`the escape \\${e ?? ''} means something else in R`);
+            }
+            i += 2;
+            let err: string | null;
+            if (e === 's') err = atom(`[${JS_SPACE}]`, false);
+            else if (e === 'S') err = atom(`[^${JS_SPACE}]`, true);
+            else err = atom(`\\${e}`, e === 'W' || e === 'D');
+            if (err) return refuse(err);
+            continue;
+        }
+        if (c === '[') {
+            const cls = readClass(pattern, i);
+            if ('reason' in cls) return refuse(cls.reason);
+            i = cls.end;
+            const err = atom(caseSensitive ? cls.pcre : foldGuard(cls.js, cls.inner, cls.pcre, false), cls.anyUnit);
+            if (err) return refuse(err);
+            continue;
+        }
+        if (c === '.') {
+            i++;
+            const err = atom(JS_DOT, true);
+            if (err) return refuse(err);
+            continue;
+        }
+        if (c === '$') { out += '\\z'; i++; continue; }
+        if (c === '(') {
+            const named = /^\(\?<([A-Za-z_$][\w$]*)>/.exec(pattern.slice(i));
+            const head = named ? named[0] : /^\((\?(:|=|!|<=|<!))?/.exec(pattern.slice(i))![0];
+            if (head === '(' && pattern[i + 1] === '?') return refuse('this group syntax means something else in R');
+            out += head;
+            i += head.length;
+            groups.push(false);
+            continue;
+        }
+        if (c === ')') {
+            out += c;
+            i++;
+            const plusInside = groups.pop() ?? false;
+            if (plusInside && /[*+?{]/.test(pattern[i] ?? '')) return refuse(nonBmp);
+            if (plusInside && groups.length > 0) groups[groups.length - 1] = true;
+            continue;
+        }
+        if (c === '{') {
+            // `{,n}` is a quantifier in PCRE2 10.43+, a literal in JS.
+            if (pattern[i + 1] === ',') return refuse('`{,` means something else in R');
+            out += c;
             i++;
             continue;
         }
-        if (!inClass) {
-            if (c !== '[') continue;
-            inClass = true;
-            if (pattern[i + 1] === '^') i++;
-            // `[]` / `[^]`: an empty (or "any") class in JS, but in PCRE a
-            // leading `]` is a literal and the class runs on, or errors.
-            if (pattern[i + 1] === ']') return false;
+        if ('*+?|^}'.includes(c)) { out += c; i++; continue; }
+        // A literal character.
+        i++;
+        const lit = c === ']' ? '\\]' : c;
+        const err = atom(caseSensitive ? lit : foldGuard(`[${classBody(c)}]`, classBody(c), lit, true), false);
+        if (err) return refuse(err);
+    }
+    return { pcre: out };
+}
+
+/** JS's `\s`, as the body of a PCRE class (non-ASCII spaces as literal
+ *  characters, so R compiles the pattern in UTF-8 mode). */
+const JS_SPACE = '\\t\\n\\x0b\\f\\r    -     　﻿';
+/** JS's `.` (without the `s` flag). */
+const JS_DOT = '[^\\n\\r  ]';
+
+/** Case-fold groups (BMP) where PCRE's caseless matching (Unicode simple
+ *  case folding) joins characters that JS's non-Unicode `i` (each
+ *  character's `toUpperCase()`, unless that is several characters or
+ *  turns non-ASCII into ASCII) keeps apart. Generated by comparing
+ *  `/x/iu` with `/x/i` over the BMP; the round trip tests check it
+ *  against R. */
+const FOLD_GROUPS: readonly string[] = [
+    'KkK', 'Ssſ', 'ÅåÅ', 'ßẞ', 'Θθϑϴ',
+    'ΩωΩ',
+    ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1f80 + k, 0x1f88 + k)),
+    ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1f90 + k, 0x1f98 + k)),
+    ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1fa0 + k, 0x1fa8 + k)),
+    'ᾳᾼ', 'ῃῌ', 'ῳῼ',
+];
+const FOLD_CHARS = FOLD_GROUPS.join('');
+
+function classBody(chars: string): string {
+    return Array.from(chars, ch => (/[\\\]^-]/.test(ch) ? '\\' + ch : ch)).join('');
+}
+
+/**
+ * A caseless atom that matches, on the characters of `FOLD_GROUPS`,
+ * exactly what JS matches. `js` is the atom as a JS class (a literal `x`
+ * as `[x]`), `inner` the JS class body of its positive members.
+ * When no member is in a fold group the atom is unchanged: PCRE and JS
+ * then agree on every input. Otherwise inputs in the touched groups are
+ * matched case-sensitively against the set JS would accept, and other
+ * inputs go to the atom as before.
+ */
+function foldGuard(js: string, inner: string, pcre: string, literal: boolean): string {
+    const innerRx = new RegExp(`^[${inner}]$`);
+    const touched = FOLD_GROUPS.filter(g => Array.from(g).some(ch => innerRx.test(ch))).join('');
+    if (touched === '') return pcre;
+    const jsRx = new RegExp(`^${js}$`, 'i');
+    const accepted = Array.from(touched).filter(ch => jsRx.test(ch)).join('');
+    const rejected = Array.from(touched).filter(ch => !accepted.includes(ch)).join('');
+    if (literal) {
+        // A literal: PCRE accepts its whole group, JS a subset.
+        return rejected === '' ? pcre : `(?:(?!(?-i:[${classBody(rejected)}]))${pcre})`;
+    }
+    const guard = `(?-i:[${classBody(touched)}])`;
+    return accepted === ''
+        ? `(?:(?!${guard})${pcre})`
+        : `(?:(?=${guard})(?-i:[${classBody(accepted)}])|(?!${guard})${pcre})`;
+}
+
+/** A bracket class at `start`: its PCRE spelling, its JS spelling, its
+ *  positive members (class body), the index after it, and whether it can
+ *  match a lone surrogate. */
+function readClass(p: string, start: number):
+    { pcre: string; js: string; inner: string; end: number; anyUnit: boolean } | { reason: string } {
+    let i = start + 1;
+    const negated = p[i] === '^';
+    if (negated) i++;
+    // `[]` / `[^]`: an empty (or "any") class in JS, but in PCRE a leading
+    // `]` is a literal and the class runs on.
+    if (p[i] === ']') return { reason: '`[]` means something else in R' };
+    let body = '';
+    let spansSurrogates = false;
+    let lastChar: number | null = null;
+    while (i < p.length && p[i] !== ']') {
+        const c = p[i];
+        const code = c.charCodeAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) {
+            return { reason: 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R' };
+        }
+        // POSIX classes and collating elements exist in PCRE only.
+        if (c === '[' && /[:.=]/.test(p[i + 1] ?? '')) return { reason: 'POSIX bracket expressions exist only in R' };
+        if (c === '\\') {
+            const e = p[i + 1];
+            if (e === undefined || !/[dDwWsbntrf.*+?()[\]{}|^$\\/\-]/.test(e)) {
+                return { reason: `the escape \\${e ?? ''} in a class means something else in R` };
+            }
+            const isSet = /[dDwWs]/.test(e);
+            // `[\d-z]`: a union with `-` in JS, an error in PCRE.
+            if (isSet && p[i + 2] === '-' && p[i + 3] !== ']') {
+                return { reason: 'a range next to a class escape means something else in R' };
+            }
+            body += e === 's' ? JS_SPACE : '\\' + e;
+            lastChar = isSet ? null : (({ n: 10, t: 9, r: 13, f: 12, b: 8 } as Record<string, number>)[e] ?? e.charCodeAt(0));
+            i += 2;
             continue;
         }
-        // POSIX classes and collating elements (`[[:alpha:]]`, `[[.a.]]`,
-        // `[[=a=]]`) exist in PCRE only; JS reads them as literal characters.
-        if (c === '[' && /[:.=]/.test(pattern[i + 1] ?? '')) return false;
-        if (c === ']') inClass = false;
+        if (c === '-' && lastChar !== null && p[i + 1] !== undefined && p[i + 1] !== ']') {
+            const hiRaw = p[i + 1];
+            if (hiRaw === '\\') {
+                const e = p[i + 2];
+                if (e === undefined || /[dDwWsS]/.test(e)) return { reason: 'a range next to a class escape means something else in R' };
+                const hi = (({ n: 10, t: 9, r: 13, f: 12, b: 8 } as Record<string, number>)[e] ?? e.charCodeAt(0));
+                if (lastChar <= 0xdfff && hi >= 0xd800) spansSurrogates = true;
+                body += '-\\' + e;
+                i += 3;
+            } else {
+                const hi = hiRaw.charCodeAt(0);
+                if (hi >= 0xd800 && hi <= 0xdfff) {
+                    return { reason: 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R' };
+                }
+                if (lastChar <= 0xdfff && hi >= 0xd800) spansSurrogates = true;
+                body += '-' + (hiRaw === ']' ? '\\]' : hiRaw);
+                i += 2;
+            }
+            lastChar = null;
+            continue;
+        }
+        body += c;
+        lastChar = code;
+        i++;
     }
-    return true;
+    if (p[i] !== ']') return { reason: 'invalid pattern' };
+    const js = p.slice(start, i + 1);
+    const jsInner = p.slice(start + 1 + (negated ? 1 : 0), i);
+    return {
+        pcre: `[${negated ? '^' : ''}${body}]`,
+        js,
+        inner: jsInner,
+        end: i + 1,
+        anyUnit: negated || spansSurrogates,
+    };
 }
 
 /** `<x> %in% c(...)` for a set filter, routed as `filter.ts` routes it. */
@@ -707,9 +921,11 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
     const labelsOn = input.filter.labelsOnWhenFiltered;
     const conditions: string[] = [];
     for (const e of entries) {
+        ctx.skipReason = undefined;
         const code = entryCode(ctx, e, labelsOn);
         if (code === null) {
-            ctx.skipped.push(`filter on ${input.columns[e.columnIndex].name} (${e.predicate.kind})`);
+            const why = ctx.skipReason ? `: ${ctx.skipReason}` : '';
+            ctx.skipped.push(`filter on ${input.columns[e.columnIndex].name} (${e.predicate.kind}${why})`);
         } else {
             conditions.push(code);
         }

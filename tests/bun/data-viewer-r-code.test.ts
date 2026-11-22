@@ -2,7 +2,7 @@
 // data-viewer-r-code-roundtrip.test.ts).
 import { describe, expect, test } from 'bun:test';
 import type { ColumnSchema } from '../../editors/vscode/src/data-viewer/arrow-reader';
-import { generateRCode, pcreCompatible, rName, rNumber, rString } from '../../editors/vscode/src/data-viewer/r-code';
+import { generateRCode, rName, rNumber, rString, translateRegex } from '../../editors/vscode/src/data-viewer/r-code';
 import { EMPTY_FILTER, EMPTY_SORT } from '../../editors/vscode/src/data-viewer/messages';
 
 function col(name: string, arrowType: string, extra: Partial<ColumnSchema> = {}): ColumnSchema {
@@ -122,19 +122,33 @@ describe('generateRCode', () => {
             filter: { entries: [{ id: 'r', columnIndex: 3, predicate: { kind: 'strRegex', pattern, caseSensitive: true }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
         });
         const ok = regex('^file_\\d+\\.csv$');
-        expect('code' in ok && ok.code).toContain('grepl("^file_\\\\d+\\\\.csv$"');
+        expect('code' in ok && ok.code).toContain('grepl("^file_\\\\d+\\\\.csv\\\\z"');
         for (const pattern of ['\\u0061', '\\x{61}a\\cJ', '[^]', '\\p{L}', '\\k', '\\0', '\\v']) {
             const r = regex(pattern);
             expect([pattern, 'code' in r && r.code.includes('grepl(')]).toEqual([pattern, false]);
-            expect('code' in r && r.code).toContain('# Not translated: filter on my name (strRegex)');
+            expect('code' in r && r.code).toContain('# Not translated: filter on my name (strRegex: ');
         }
     });
 
-    test('pcreCompatible allows the shared subset only', () => {
-        for (const p of ['abc', '^a.*b$', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\s\\S\\w\\W', '[^a-c]x', '[\\]]', 'a:b[x:y]'])
-            expect([p, pcreCompatible(p)]).toEqual([p, true]);
-        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\'])
-            expect([p, pcreCompatible(p)]).toEqual([p, false]);
+    test('translateRegex keeps the shared subset and rewrites what JS reads differently', () => {
+        const pcre = (p: string, cs = true) => {
+            const t = translateRegex(p, cs);
+            return 'pcre' in t ? t.pcre : null;
+        };
+        for (const p of ['abc', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\w\\W*', '[\\]]', 'a:b[x:y]', '(?:a)(?=b)(?!c)(?<=d)(?<!e)(?<n>f)'])
+            expect([p, pcre(p)]).toEqual([p, p]);
+        expect(pcre('^a.*b$')).toBe('^a[^\\n\\r  ]*b\\z');
+        expect(pcre('x\\sy')).toBe('x[\\t\\n\\x0b\\f\\r    -     　﻿]y');
+        // Caseless `k` must not match the Kelvin sign, as in JS.
+        expect(pcre('k', false)).toBe('(?:(?!(?-i:[K]))k)');
+        expect(pcre('ab', false)).toBe('ab');
+        // Counts of any-character atoms differ on non-BMP text.
+        for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]'])
+            expect([p, pcre(p)]).toEqual([p, null]);
+        expect(pcre('^.+$')).not.toBeNull();
+        expect(pcre('^[^,]*,.*$')).not.toBeNull();
+        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', 'a{,2}', '[\\d-z]', '[\\S]', '(unclosed'])
+            expect([p, pcre(p)]).toEqual([p, null]);
     });
 
     test('untranslatable filters are named in a comment, not approximated', () => {
