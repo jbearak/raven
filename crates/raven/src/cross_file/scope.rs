@@ -14647,6 +14647,7 @@ local({ rm(by_pos, pos = 1) })
                 "wrong",
             ),
             ("delayedAssign(value = 1, \"named\")\n", "named", "value"),
+            ("delayedAssign(\"wrong\", \"x\" = \"right\")\n", "right", "wrong"),
             (
                 "local({ delayedAssign(\"wrong\", x = \"right\", assign.env = globalenv()) })\n",
                 "right",
