@@ -1208,6 +1208,7 @@ impl<'w> FileResolver<'w> {
         own_import: Option<&Resolution>,
     ) -> Resolution {
         let names = self.names;
+        let call_site = (self.callers[index].1, self.callers[index].2);
         let (caller, line, column) = if late {
             (self.callers[index].0.clone(), u32::MAX, u32::MAX)
         } else {
@@ -1222,14 +1223,16 @@ impl<'w> FileResolver<'w> {
             .symbols
             .get(name)
             .filter(|symbol| {
-                // At the call site, the file's literal overwrites the caller's
-                // earlier global binding. Read late, the caller's scope is its
-                // whole top level, which already ends with the file's literal
-                // unless the caller binds the name again after `source()`. A
-                // named import (a package symbol) is on the search path, not
-                // in the global environment.
+                // The file's literal overwrites the caller's global binding
+                // made before the `source()` call. Read late, the caller's
+                // scope is its whole top level, so a binding the caller makes
+                // after the call survives. A named import (a package symbol)
+                // is on the search path, not in the global environment.
+                let before_call = !late
+                    || (symbol.source_uri == caller
+                        && (symbol.defined_line, symbol.defined_column) < call_site);
                 let overwritten = self.global_overwritten.get()
-                    && !late
+                    && before_call
                     && scope::package_name_from_uri(&symbol.source_uri).is_none();
                 symbol.source_uri != names.uri && !overwritten && !self.passes_over(symbol)
             })

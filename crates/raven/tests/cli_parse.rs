@@ -672,6 +672,26 @@ fn a_literal_overwrite_keeps_caller_imports_and_later_rebindings() {
     );
 }
 
+/// Read late, a caller's binding made before its `source()` call is still
+/// overwritten, even when the call is inside a function.
+#[test]
+fn a_literal_overwrite_read_late_hides_earlier_caller_bindings() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "a.R",
+        b"mean <- function(x) 99\ng <- function() source(\"c.R\")\n",
+    );
+    write(&ws, "b.R", b"source(\"c.R\")\n");
+    write(
+        &ws,
+        "c.R",
+        b"# raven: sourced-by a.R\nmean <- 7\nf <- function() mean(1)\n",
+    );
+    let docs = parse_isolated(&ws, &["c.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
+}
+
 /// The `target` range of top-level statement `index`'s assignment.
 fn target_range(doc: &Value, index: usize) -> &Value {
     &doc["statements"][index]["expression"]["target"]["range"]
