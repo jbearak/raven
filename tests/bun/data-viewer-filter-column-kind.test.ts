@@ -103,5 +103,8 @@ describe('labelledNumericChoices: integer64 codes past 2^53', () => {
             { code: '9007199254740992', label: 'even' },
             { code: '9007199254740993', label: 'odd' },
         ]);
+        // A double column keeps numbers (Value Counts sends numbers there).
+        expect(labelledNumericChoices({ ...col, arrowType: 'Float64' } as any).map(c => c.code))
+            .toEqual([3, 9007199254740992, 9007199254740992]);
     });
 });

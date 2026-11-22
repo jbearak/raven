@@ -322,8 +322,8 @@ function predicateCode(
         return { code: 'FALSE', trueOnNA: false };
     }
     switch (p.kind) {
-        case 'isEmpty': return { code: naCode(ctx, entry.columnIndex), trueOnNA: true };
-        case 'isNotEmpty': return { code: `!${naCode(ctx, entry.columnIndex)}`, trueOnNA: false };
+        case 'isEmpty': return { code: naCode(ctx, entry.columnIndex, x), trueOnNA: true };
+        case 'isNotEmpty': return { code: `!${naCode(ctx, entry.columnIndex, x)}`, trueOnNA: false };
         case 'bool': return { code: p.value ? x : `!${x}`, trueOnNA: false };
         case 'numCompare': {
             const op = p.op === '=' ? '==' : p.op;
@@ -795,16 +795,16 @@ function entryCode(ctx: Ctx, entry: FilterEntry, labelsOn: boolean): string | nu
     if (!pred) return null;
     const kind = entry.predicate.kind;
     if (kind === 'isEmpty' || kind === 'isNotEmpty') return pred.code;
-    const na = naCode(ctx, entry.columnIndex);
+    const na = naCode(ctx, entry.columnIndex, colRef(ctx, entry.columnIndex));
     if (entry.includeMissing) return `${na} | ${pred.code}`;
     if (pred.trueOnNA) return `!${na} & ${pred.code}`;
     return pred.code;
 }
 
-/** `is.na(x)` for column `ci`. For an integer64 the method is called by
- *  name: until bit64 is loaded, plain is.na() reads the raw bits. */
-function naCode(ctx: Ctx, ci: number): string {
-    const x = colRef(ctx, ci);
+/** `is.na(x)` for `x`, a reference to column `ci`. For an integer64 the
+ *  method is called by name: until bit64 is loaded, plain is.na() reads
+ *  the raw bits. */
+function naCode(ctx: Ctx, ci: number, x: string): string {
     if (!isInt64(ctx.input.columns[ci])) return `is.na(${x})`;
     ctx.needs.add('bit64');
     return `bit64::is.na.integer64(${x})`;

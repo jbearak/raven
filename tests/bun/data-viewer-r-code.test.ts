@@ -265,4 +265,13 @@ describe('generateRCode', () => {
         const r = gen({ columns: cols, hiddenColumns: [0] });
         expect('code' in r && r.code).not.toContain('select(');
     });
+
+    test('isEmpty on a value-labelled column reads the unclassed values (haven_labelled_spss na_values)', () => {
+        const cols = [col('x', 'Float64', { typeTag: '<dbl+lbl>', valueLabels: { 1: 'one' } })];
+        const r = gen({
+            columns: cols,
+            filter: { entries: [{ id: 'a', columnIndex: 0, predicate: { kind: 'isEmpty' }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        }, 'base');
+        expect('code' in r && r.code).toContain('is.na(unclass(x))');
+    });
 });

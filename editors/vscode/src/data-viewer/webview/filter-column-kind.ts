@@ -87,10 +87,11 @@ export function kindOptions(kind: ColKind): KindOption[] {
 export function labelledNumericChoices(col: ColumnSchema): { code: number | string; label: string }[] {
     const vl = col.valueLabels;
     if (!vl) return [];
+    const int64 = /^U?[Ii]nt64$/.test(col.arrowType);
     return Object.entries(vl)
         .map(([k, label]) => {
             const n = Number(k);
-            const unsafe = /^-?[0-9]+$/.test(k) && !Number.isSafeInteger(n);
+            const unsafe = int64 && /^-?[0-9]+$/.test(k) && !Number.isSafeInteger(n);
             return { code: unsafe ? k : n, n, label };
         })
         .filter(c => Number.isFinite(c.n))
