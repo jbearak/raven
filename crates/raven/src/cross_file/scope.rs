@@ -15,7 +15,7 @@ use tree_sitter::{Node, Tree};
 
 use super::binding::{CaptureEvaluationFrame, RuntimeFunctionScope};
 use super::source_detect::{
-    FramedLibraryCall, FramedSource, detect_exists_calls_with_bindings,
+    FramedLibraryCall, FramedRmCall, FramedSource, detect_exists_calls_with_bindings,
     detect_library_calls_with_bindings_for_scope, detect_rm_calls_with_bindings_for_scope,
     detect_source_calls_with_bindings_and_frames,
 };
@@ -938,10 +938,13 @@ pub struct ScopeArtifacts {
     /// `local()` body intervals, which `rebuild_function_scope_index` marks
     /// immediate in `function_scope_tree` (see `push_local_block_scopes`).
     pub immediate_function_scopes: Vec<FunctionScopeInterval>,
-    /// Anchors (`line`, `column`) of `<<-` / `->>` definitions and of
-    /// `assign()` calls with a proven global destination, which escape an
-    /// immediate `local()` body (see `FunctionScopeTree::outside_immediate`).
-    pub escaping_def_anchors: HashSet<(u32, u32)>,
+    /// Anchors (`line`, `column`) of the events that escape an immediate
+    /// `local()` body (see `FunctionScopeTree::outside_immediate`): `<<-` /
+    /// `->>` definitions, and the `Def`, `DataLoad`, and `Removal` events of
+    /// calls whose destination is the global environment, explicitly
+    /// (`assign()`, `delayedAssign(assign.env =)`, `rm(envir =)`) or by
+    /// default (`data()`, write-mode `textConnection()`).
+    pub escaping_effect_anchors: HashSet<(u32, u32)>,
     /// `true` when this file contains a non-quoted `devtools::load_all()` /
     /// `pkgload::load_all()` / bare `load_all()` call site (including one that
     /// lives only inside a function body).
@@ -1005,7 +1008,7 @@ impl Default for ScopeArtifacts {
             function_scope_tree: FunctionScopeTree::default(),
             conditional_shiny_deferred_scopes: Vec::new(),
             immediate_function_scopes: Vec::new(),
-            escaping_def_anchors: HashSet::new(),
+            escaping_effect_anchors: HashSet::new(),
             calls_dev_load_all: false,
             dev_load_all_sites: Vec::new(),
             global_assignments: Vec::new(),
@@ -2182,6 +2185,23 @@ fn single_file_attachment_projection(
     (active, late_attached)
 }
 
+/// Append the `Removal` event for a detected `rm()` call, marking it to escape
+/// an enclosing `local()` block when it targets the global environment.
+fn push_removal_event(artifacts: &mut ScopeArtifacts, rm_call: FramedRmCall) {
+    if rm_call.escapes_to_global() {
+        artifacts
+            .escaping_effect_anchors
+            .insert((rm_call.call.line, rm_call.call.column));
+    }
+    artifacts.timeline.push(ScopeEvent::Removal {
+        line: rm_call.call.line,
+        column: rm_call.call.column,
+        symbols: rm_call.call.symbols,
+        runtime_function_scope: rm_call.runtime_function_scope,
+        function_scope: None,
+    });
+}
+
 /// Apply an already-eligible removal. Positional removals record tombstones;
 /// hoisted global removals preserve the point resolver's symbol-only projection.
 fn apply_removal(scope: &mut ScopeAtPosition, symbols: &[String], visibility: EventVisibility) {
@@ -2221,10 +2241,13 @@ fn rebuild_function_scope_index(artifacts: &mut ScopeArtifacts, line_index: &Lin
 
 fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
     let tree = &artifacts.function_scope_tree;
-    let escaping_defs = &artifacts.escaping_def_anchors;
+    let escaping = &artifacts.escaping_effect_anchors;
+    let escapes =
+        |line: u32, column: u32| !escaping.is_empty() && escaping.contains(&(line, column));
     for event in &mut artifacts.timeline {
         match event {
-            // `<<-` / `->>` and `library()` escape an immediate `local()` body;
+            // `<<-` / `->>`, `library()`, and effects whose destination is the
+            // global environment escape an immediate `local()` body;
             // everything else defined in one stays there.
             ScopeEvent::Def {
                 line,
@@ -2240,12 +2263,11 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &L
                     *line,
                     *column,
                 );
-                *function_scope =
-                    if !escaping_defs.is_empty() && escaping_defs.contains(&(*line, *column)) {
-                        tree.outside_immediate(resolved)
-                    } else {
-                        resolved
-                    };
+                *function_scope = if escapes(*line, *column) {
+                    tree.outside_immediate(resolved)
+                } else {
+                    resolved
+                };
             }
             ScopeEvent::PackageLoad {
                 line,
@@ -2275,8 +2297,21 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &L
                 runtime_function_scope,
                 function_scope,
                 ..
+            } => {
+                let resolved = resolve_runtime_function_scope(
+                    tree,
+                    line_index,
+                    *runtime_function_scope,
+                    *line,
+                    *column,
+                );
+                *function_scope = if escapes(*line, *column) {
+                    tree.outside_immediate(resolved)
+                } else {
+                    resolved
+                };
             }
-            | ScopeEvent::Declaration {
+            ScopeEvent::Declaration {
                 line,
                 column,
                 runtime_function_scope,
@@ -2474,13 +2509,7 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
         &mut artifacts,
     );
     for rm_call in detect_rm_calls_with_bindings_for_scope(tree, content, capture_bindings) {
-        artifacts.timeline.push(ScopeEvent::Removal {
-            line: rm_call.call.line,
-            column: rm_call.call.column,
-            symbols: rm_call.call.symbols,
-            runtime_function_scope: rm_call.runtime_function_scope,
-            function_scope: None,
-        });
+        push_removal_event(&mut artifacts, rm_call);
     }
     let library_calls =
         detect_library_calls_with_bindings_for_scope(tree, content, capture_bindings);
@@ -2801,13 +2830,7 @@ pub fn compute_artifacts_with_metadata(
     // Collect rm()/remove() calls and add them to timeline.
     let rm_calls = detect_rm_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
     for rm_call in rm_calls {
-        artifacts.timeline.push(ScopeEvent::Removal {
-            line: rm_call.call.line,
-            column: rm_call.call.column,
-            symbols: rm_call.call.symbols,
-            runtime_function_scope: rm_call.runtime_function_scope,
-            function_scope: None,
-        });
+        push_removal_event(&mut artifacts, rm_call);
     }
 
     // Collect `exists("name")` calls and add Declaration events (treated as
@@ -3401,7 +3424,7 @@ fn collect_definitions(
             assignment_visible_from_position(node, line_index, &symbol);
         if assignment_escapes_current_frame {
             artifacts
-                .escaping_def_anchors
+                .escaping_effect_anchors
                 .insert((symbol.defined_line, symbol.defined_column));
         }
         let event = ScopeEvent::Def {
@@ -3495,10 +3518,7 @@ fn collect_definitions(
             // A global destination binds outside any `local()` block, like
             // `<<-`.
             if effect_frame == CaptureEvaluationFrame::Global {
-                artifacts
-                    .escaping_def_anchors
-                    .insert((symbol.defined_line, symbol.defined_column));
-                artifacts.global_assignments.push(symbol.clone());
+                mark_global_destination(artifacts, &symbol);
             }
             artifacts
                 .exported_interface
@@ -3528,6 +3548,10 @@ fn collect_definitions(
         && evaluation_frame.is_caller_or_global()
         && let Some(symbol) = try_extract_delayed_assign_call(node, line_index, uri)
     {
+        // `assign.env = globalenv()` binds outside any `local()` block.
+        if delayed_assign_targets_global(node, line_index, capture_bindings) {
+            mark_global_destination(artifacts, &symbol);
+        }
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
         let event = ScopeEvent::Def {
             line: symbol.defined_line,
@@ -3656,6 +3680,11 @@ fn collect_definitions(
         && evaluation_frame.is_caller_or_global()
         && let Some(symbol) = try_extract_text_connection_definition(node, line_index, uri)
     {
+        // With `local = FALSE` (the default) the variable is created in the
+        // global environment, even from inside a `local()` block.
+        if text_connection_targets_global(node, line_index) {
+            mark_global_destination(artifacts, &symbol);
+        }
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
         let event = ScopeEvent::Def {
             line: symbol.defined_line,
@@ -3672,12 +3701,20 @@ fn collect_definitions(
             .insert(symbol.name.clone(), symbol);
     }
 
-    // Check for data() calls. `data(foo, "bar")` loads named datasets into the
-    // calling environment. Model each positional identifier/string arg as a
-    // binding visible from the call's end position.
+    // Check for data() calls. `data(foo, "bar")` loads named datasets into
+    // `envir`, the global environment by default. Model each positional
+    // identifier/string arg as a binding visible from the call's end position.
+    // A global destination escapes a `local()` block; every symbol and the
+    // `DataLoad` event share the call's start as their anchor.
     if call_callee == Some("data") && evaluation_frame.is_caller_or_global() {
         let (data_symbols, data_call_info) =
             try_extract_data_call_definitions(node, line_index, uri);
+        if !data_symbols.is_empty() && data_call_targets_global(node, line_index, capture_bindings)
+        {
+            for symbol in &data_symbols {
+                mark_global_destination(artifacts, symbol);
+            }
+        }
         if !data_symbols.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
             for symbol in data_symbols {
@@ -4674,17 +4711,8 @@ fn try_extract_assign_call(
     }
 
     let args_node = node.child_by_field_name("arguments")?;
-    let bindings = capture_bindings.get();
-    // A call in a top-level `if` branch or `local()` body runs at its source
-    // position, so only earlier effects can rebind `globalenv`/`.GlobalEnv`.
-    // This collector already treats a bare `assign()` as `base::assign` (it is
-    // emitting a definition for one), so other unproven bare `assign()` calls,
-    // this one included, bind only their literal names.
-    let deferred_use = !bindings.is_source_ordered_at(node);
-    let bare_globalenv_trusted =
-        !bindings.named_alias_may_shadow_assuming_base_assign_at("globalenv", node, deferred_use);
-    let dot_global_env_trusted =
-        !bindings.named_alias_may_shadow_assuming_base_assign_at(".GlobalEnv", node, deferred_use);
+    let (bare_globalenv_trusted, dot_global_env_trusted) =
+        global_env_names_trusted(node, capture_bindings);
     let resolved = super::binding::resolve_assign_arguments(
         args_node,
         line_index.text,
@@ -4712,6 +4740,133 @@ fn try_extract_assign_call(
         is_declared: false,
     };
     Some((symbol, resolved.destination))
+}
+
+/// Record that the `Def` anchored at `symbol` binds in the global
+/// environment: it escapes an immediate `local()` body and, at the file's
+/// runtime top level, reaches a caller that runs the file in a `local()` block
+/// (see [`ScopeArtifacts::global_assignments`]).
+fn mark_global_destination(artifacts: &mut ScopeArtifacts, symbol: &ScopedSymbol) {
+    artifacts
+        .escaping_effect_anchors
+        .insert((symbol.defined_line, symbol.defined_column));
+    artifacts.global_assignments.push(symbol.clone());
+}
+
+/// Whether bare `globalenv` and `.GlobalEnv` still name base's global
+/// environment at `node`.
+///
+/// A call in a top-level `if` branch or `local()` body runs at its source
+/// position, so only earlier effects can rebind `globalenv`/`.GlobalEnv`.
+/// This collector treats a bare `assign()` as `base::assign` (it emits a
+/// definition for one), so other unproven bare `assign()` calls bind only
+/// their literal names.
+fn global_env_names_trusted(node: Node, capture_bindings: &mut LazyStaticBindings) -> (bool, bool) {
+    let bindings = capture_bindings.get();
+    let deferred_use = !bindings.is_source_ordered_at(node);
+    (
+        !bindings.named_alias_may_shadow_assuming_base_assign_at("globalenv", node, deferred_use),
+        !bindings.named_alias_may_shadow_assuming_base_assign_at(".GlobalEnv", node, deferred_use),
+    )
+}
+
+/// Whether a `delayedAssign()` call's `assign.env` is the global environment.
+/// Arguments match as R matches them, so `assign = .GlobalEnv` counts.
+fn delayed_assign_targets_global(
+    node: Node,
+    line_index: &LineIndex,
+    capture_bindings: &mut LazyStaticBindings,
+) -> bool {
+    const FORMALS: [&str; 4] = ["x", "value", "eval.env", "assign.env"];
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let Some(matched) = super::binding::match_call_arguments(
+        arguments,
+        line_index.text,
+        &FORMALS,
+        super::binding::CallMatchMode::Strict,
+    ) else {
+        return false;
+    };
+    let Some(super::binding::CallActual::Value(assign_env)) = matched[3] else {
+        return false;
+    };
+    let (bare_trusted, dot_trusted) = global_env_names_trusted(node, capture_bindings);
+    super::binding::value_is_global_environment(
+        assign_env,
+        line_index.text,
+        bare_trusted,
+        dot_trusted,
+    )
+}
+
+/// Whether a `data()` call loads into the global environment: `envir`
+/// omitted (its default is `.GlobalEnv`) or explicitly global. `envir`
+/// follows `...` in `data()`'s formals, so only the exact name matches.
+fn data_call_targets_global(
+    node: Node,
+    line_index: &LineIndex,
+    capture_bindings: &mut LazyStaticBindings,
+) -> bool {
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut envir = None;
+    for argument in arguments.children(&mut arguments.walk()) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        let Some(name) = argument
+            .child_by_field_name("name")
+            .and_then(|name| super::binding::plain_argument_name(name, line_index.text))
+        else {
+            continue;
+        };
+        if name == "envir" {
+            if envir.is_some() {
+                return false;
+            }
+            envir = Some(argument.child_by_field_name("value"));
+        }
+    }
+    match envir {
+        None => true,
+        Some(None) => false,
+        Some(Some(value)) => {
+            let (bare_trusted, dot_trusted) = global_env_names_trusted(node, capture_bindings);
+            super::binding::value_is_global_environment(
+                value,
+                line_index.text,
+                bare_trusted,
+                dot_trusted,
+            )
+        }
+    }
+}
+
+/// Whether a write-mode `textConnection()` creates its variable in the global
+/// environment, which R does unless `local` is `TRUE`. A `local` value that
+/// isn't a `TRUE`/`FALSE` literal keeps the current-frame model.
+fn text_connection_targets_global(node: Node, line_index: &LineIndex) -> bool {
+    const FORMALS: [&str; 5] = ["object", "open", "local", "name", "encoding"];
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let Some(matched) = super::binding::match_call_arguments(
+        arguments,
+        line_index.text,
+        &FORMALS,
+        super::binding::CallMatchMode::Strict,
+    ) else {
+        return false;
+    };
+    match matched[2] {
+        None | Some(super::binding::CallActual::Missing) => true,
+        Some(super::binding::CallActual::Value(value)) => {
+            node_text(value, line_index.text).trim() == "FALSE"
+        }
+    }
 }
 
 /// Extract the symbol name bound by a `delayedAssign("name", expr)` call.
@@ -14031,6 +14186,91 @@ mod tests {
             let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
             assert!(scope.symbols.contains_key(name), "{code}: {artifacts:?}");
         }
+    }
+
+    /// Effects whose destination is the global environment, by default
+    /// (`data()`, write-mode `textConnection()`) or by argument
+    /// (`delayedAssign(assign.env =)`, `rm(envir =)`, `rm(pos = 1)`), reach the
+    /// top level from inside `local()`; the same calls aimed at the block's own
+    /// frame stay in it.
+    #[test]
+    fn global_destination_effects_escape_local_blocks() {
+        for (code, name, defined_after) in [
+            (
+                "local({ data(Boston, package = \"MASS\") })\n",
+                "Boston",
+                true,
+            ),
+            (
+                "local({ utils::data(\"ds\", envir = .GlobalEnv) })\n",
+                "ds",
+                true,
+            ),
+            (
+                "local({ delayedAssign(\"dv\", 42, assign.env = globalenv()) })\n",
+                "dv",
+                true,
+            ),
+            (
+                "local({ delayedAssign(\"dv\", 42, assign = .GlobalEnv) })\n",
+                "dv",
+                true,
+            ),
+            (
+                "local({ tc <- textConnection(\"out\", \"w\") })\n",
+                "out",
+                true,
+            ),
+            (
+                "local({ tc <- textConnection(\"out\", \"w\", local = FALSE) })\n",
+                "out",
+                true,
+            ),
+            (
+                "gone <- 1\nlocal({ rm(gone, envir = globalenv()) })\n",
+                "gone",
+                false,
+            ),
+            ("gone <- 1\nlocal({ rm(gone, pos = 1) })\n", "gone", false),
+            // Aimed at the block's own frame: stays in the block.
+            ("local({ data(ds, envir = environment()) })\n", "ds", false),
+            ("local({ delayedAssign(\"dv\", 42) })\n", "dv", false),
+            (
+                "local({ tc <- textConnection(\"out\", \"w\", local = TRUE) })\n",
+                "out",
+                false,
+            ),
+            ("kept <- 1\nlocal({ kept <- 2; rm(kept) })\n", "kept", true),
+            // `globalenv` rebound earlier: not proven global.
+            (
+                "globalenv <- function() new.env()\nlocal({ delayedAssign(\"dv\", 1, assign.env = globalenv()) })\n",
+                "dv",
+                false,
+            ),
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert_eq!(
+                scope.symbols.contains_key(name),
+                defined_after,
+                "{code}: {artifacts:?}"
+            );
+        }
+    }
+
+    /// A global-destination effect at the top level of a file also lands in
+    /// `global_assignments`, so a caller running the file in a `local()`
+    /// block sees it; one inside a function body does not.
+    #[test]
+    fn global_destination_effects_are_global_assignments() {
+        let code = "data(ds)\ntc <- textConnection(\"out\", \"w\")\ndelayedAssign(\"dv\", 1, assign.env = globalenv())\nordinary <- 1\nf <- function() data(in_fn)\n";
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let names: Vec<&str> = artifacts
+            .global_assignments
+            .iter()
+            .map(|symbol| symbol.name.as_ref())
+            .collect();
+        assert_eq!(names, vec!["ds", "out", "dv"]);
     }
 
     #[test]

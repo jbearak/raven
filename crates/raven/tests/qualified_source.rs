@@ -113,3 +113,33 @@ fn missing_base_qualified_target_is_reported_like_the_bare_call() {
         .collect();
     assert_eq!(found, expected);
 }
+
+/// R's `source()` reads URLs (`file://`, `http(s)://`, `ftp://`), so a URL
+/// argument gets no missing-file diagnostic, bare or `base::`-qualified.
+/// `sys.source()` rejects URLs, so its URL argument is still reported.
+#[test]
+fn url_source_arguments_are_not_reported_as_missing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "helpers.R", "helper_value <- 1\n");
+    let helpers_url = url::Url::from_file_path(dir.path().join("helpers.R")).unwrap();
+    write(
+        dir.path(),
+        "main.R",
+        &format!(
+            "source(\"{helpers_url}\")\n\
+             base::source(\"{helpers_url}\")\n\
+             source(\"https://example.invalid/remote.R\")\n\
+             base::source(\"ftp://example.invalid/remote.R\")\n\
+             sys.source(\"{helpers_url}\", envir = globalenv())\n"
+        ),
+    );
+    let found = diagnostics(dir.path(), &[]);
+    assert_eq!(
+        found
+            .iter()
+            .map(|(code, line, _, _)| (code.as_str(), *line))
+            .collect::<Vec<_>>(),
+        vec![("unresolved-source-path", 4)],
+        "{found:?}"
+    );
+}

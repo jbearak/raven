@@ -1729,7 +1729,7 @@ pub(crate) fn resolve_assign_arguments<'tree>(
     })
 }
 
-fn value_is_global_environment(
+pub(crate) fn value_is_global_environment(
     value: Node,
     content: &str,
     bare_globalenv_trusted: bool,

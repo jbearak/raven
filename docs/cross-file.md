@@ -49,6 +49,7 @@ Raven reads these forms without any configuration:
 | `if (file.exists("config.R")) source("config.R")` | Follows the file when it exists, and reports nothing when it doesn't. |
 | `for (file in list.files("functions", pattern = "[.]R$", full.names = TRUE)) source(file)`, or the listing assigned to a variable first | Sources each `.R` file in that folder, in order. |
 | `source(paste0(dir, "/x.R"))`, `source(Sys.getenv("SETUP"))` | Skips the call. Use a [directive](#when-raven-cant-see-the-link). |
+| `source("https://example.org/setup.R")`, `source("file:///abs/path/setup.R")` | Doesn't follow the URL, and doesn't report it as a missing file. Use a [directive](#when-raven-cant-see-the-link) with the local path if you need its definitions. |
 
 Each form has exact limits, described in [How Raven reads `source()` calls](#how-raven-reads-source-calls). Raven also models how [Shiny apps](#shiny-application-loading) load `R/` helpers and `global.R`, and how [`targets::tar_source()`](#targetstar_source-scripts) loads pipeline scripts.
 
@@ -129,7 +130,13 @@ Raven recognizes these R constructs as definitions:
 
 #### Global assignments
 
-`assign("name", expr, envir = globalenv())` (or `envir = .GlobalEnv`) with a literal name, and `name <<- expr` outside a function body, define `name` in the global scope from that point on. That holds even when the assignment runs outside the global frame:
+`assign("name", expr, envir = globalenv())` (or `envir = .GlobalEnv`) with a literal name, and `name <<- expr` outside a function body, define `name` in the global scope from that point on. So do these calls, which put their binding in the global environment by default or by argument:
+
+- `data(name)`, unless `envir` names another environment;
+- `delayedAssign("name", expr, assign.env = globalenv())`;
+- `textConnection("name", "w")`, unless `local = TRUE`.
+
+These all hold even when the call runs outside the global frame:
 
 - inside a `local({ ... })` block, which the name escapes, or an `if` block;
 - at the top level of a file that a caller sources with `local = TRUE` from inside `local()`.
@@ -145,7 +152,7 @@ print(config)  # defined by R/setup.R
 assign("config", list(debug = TRUE), envir = globalenv())
 ```
 
-A non-literal name or any other `envir` defines nothing, and a read before the call is still undefined. Raven doesn't follow function calls, so an assignment inside a function body still only counts within that function.
+A non-literal name or any other `envir` defines nothing, and a read before the call is still undefined. Without an explicit environment, `assign()`, `delayedAssign()`, and `rm()` act on the block's own frame, so inside `local()` they stay in the block. `rm(name, envir = globalenv())` and `rm(name, pos = 1)` remove the global `name`, also from inside a `local()` block. Raven doesn't follow function calls, so an assignment inside a function body still only counts within that function.
 
 For symbols created dynamically (`eval()`, `load()`, `assign()` with a computed name), use [declaration directives](directives.md#declaration-directives).
 
@@ -426,7 +433,7 @@ For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`. A shadowed 
 - **Inside `local({ ... })`**, the environment is the block's. The child sees the parent's bindings as of the call, including ones the block defined earlier, and its definitions are visible in the rest of the block and nowhere after it. So `d <- local({ source("child.R", local = TRUE); d })` works even when only the child creates `d`, and the child's other names don't leak into the script. `local()` with an explicit `envir`, or a `local` the file redefines, isn't modeled this way.
 - **Inside a function body**, the environment is the function's frame. The child sees the function's earlier locals and the script's globals, read from the whole file as for any function body, and its definitions are visible in the rest of the function only.
 
-A `local()` block also keeps its own definitions to itself, as in R: after `y <- local({ a <- 1; a })`, `a` is undefined. Two effects escape the block, as they do in R: `library()` attaches the package for the rest of the script, and `<<-` assigns in the enclosing environment. Unlike a function body, a block runs where it stands, so a global defined after the block isn't visible inside it.
+A `local()` block also keeps its own definitions to itself, as in R: after `y <- local({ a <- 1; a })`, `a` is undefined. Some effects escape the block, as they do in R: `library()` attaches the package for the rest of the script, `<<-` assigns in the enclosing environment, and the calls under [Global assignments](#global-assignments) act on the global environment. Unlike a function body, a block runs where it stands, so a global defined after the block isn't visible inside it.
 
 Inside any other call, such as `with()`, `tryCatch()`, or a Shiny `observe()` body, Raven doesn't assume the call runs its argument in the script's own environment, so `local = TRUE` there isn't treated as top level.
 

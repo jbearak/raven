@@ -120,6 +120,10 @@ pub struct RmCall {
     pub column: u32,
     /// Symbol names to remove
     pub symbols: Vec<String>,
+    /// The call names the global environment as its target (`envir =
+    /// globalenv()` / `.GlobalEnv`, or `pos = 1`), so in R the removal takes
+    /// effect there even from inside a `local()` block.
+    pub targets_global: bool,
 }
 
 #[derive(Debug)]
@@ -132,6 +136,15 @@ pub(crate) struct FramedRmCall {
 }
 
 impl FramedRmCall {
+    /// Whether the removal escapes an enclosing `local()` block to the global
+    /// environment. A removal whose position was moved to a conservative
+    /// capture anchor shares that anchor with its neighbors, so it is kept in
+    /// place: escaping a non-global removal by mistake would report a false
+    /// "not defined", while keeping a global one local only misses one.
+    pub(crate) fn escapes_to_global(&self) -> bool {
+        self.call.targets_global && self.conservative_effect_position.is_none()
+    }
+
     fn normalize_scope_effect_position(&mut self) {
         if let Some((line, column)) = self.conservative_effect_position {
             self.call.line = line;
@@ -744,6 +757,17 @@ fn try_parse_source_call<'tree, 'text>(
     })
 }
 
+/// Whether `path` is a URL that `source()` reads (`file://`, `http://`,
+/// `https://`, `ftp://`, `ftps://`) rather than a filesystem path. Raven
+/// reads a leading `/` as workspace-root-relative, so a `file://` URL is not
+/// resolved; like a remote one, it is only kept out of missing-file
+/// diagnostics.
+pub(crate) fn is_url_source_path(path: &str) -> bool {
+    ["file://", "http://", "https://", "ftp://", "ftps://"]
+        .iter()
+        .any(|scheme| path.starts_with(scheme))
+}
+
 /// True when `node` provably evaluates in the frame running the file's
 /// top-level code: every ancestor up to the root is syntax that evaluates its
 /// operands in place (braces, parentheses, `if`, loops, and assignments).
@@ -1303,6 +1327,7 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
         line: start.row as u32,
         column,
         symbols,
+        targets_global: super::binding::arguments_explicitly_target_global(args_node, content),
     })
 }
 
