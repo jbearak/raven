@@ -46,6 +46,29 @@ function make_active(terminal: vscode.Terminal): Promise<void> {
 }
 
 /**
+ * Whether vscode-R will run code in its Interactive session without ever
+ * selecting a terminal. vscode-R (3.2 and later, which declare
+ * `r.interactive.executionTarget`) offers every send to its Interactive
+ * router before the terminal selector, and with the target set to
+ * `interactive` the router never falls back to a terminal: it runs the code
+ * in a connected session or asks the user to pick or start one (the
+ * "create terminal" choice is left out of that prompt). The setting is read
+ * for the active editor's document, as vscode-R reads it. With `auto`, the
+ * router's choice depends on state vscode-R doesn't expose, so the terminal
+ * guard still applies there.
+ */
+function vscode_r_targets_interactive(extension: vscode.Extension<unknown>): boolean {
+    const json = extension.packageJSON as { contributes?: { configuration?: unknown } } | undefined;
+    const sections = json?.contributes?.configuration;
+    const declared = (Array.isArray(sections) ? sections : [sections]).some((section) =>
+        typeof section === 'object' && section !== null
+        && 'r.interactive.executionTarget' in ((section as { properties?: object }).properties ?? {}));
+    if (!declared) return false;
+    const document = vscode.window.activeTextEditor?.document.uri;
+    return vscode.workspace.getConfiguration('r', document).get<string>('interactive.executionTarget', 'auto') === 'interactive';
+}
+
+/**
  * Makes sure vscode-R's terminal selector (`vscode_r_terminal_pick`) won't
  * pick one of Raven's terminals, which are also named `R`. Does nothing
  * unless a Raven terminal would be picked; then activates vscode-R's own
@@ -78,7 +101,8 @@ async function clear_way_for_vscode_r(): Promise<boolean> {
  * which passes the text to `runTextInTerm` unchanged. vscode-R registers its
  * commands on activation, so activate it first. Returns false (after telling
  * the user) when vscode-R isn't available, or when its selector would pick a
- * Raven terminal (see `clear_way_for_vscode_r`).
+ * Raven terminal (see `clear_way_for_vscode_r`; skipped when vscode-R sends
+ * to its Interactive session, see `vscode_r_targets_interactive`).
  *
  * True means vscode-R took the code, not that it ran: `r.runCommand`'s
  * handler discards whether it sent anything (vscode-R 3.4: `async (t) =>
@@ -90,7 +114,7 @@ export async function send_to_vscode_r(code: string): Promise<boolean> {
     try {
         if (!extension) throw new Error("vscode-R isn't installed or is disabled");
         await extension.activate();
-        if (!(await clear_way_for_vscode_r())) {
+        if (!vscode_r_targets_interactive(extension) && !(await clear_way_for_vscode_r())) {
             throw new Error("it would have gone to Raven's own R terminal; click vscode-R's terminal, then send again");
         }
         await vscode.commands.executeCommand('r.runCommand', code);

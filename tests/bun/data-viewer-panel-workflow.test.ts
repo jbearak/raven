@@ -57,6 +57,15 @@ async function flush(n = 6): Promise<void> {
     for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 0));
 }
 
+// `mock.module` outlives `mock.restore()`, and replacing a module that is
+// already loaded rewrites its exports for every test file in the run (other
+// suites send code through the real `send_code`). Keep the real exports so
+// each test can put them back.
+const TERMINAL_MANAGER = '../../editors/vscode/src/send-to-r/r-terminal-manager';
+const SEND_CODE = '../../editors/vscode/src/send-to-r/send-code';
+const realTerminalManager = { ...(await import(TERMINAL_MANAGER)) };
+const realSendCode = { ...(await import(SEND_CODE)) };
+
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
     for (const c of cleanups.reverse()) { try { await c(); } catch { /* best effort */ } }
@@ -70,6 +79,8 @@ afterEach(async () => {
     opened = [];
     modalAnswer = undefined;
     mock.restore();
+    mock.module(TERMINAL_MANAGER, () => realTerminalManager);
+    mock.module(SEND_CODE, () => realSendCode);
 });
 
 async function setup(opts: { savedSort?: any; savedFilter?: any; source?: any; persistSort?: boolean; title?: string } = {}) {
@@ -92,11 +103,11 @@ async function setup(opts: { savedSort?: any; savedFilter?: any; source?: any; p
         Uri: { parse: (s: string) => ({ toString: () => s }), joinPath: (base: any, ...parts: string[]) => ({ fsPath: [base?.fsPath ?? '', ...parts].join('/') }) },
         ViewColumn: { Active: -1 },
     }));
-    mock.module('../../editors/vscode/src/send-to-r/r-terminal-manager', () => ({
+    mock.module(TERMINAL_MANAGER, () => ({
         // Refresh re-runs only in the session that made the view.
         terminal_for_session: (id: string) => (id === 'live' ? { name: 'R' } : undefined),
     }));
-    mock.module('../../editors/vscode/src/send-to-r/send-code', () => ({
+    mock.module(SEND_CODE, () => ({
         get_send_options: () => ({ sendMethod: 'auto', autoTempFileThresholdLines: 25 }),
         send_code: (_t: unknown, code: string) => { sent.push(code); },
     }));

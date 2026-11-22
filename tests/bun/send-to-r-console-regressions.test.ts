@@ -160,9 +160,19 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         return active && named.includes(active) ? active : named[named.length - 1];
     }
 
+    /** Code vscode-R ran in its Interactive session. */
+    let interactive: string[] = [];
+
     function install_vscode_r() {
         const created: FakeTerminal[] = [];
-        fake.state.extensions.set('REditorSupport.r', { activate: async () => undefined });
+        interactive = [];
+        fake.state.extensions.set('REditorSupport.r', {
+            activate: async () => undefined,
+            packageJSON: {
+                version: '3.4.0',
+                contributes: { configuration: { properties: { 'r.interactive.executionTarget': { default: 'auto' } } } },
+            },
+        });
         fake.commands.set('r.createRTerm', async () => {
             const t = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
             created.push(t);
@@ -170,6 +180,12 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         });
         // `r.runCommand` discards whether it ran, as in vscode-R 3.4.0.
         fake.commands.set('r.runCommand', async (code: unknown) => {
+            // vscode-R 3.4.0 offers the code to its Interactive router first;
+            // with the target set to `interactive` it never picks a terminal.
+            if (fake.module.workspace.getConfiguration('r').get('interactive.executionTarget') === 'interactive') {
+                interactive.push(String(code));
+                return;
+            }
             let t = vscode_r_selector();
             if (!t) {
                 await fake.module.commands.executeCommand('r.createRTerm');
@@ -242,6 +258,32 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         expect(theirs.typed).toEqual(['v <- 5']);
         started();
         await opening;
+    });
+
+    test("sends to vscode-R's Interactive target without opening a terminal", async () => {
+        const created = install_vscode_r();
+        const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
+        await make_active(ours);
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        fake.set_setting('r.interactive.executionTarget', 'global', 'interactive');
+
+        expect(await send.send_to_r_console('u <- 6')).toBe(true);
+        expect(created).toEqual([]);
+        expect(ours.typed).toEqual([]);
+        expect(interactive).toEqual(['u <- 6']);
+    });
+
+    test('an Interactive target needs no terminal even when none can be opened', async () => {
+        install_vscode_r();
+        fake.commands.set('r.createRTerm', async () => undefined);
+        const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
+        await make_active(ours);
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        fake.set_setting('r.interactive.executionTarget', 'global', 'interactive');
+
+        expect(await send.send_to_r_console('t <- 7')).toBe(true);
+        expect(fake.errors).toEqual([]);
+        expect(interactive).toEqual(['t <- 7']);
     });
 
     test('leaves vscode-R alone when no Raven terminal is in its way', async () => {
@@ -385,6 +427,53 @@ describe('package tasks follow a session console choice', () => {
         expect(second).not.toBe(first);
         expect(second.creationOptions.shellPath).toBe('R');
     });
+
+    test('two tasks requested at once share one terminal', async () => {
+        fake.set_setting('raven.rTerminal.program', 'global', 'raven');
+        const [a, b] = await Promise.all([build.get_or_create_tasks_terminal(), build.get_or_create_tasks_terminal()]);
+        expect(b).toBe(a);
+        expect(fake.window.terminals.length).toBe(1);
+    });
+
+    // The fixture is a shell script.
+    test.skipIf(process.platform === 'win32')('a creation that finishes after a settings change keeps the newer one shared', async () => {
+        binary._clear_console_probes_for_test();
+        const slow = path.join(storage, 'raven-slow-probe-2');
+        fs.writeFileSync(slow, '#!/bin/sh\nsleep 0.3\necho "raven console"\n', { mode: 0o755 });
+        rtm._set_server_binaries_for_test(() => ({ configured: slow, bundled: BUNDLED }));
+        build.register_build_commands(context as never);
+        fake.set_setting('raven.rTerminal.program', 'global', 'raven');
+        const a = build.get_or_create_tasks_terminal();
+        await settle(20);
+        // radian's PATH check outlasts the first creation.
+        rtm._set_validator_for_test(async () => { await settle(700); return true; });
+        await fake.module.workspace.getConfiguration('raven').update('rTerminal.program', 'radian', fake.module.ConfigurationTarget.Global);
+        const b = build.get_or_create_tasks_terminal();
+        await a;
+        const c = build.get_or_create_tasks_terminal();
+        expect(await c).toBe(await b);
+        expect(fake.window.terminals.length).toBe(2);
+    });
+
+    // The fixture is a shell script.
+    test.skipIf(process.platform === 'win32')('a task requested while the first is still starting follows the new choice', async () => {
+        binary._clear_console_probes_for_test();
+        // The first task's `console --help` probe takes a moment.
+        const slow = path.join(storage, 'raven-slow-probe');
+        fs.writeFileSync(slow, '#!/bin/sh\nsleep 0.3\necho "raven console"\n', { mode: 0o755 });
+        rtm._set_server_binaries_for_test(() => ({ configured: slow, bundled: BUNDLED }));
+        fake.set_setting('raven.rTerminal.program', 'global', 'raven');
+        const first = build.get_or_create_tasks_terminal();
+        await settle(20);
+
+        picker._set_picker_for_test(async () => ({ target: 'R', scope: 'session' }));
+        await rtm.choose_r_console();
+        picker._set_picker_for_test(null);
+
+        const second = await build.get_or_create_tasks_terminal() as unknown as FakeTerminal;
+        expect(second.creationOptions.shellPath).toBe('R');
+        expect(second).not.toBe(await first);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -437,6 +526,38 @@ describe('a raven.server.path from before `raven console`', () => {
         expect(probes).toBe(1);
         fs.writeFileSync(file, '#!/bin/sh\nexit 0\n# rebuilt, longer\n');
         expect(await binary.console_binary(b, () => undefined, async () => true)).toBe(file);
+    });
+
+    // Windows bare names aren't stamped (libuv's lookup isn't reproduced).
+    test.skipIf(process.platform === 'win32')('a bare command name is stamped as the file PATH finds', async () => {
+        const dir = fs.mkdtempSync(path.join(storage, 'bin-'));
+        const name = 'raven-on-path';
+        const file = path.join(dir, name);
+        fs.writeFileSync(file, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+        const saved = process.env.PATH;
+        process.env.PATH = dir;
+        try {
+            let probes = 0;
+            const b = { configured: name, bundled: BUNDLED };
+            const old = async () => { probes++; return false; };
+            expect(await binary.console_binary(b, () => undefined, old)).toBe(BUNDLED);
+            expect(await binary.console_binary(b, () => undefined, old)).toBe(BUNDLED);
+            expect(probes).toBe(1);
+            // Replaced by a build with `console`.
+            fs.writeFileSync(file, '#!/bin/sh\nexit 0\n# rebuilt, longer\n');
+            expect(await binary.console_binary(b, () => undefined, async () => true)).toBe(name);
+        } finally {
+            process.env.PATH = saved;
+        }
+    });
+
+    test('a binary that cannot be found is probed again next time', async () => {
+        let probes = 0;
+        const probe = async () => { probes++; return false; };
+        const b = { configured: 'raven-nowhere-on-path-0123', bundled: BUNDLED };
+        await binary.console_binary(b, () => undefined, probe);
+        await binary.console_binary(b, () => undefined, probe);
+        expect(probes).toBe(2);
     });
 
     test('no configured binary means the bundled one, without probing', async () => {

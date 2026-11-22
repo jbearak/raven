@@ -234,8 +234,16 @@ class ConsoleLink {
      * while the console starts doesn't release sends early.
      */
     private subscribed = false;
-    /** Files only the console's summary named; cleared, then forgotten. */
+    /**
+     * Files only the console's summary named; cleared, then forgotten. Each
+     * is cleared at most once per connection: a path that no longer
+     * resolves to what the console stored (the file was replaced by a
+     * symlink) can't be cleared from here, and the console keeps reporting
+     * it.
+     */
     private discovered = new Set<string>();
+    /** Discovered files a mirror the console applied has cleared. */
+    private cleared = new Set<string>();
     /** A mirror on this connection has been applied (`ok`). */
     private applied = false;
     /** The initial reconciliation is done and sends are released. */
@@ -304,7 +312,8 @@ class ConsoleLink {
             return;
         }
         const wanted = with_real_paths(Object.keys(editor_breakpoints().files));
-        const stale = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
+        const reported = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
+        const stale = reported.filter((p) => !this.discovered.has(p));
         if (stale.length > 0) {
             for (const p of stale) {
                 this.mirrored.add(p);
@@ -314,6 +323,14 @@ class ConsoleLink {
         } else if (this.applied && !this.in_flight) {
             // The console pushes a summary after each file it applies, so
             // only a summary seen once a whole mirror is in counts.
+            for (const p of new Set(reported)) {
+                // Only a path that now resolves elsewhere can't be cleared;
+                // any other is just in a summary sent before its clear.
+                let real = p;
+                try { real = fs.realpathSync.native(p); } catch { /* gone: cleared as given */ }
+                if (real === p) continue;
+                console.warn(`raven: could not clear the R console's breakpoints in ${p}; the path no longer names the file the console armed`);
+            }
             this.release();
         }
     }
@@ -327,6 +344,7 @@ class ConsoleLink {
         const kept = Object.keys(editor_breakpoints().files);
         for (const p of this.discovered) if (!kept.includes(p)) this.mirrored.delete(p);
         this.discovered.clear();
+        this.cleared.clear();
         this.mirrored_once();
     }
 
@@ -379,8 +397,16 @@ class ConsoleLink {
             }
         };
         if (this.closed || !fs.existsSync(this.ipc)) return finish();
-        const { msg, files } = mirror_payload(this.mirrored);
-        for (const f of files) this.mirrored.add(f);
+        // A discovered file already cleared isn't cleared again (one the
+        // editor has breakpoints in again is sent as usual).
+        const previous = new Set([...this.mirrored].filter((p) => !this.cleared.has(p)));
+        const { msg, files } = mirror_payload(previous);
+        for (const f of files) {
+            this.mirrored.add(f);
+            this.cleared.delete(f);
+        }
+        const sent = (msg as { files: Record<string, object[]> }).files;
+        const clears = [...this.discovered].filter((p) => sent[p]?.length === 0);
         (msg as { files: Record<string, object[]> }).files[probe_path(this.ipc)] = [];
         const sock = net.createConnection(socket_endpoint(this.ipc));
         sock.setEncoding('utf8');
@@ -397,7 +423,9 @@ class ConsoleLink {
                 this.again = false;
                 setTimeout(() => this.send_mirror(attempt + 1), 250);
             } else {
-                finish(reply.includes('"ok"'));
+                const applied = reply.includes('"ok"');
+                if (applied) for (const p of clears) this.cleared.add(p);
+                finish(applied);
             }
         });
         const fail = () => {
