@@ -160,9 +160,19 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         return active && named.includes(active) ? active : named[named.length - 1];
     }
 
+    /** Code vscode-R ran in its Interactive session. */
+    let interactive: string[] = [];
+
     function install_vscode_r() {
         const created: FakeTerminal[] = [];
-        fake.state.extensions.set('REditorSupport.r', { activate: async () => undefined });
+        interactive = [];
+        fake.state.extensions.set('REditorSupport.r', {
+            activate: async () => undefined,
+            packageJSON: {
+                version: '3.4.0',
+                contributes: { configuration: { properties: { 'r.interactive.executionTarget': { default: 'auto' } } } },
+            },
+        });
         fake.commands.set('r.createRTerm', async () => {
             const t = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
             created.push(t);
@@ -170,6 +180,12 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         });
         // `r.runCommand` discards whether it ran, as in vscode-R 3.4.0.
         fake.commands.set('r.runCommand', async (code: unknown) => {
+            // vscode-R 3.4.0 offers the code to its Interactive router first;
+            // with the target set to `interactive` it never picks a terminal.
+            if (fake.module.workspace.getConfiguration('r').get('interactive.executionTarget') === 'interactive') {
+                interactive.push(String(code));
+                return;
+            }
             let t = vscode_r_selector();
             if (!t) {
                 await fake.module.commands.executeCommand('r.createRTerm');
@@ -242,6 +258,32 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         expect(theirs.typed).toEqual(['v <- 5']);
         started();
         await opening;
+    });
+
+    test("sends to vscode-R's Interactive target without opening a terminal", async () => {
+        const created = install_vscode_r();
+        const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
+        await make_active(ours);
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        fake.set_setting('r.interactive.executionTarget', 'global', 'interactive');
+
+        expect(await send.send_to_r_console('u <- 6')).toBe(true);
+        expect(created).toEqual([]);
+        expect(ours.typed).toEqual([]);
+        expect(interactive).toEqual(['u <- 6']);
+    });
+
+    test('an Interactive target needs no terminal even when none can be opened', async () => {
+        install_vscode_r();
+        fake.commands.set('r.createRTerm', async () => undefined);
+        const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
+        await make_active(ours);
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        fake.set_setting('r.interactive.executionTarget', 'global', 'interactive');
+
+        expect(await send.send_to_r_console('t <- 7')).toBe(true);
+        expect(fake.errors).toEqual([]);
+        expect(interactive).toEqual(['t <- 7']);
     });
 
     test('leaves vscode-R alone when no Raven terminal is in its way', async () => {
