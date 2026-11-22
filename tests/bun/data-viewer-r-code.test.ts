@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { ColumnSchema } from '../../editors/vscode/src/data-viewer/arrow-reader';
 import { generateRCode, rName, rNumber, rString, translateRegex } from '../../editors/vscode/src/data-viewer/r-code';
-import { EMPTY_FILTER, EMPTY_SORT } from '../../editors/vscode/src/data-viewer/messages';
+import { EMPTY_FILTER, EMPTY_SORT, type FilterPredicate } from '../../editors/vscode/src/data-viewer/messages';
 
 function col(name: string, arrowType: string, extra: Partial<ColumnSchema> = {}): ColumnSchema {
     return { name, arrowType, dictionaryShipped: false, isInteger: false, ...extra };
@@ -175,5 +175,34 @@ describe('generateRCode', () => {
         });
         expect('code' in r && r.code).toContain('# Not translated: filter on when (setIn)');
         expect('code' in r && r.code).not.toContain('filter(');
+    });
+
+    test('integer64: set values compare exactly, comparisons in the doubles the viewer compares', () => {
+        const cols = [
+            col('big', 'Int64', { typeTag: '<integer64>' }),
+            col('lab', 'Int64', { typeTag: '<integer64>', valueLabels: { '9007199254740993': 'odd' } }),
+        ];
+        const entry = (columnIndex: number, predicate: FilterPredicate) =>
+            ({ id: String(columnIndex) + JSON.stringify(predicate), columnIndex, predicate, enabled: true, includeMissing: false });
+        for (const flavor of ['dplyr', 'base', 'data.table'] as const) {
+            const r = gen({
+                columns: cols,
+                filter: { entries: [
+                    entry(0, { kind: 'setIn', values: ['9007199254740993', 3] }),
+                    entry(1, { kind: 'setIn', values: ['9007199254740993'] }),
+                    entry(0, { kind: 'numCompare', op: '>=', value: 2.5 }),
+                    entry(0, { kind: 'numBetween', lo: 1, hi: Infinity, inclusive: true }),
+                ], labelsOnWhenFiltered: true },
+            }, flavor);
+            const code = 'code' in r ? r.code : r.error;
+            expect(code).toContain('# Requires ');
+            expect(code).toContain('bit64');
+            expect(code).toContain('big %in% bit64::as.integer64(c("9007199254740993", "3"))');
+            // No unclass(): it would turn an integer64 into raw doubles.
+            expect(code).toContain('lab %in% bit64::as.integer64("9007199254740993")');
+            expect(code).toContain('as.double(big) >= 2.5');
+            expect(code).toContain('as.double(big) >= 1 & as.double(big) <= Inf');
+            expect(code).not.toContain('9007199254740992');
+        }
     });
 });

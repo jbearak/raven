@@ -54,6 +54,7 @@
 import type { ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState, SortState, StringOrder } from './messages';
 import { keyKind } from './sort';
+import { int64SetKey, isNumberLike } from './filter';
 
 export type CodeFlavor = 'dplyr' | 'base' | 'data.table';
 
@@ -201,7 +202,7 @@ type Ctx = {
     frame: string;
     /** True once a rowname column is materialized as a real column. */
     rownamesAsColumn: boolean;
-    needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble'>;
+    needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble' | 'bit64'>;
     skipped: string[];
     /** Why the last untranslatable filter is left out, when known. */
     skipReason?: string;
@@ -268,7 +269,14 @@ function rownameNameOf(input: CodeInput): string {
 function valueRef(ctx: Ctx, ci: number): string {
     const col = ctx.input.columns[ci];
     const x = colRef(ctx, ci);
-    return col.valueLabels && !isFactor(col) ? `unclass(${x})` : x;
+    // An integer64 with a "labels" attribute is no haven_labelled (haven
+    // refuses integer64); unclass() would turn it into raw doubles.
+    return col.valueLabels && !isFactor(col) && !isInt64(col) ? `unclass(${x})` : x;
+}
+
+/** An Int64/UInt64 column: a `bit64::integer64` in R. */
+function isInt64(col: ColumnSchema): boolean {
+    return /^U?[Ii]nt64$/.test(col.arrowType);
 }
 
 function isFactor(col: ColumnSchema): boolean {
@@ -298,6 +306,10 @@ function predicateCode(
     const col = ctx.input.columns[entry.columnIndex];
     const x = valueRef(ctx, entry.columnIndex);
     const p: FilterPredicate = entry.predicate;
+    // The viewer compares an integer64 column as doubles (each value
+    // rounded to the nearest one); bit64 would instead truncate a
+    // fractional bound and turn an infinite one into NA.
+    const num = isInt64(col) ? `as.double(${x})` : x;
     const str = isFactor(col) ? `as.character(${x})` : x;
     switch (p.kind) {
         case 'isEmpty': return { code: `is.na(${x})`, trueOnNA: true };
@@ -305,17 +317,17 @@ function predicateCode(
         case 'bool': return { code: p.value ? x : `!${x}`, trueOnNA: false };
         case 'numCompare': {
             const op = p.op === '=' ? '==' : p.op;
-            return { code: `${x} ${op} ${rNumber(p.value)}`, trueOnNA: false };
+            return { code: `${num} ${op} ${rNumber(p.value)}`, trueOnNA: false };
         }
         case 'numBetween': {
             const hiIncl = p.upperInclusive ?? p.inclusive;
-            const lo = `${x} ${p.inclusive ? '>=' : '>'} ${rNumber(p.lo)}`;
-            const hi = `${x} ${hiIncl ? '<=' : '<'} ${rNumber(p.hi)}`;
+            const lo = `${num} ${p.inclusive ? '>=' : '>'} ${rNumber(p.lo)}`;
+            const hi = `${num} ${hiIncl ? '<=' : '<'} ${rNumber(p.hi)}`;
             return { code: `${lo} & ${hi}`, trueOnNA: false };
         }
         case 'numNotBetween': {
-            const lo = `${x} ${p.inclusive ? '<' : '<='} ${rNumber(p.lo)}`;
-            const hi = `${x} ${p.inclusive ? '>' : '>='} ${rNumber(p.hi)}`;
+            const lo = `${num} ${p.inclusive ? '<' : '<='} ${rNumber(p.lo)}`;
+            const hi = `${num} ${p.inclusive ? '>' : '>='} ${rNumber(p.hi)}`;
             return { code: `(${lo} | ${hi})`, trueOnNA: false };
         }
         case 'strCompare': {
@@ -682,8 +694,15 @@ function setCode(ctx: Ctx, ci: number, values: readonly (string | number)[], lab
         const codes = values.map(v => Number(v)).filter(Number.isInteger).map(c => rNumber(c + 1));
         return `as.integer(${x}) %in% ${codes.length > 0 ? rVector(codes) : 'integer(0)'}`;
     }
+    if (isInt64(col)) {
+        // Exact, as the viewer matches: a double literal can't hold every
+        // integer64 (`9007199254740993` would read as ...992).
+        ctx.needs.add('bit64');
+        const keys = values.map(int64SetKey).filter((k): k is string => k !== undefined);
+        return `${x} %in% bit64::as.integer64(${keys.length > 0 ? rVector(keys.map(rString)) : 'character(0)'})`;
+    }
     if (col.valueLabels && isNumericType(t)) {
-        const nums = values.map(Number).filter(v => !Number.isNaN(v)).map(rNumber);
+        const nums = values.filter(isNumberLike).map(Number).filter(v => !Number.isNaN(v)).map(rNumber);
         return `${x} %in% ${nums.length > 0 ? rVector(nums) : 'numeric(0)'}`;
     }
     if (col.valueLabels && labelsOn) {
@@ -693,6 +712,7 @@ function setCode(ctx: Ctx, ci: number, values: readonly (string | number)[], lab
         return `${x} %in% ${rVector(values.map(v => rString(String(v))))}`;
     }
     if (isNumericType(t)) {
+        if (!values.every(isNumberLike)) return null;
         const nums = values.map(v => Number(v));
         if (nums.some(Number.isNaN)) return null;
         return `${x} %in% ${rVector(nums.map(rNumber))}`;
@@ -906,6 +926,7 @@ function header(ctx: Ctx, extra: string[]): string[] {
     if (ctx.flavor === 'dplyr') req.push('R >= 4.1 (|>)', 'dplyr >= 1.1.0');
     if (ctx.flavor === 'data.table') req.push('data.table');
     if (ctx.needs.has('tibble')) req.push('tibble');
+    if (ctx.needs.has('bit64')) req.push('bit64');
     if (ctx.needs.has('stringr')) req.push('stringr >= 1.5.0 (str_rank)');
     if (ctx.needs.has('stringi')) req.push('stringi (a .locale other than "C")');
     const firstLine = ctx.input.expression.trim().split(/\r\n|\r|\n/)[0];

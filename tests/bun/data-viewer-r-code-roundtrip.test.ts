@@ -425,3 +425,34 @@ edgeSuite('Copy as R code round trip: logical columns and data.table objects (re
         { name: 'hide all but id', hide: [1, 2] },
         { name: 'b is TRUE, hide b and s', filters: [{ ci: 1, p: { kind: 'bool', value: true } }], hide: [1, 2] },
     ]);
+
+// integer64: set values are decimal strings the double can't hold
+// (Value Counts counts on the bigint), so the code compares them as
+// integer64; comparisons and ranges round the column to double, as the
+// viewer does. `lab` carries integer64 value labels.
+edgeSuite('Copy as R code round trip: integer64 (real R)',
+    `df <- data.frame(id = 1:3)
+df$big <- bit64::as.integer64(c("9007199254740992", "9007199254740993", "9007199254740993"))
+df$small <- bit64::as.integer64(c("2", "3", NA))
+lab <- df$big
+labs <- bit64::as.integer64(c("9007199254740992", "9007199254740993"))
+names(labs) <- c("even", "odd")
+attr(lab, "labels") <- labs
+df$lab <- lab`,
+    ['df', 'dtobj'],
+    [
+        { name: 'big in one exact value', filters: [{ ci: 1, p: { kind: 'setIn', values: ['9007199254740993'] } }] },
+        { name: 'big not in one exact value', filters: [{ ci: 1, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
+        { name: 'big > 2^53', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 9007199254740992 } }] },
+        { name: 'big = 2^53', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: 9007199254740992 } }] },
+        { name: 'big between 2^53 and 2^53', filters: [{ ci: 1, p: { kind: 'numBetween', lo: 9007199254740992, hi: 9007199254740992, inclusive: true } }] },
+        { name: 'small >= 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
+        { name: 'small = 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '=', value: 2.5 } }] },
+        { name: 'small < Inf', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
+        { name: 'small not between 2.5 and 9', filters: [{ ci: 2, p: { kind: 'numNotBetween', lo: 2.5, hi: 9, inclusive: true } }] },
+        { name: 'small in 3 (a number)', filters: [{ ci: 2, p: { kind: 'setIn', values: ['3'] } }] },
+        { name: 'labelled: odd', filters: [{ ci: 3, p: { kind: 'setIn', values: ['9007199254740993'] } }] },
+        { name: 'labelled: even (a safe number)', filters: [{ ci: 3, p: { kind: 'setIn', values: [9007199254740992] } }] },
+        { name: 'labelled: not odd', filters: [{ ci: 3, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
+        { name: 'sort by big desc', sort: [{ ci: 1, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
+    ]);
