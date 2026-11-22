@@ -20,6 +20,14 @@ describe('formatDeclaresInteger — Stata', () => {
 });
 
 describe('formatDeclaresInteger — SAS / SPSS', () => {
+    test('read_xpt spellings without the dot or width (F8, COMMA, PERCENT8)', () => {
+        expect(formatDeclaresInteger('F8')).toBe(true);
+        expect(formatDeclaresInteger('COMMA')).toBe(true);
+        expect(formatDeclaresInteger('DOLLAR8')).toBe(true);
+        expect(formatDeclaresInteger('PERCENT8')).toBe(false);
+        expect(formatDeclaresInteger('BEST12')).toBe(false);
+        expect(formatDeclaresInteger('DATE9')).toBe(false);
+    });
     test('F8.0 → integer', () => {
         expect(formatDeclaresInteger('F8.0')).toBe(true);
     });

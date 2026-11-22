@@ -60,6 +60,10 @@ export type NumberFormatSpec =
  *             parentheses (0.25 → `25.00%`, -0.25 → `(25.00%)`);
  *             `PERCENTNw.d` the same with a minus sign
  *
+ * The width and the `.d` are optional (`PERCENT8`, `DOLLAR`): haven's
+ * `read_xpt()` drops the trailing dot and a default width. No `.d` means
+ * no decimals, as in SAS.
+ *
  * The writer stores one format string without saying which program it
  * came from, so names are read by their documented meaning: `PCT` is
  * SPSS-only and `PERCENT` is SAS-only.
@@ -75,9 +79,11 @@ export function parseDisplayFormat(fmt: string | undefined): NumberFormatSpec | 
         }
         return fixedSpec(decimals, { thousands: stata[3] === 'fc' });
     }
-    const named = /^([A-Z]*)(\d+)\.(\d*)$/.exec(t.toUpperCase());
-    if (!named) return undefined;
-    const [, name, width, dec] = named;
+    // `PERCENT8.2`, `F8.`, and the spellings haven's read_xpt() gives:
+    // no trailing dot (`PERCENT8`, `BEST12`), no width (`PERCENTN`).
+    const named = /^([A-Z]*)(\d*)(?:\.(\d*))?$/.exec(t.toUpperCase());
+    if (!named || (named[1] === '' && named[2] === '')) return undefined;
+    const [, name, width, dec = ''] = named;
     const decimals = dec === '' ? 0 : Number(dec);
     switch (name) {
         case '':
@@ -94,7 +100,7 @@ export function parseDisplayFormat(fmt: string | undefined): NumberFormatSpec | 
         case 'PERCENTN':
             return fixedSpec(decimals, { suffix: '%', scale: 100 });
         case 'Z':
-            return dec === '' || decimals === 0 ? { kind: 'zeroPadded', width: Number(width) } : undefined;
+            return decimals === 0 ? { kind: 'zeroPadded', width: width === '' ? 1 : Number(width) } : undefined;
         default:
             return undefined;
     }
