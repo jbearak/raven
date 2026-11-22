@@ -48,6 +48,8 @@ function file_run_for(binary: string): string | undefined {
     // With PATH unset the lookup falls back to platform defaults; don't
     // guess which file that finds (the result just isn't cached).
     if (bare && process.env.PATH === undefined) return undefined;
+    // libuv parses quoted Windows PATH entries; don't guess at those either.
+    if (bare && process.platform === 'win32' && process.env.PATH?.includes('"')) return undefined;
     const candidates = bare
         ? [
             // libuv on Windows looks in the working directory first.
