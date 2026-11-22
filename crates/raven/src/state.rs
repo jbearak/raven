@@ -12619,7 +12619,10 @@ fn backward_directive_parents(
 /// derivation's oscillation rule ([`settle_inherited_wd_rounds`]). So
 /// inside a `source()` cycle the answer does not depend on the order the
 /// ancestors are visited in, and it equals what the workspace derivation (and
-/// `raven check`) gives the same files.
+/// `raven check`) gives the same files. One known gap: the ancestors come
+/// from the settled graph, while the workspace derivation re-resolves
+/// `source()` targets each round, so a cycle edge that exists only under a
+/// directory some round passes through is not seen here.
 pub(crate) fn enrich_open_metadata_with_inherited_wd(
     metadata: &mut crate::cross_file::CrossFileMetadata,
     uri: &Url,
