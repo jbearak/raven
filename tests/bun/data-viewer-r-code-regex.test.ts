@@ -46,6 +46,7 @@ const PATTERNS = [
     'foo|bar', '^(foo|bar)$', ',', '^[^,]*,.*$',
     // Repeats PCRE expands into copies (R refuses a compiled pattern past 64 KiB).
     '(?<a$b>x){0,10000}', '(?:x){0,1000}', '((x){0,200}){0,200}', 'k{0,5000}', 'x{0,60000}', '(?:ab){2,}',
+    '(?:[\\d][\\w][\\d][\\w]){0,499}', '(?:[\\d][\\w]){0,600}((?:[\\d][\\w]){0,600})', '(?:[a-z]\\d){0,50}',
 ];
 
 describe.skipIf(!READY)('regex translation agrees with the viewer in real R', () => {

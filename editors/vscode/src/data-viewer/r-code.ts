@@ -422,8 +422,10 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             } else return nonBmp;
         }
         out += pcre;
-        grow(pcre.length);
-        last = { size: pcre.length, group: pcre.startsWith('(') };
+        // A class compiles to a 32-byte bitmap and more; count it high.
+        const size = pcre.length + CLASS_COST * (pcre.split('[').length - 1);
+        grow(size);
+        last = { size, group: pcre.startsWith('(') };
         return null;
     };
     while (i < n) {
@@ -515,12 +517,15 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
         const err = atom(caseSensitive ? lit : foldGuard(`[${classBody(c)}]`, classBody(c), lit, true), false);
         if (err) return refuse(err);
     }
+    if (sizes.some(z => z > MAX_EXPANDED)) return refuse('the pattern is too large for R once its repeats are expanded');
     return { pcre: out };
 }
 
 /** Budget for `translateRegex`'s expanded-size estimate, well under the
  *  64 KiB compiled-pattern limit (estimates count source characters). */
 const MAX_EXPANDED = 10_000;
+/** Extra estimated size per character class (see `MAX_EXPANDED`). */
+const CLASS_COST = 40;
 
 /** JS's `\s`, as the body of a PCRE class (non-ASCII spaces as literal
  *  characters, so R compiles the pattern in UTF-8 mode). */
