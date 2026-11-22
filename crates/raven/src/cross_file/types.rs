@@ -235,7 +235,7 @@ pub struct TarchetypesDocumentLink {
 }
 
 /// Complete cross-file metadata for a document
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CrossFileMetadata {
     /// Backward directives (this file is sourced by others)
     pub sourced_by: Vec<BackwardDirective>,

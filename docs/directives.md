@@ -141,7 +141,7 @@ source("child.R")
 source("utils.R")  # Resolves to <workspace>/data/project/utils.R
 ```
 
-A file with no backward directive and no `cd` of its own also inherits a working directory from the files that `source()` it. A parent with a `cd` in effect runs it in that directory, and `source(..., chdir = TRUE)` runs it in its own directory. If two parents would run it in different directories, it inherits neither, and its paths resolve from its own directory with the workspace-root fallback. Paths in its `import::from()` calls resolve from the inherited directory too.
+A file with no backward directive and no `cd` of its own also inherits a working directory from the files that `source()` it. A parent with a `cd` in effect runs it in that directory, and `source(..., chdir = TRUE)` runs it in its own directory. If two parents would run it in different directories, it inherits neither, and its paths resolve from its own directory with the workspace-root fallback. Paths in its `import::from()` calls resolve from the inherited directory too. A [self-contained](#self-contained-sourced-files) file never inherits a directory this way.
 
 ## Self-contained sourced files
 

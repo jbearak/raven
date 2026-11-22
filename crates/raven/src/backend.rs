@@ -4512,6 +4512,7 @@ async fn prepare_workspace_scan(
     }
     let (workspace_name, package_workspace_root, library_paths) = basis.system_file_inputs();
     let context = WorkspaceGraphDerivationContext {
+        reuse_unchanged_artifacts: false,
         workspace_root: inputs.basis.workspace_folders.first().cloned(),
         max_depth: inputs.basis.max_chain_depth,
         exclusions: inputs.exclusions.clone(),
@@ -10631,6 +10632,7 @@ fn extract_enriched_live_metadata_with_contexts(
         &crate::state::forward_parents(
             &state.cross_file_graph,
             &state.authoritative_revalidation_roots_for_uri(uri),
+            max_chain_depth,
         ),
         max_chain_depth,
     );
@@ -10767,6 +10769,7 @@ fn semantic_metadata_for_graph_root<'a>(
         &crate::state::forward_parents(
             &state.cross_file_graph,
             &state.authoritative_revalidation_roots_for_uri(input_root),
+            state.cross_file_config.max_chain_depth,
         ),
         state.cross_file_config.max_chain_depth,
     );
@@ -12410,7 +12413,7 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
 
 struct CapturedOpenInstallAnalysis {
     /// See [`crate::state::forward_parents`].
-    forward_parents: Vec<crate::state::ForwardParent>,
+    forward_parents: crate::state::ForwardParents,
     basis: AnalysisBasis,
     intent: OpenInstallIntentToken,
     uri: Url,
@@ -12587,7 +12590,11 @@ fn capture_open_install_analysis(
         .unwrap_or_default();
     let (workspace_name, system_package_root, library_paths) = state.snapshot_system_file_inputs();
     Some(CapturedOpenInstallAnalysis {
-        forward_parents: crate::state::forward_parents(&state.cross_file_graph, &graph_roots),
+        forward_parents: crate::state::forward_parents(
+            &state.cross_file_graph,
+            &graph_roots,
+            state.cross_file_config.max_chain_depth,
+        ),
         box_context: state.box_search_context_for_document(&uri, &document.contents),
         basis,
         intent: intent.clone(),
@@ -13615,6 +13622,7 @@ fn snapshot_watched_closed_batch_overlay(
         entries,
         open_overlays,
         context: WorkspaceGraphDerivationContext {
+            reuse_unchanged_artifacts: false,
             workspace_root: state.workspace_folders.first().cloned(),
             max_depth: state.cross_file_config.max_chain_depth,
             exclusions: state.workspace_exclusions.clone(),
@@ -23821,8 +23829,9 @@ impl Backend {
                                 true
                             } else {
                                 // Already indexed. A child that declares its own
-                                // `# raven: cd` keeps its own working directory
-                                // regardless of the caller, so no inherited WD is ever
+                                // `# raven: cd`, or is self-contained, keeps its own
+                                // working directory regardless of the caller, so no
+                                // caller's inherited WD is ever
                                 // stored for it (see `index_file_on_demand_with_inherited_wd`)
                                 // — never re-index it for WD reasons. Otherwise re-index
                                 // only when the WD now in effect differs from the stored
@@ -23831,7 +23840,10 @@ impl Backend {
                                 // stale WD left by an earlier cd path to a shared child
                                 // (and vice versa), instead of keying on mere WD presence.
                                 match state.get_enriched_metadata(&child_uri) {
-                                    Some(child_meta) if child_meta.working_directory.is_some() => {
+                                    Some(child_meta)
+                                        if child_meta.working_directory.is_some()
+                                            || child_meta.standalone =>
+                                    {
                                         false
                                     }
                                     Some(child_meta) => {
@@ -23988,9 +24000,11 @@ impl Backend {
             },
             crate::state::Document::cross_file_metadata,
         );
+        // A self-contained file is isolated from its callers' directory.
         if non_r_document.is_none()
             && cross_file_meta.working_directory.is_none()
             && cross_file_meta.inherited_working_directory.is_none()
+            && !cross_file_meta.standalone
         {
             cross_file_meta.inherited_working_directory =
                 Some(inherited_wd.to_string_lossy().to_string());
@@ -24014,6 +24028,23 @@ impl Backend {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let packages_enabled = state.cross_file_config.packages_enabled;
+            let consumed_context_uris = std::cell::RefCell::new(Vec::new());
+
+            // A self-contained file declined the caller's directory above; its
+            // own backward directives still give it one, as in ordinary
+            // on-demand indexing.
+            if non_r_document.is_none() && cross_file_meta.standalone {
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut cross_file_meta,
+                    file_uri,
+                    workspace_root.as_ref(),
+                    |parent_uri| {
+                        consumed_context_uris.borrow_mut().push(parent_uri.clone());
+                        state.get_enriched_metadata(parent_uri)
+                    },
+                    state.cross_file_config.max_chain_depth,
+                );
+            }
 
             let (parent_content, attempted_parents) = collect_backward_parent_content_with(
                 file_uri,
@@ -24027,6 +24058,7 @@ impl Backend {
                         .or_else(|| state.cross_file_file_cache.get(parent_uri))
                 },
             );
+            consumed_context_uris.borrow_mut().extend(attempted_parents);
 
             let workspace_index_version = state.workspace_index.version();
 
@@ -24042,9 +24074,10 @@ impl Backend {
                         .clone(),
                 )
             };
-            let Some(analysis_basis) =
-                state.attach_analysis_context_authorities(analysis_basis, attempted_parents)
-            else {
+            let Some(analysis_basis) = state.attach_analysis_context_authorities(
+                analysis_basis,
+                consumed_context_uris.into_inner(),
+            ) else {
                 if let Some(claim) = &claim {
                     state
                         .workspace_index
@@ -39617,6 +39650,204 @@ mod project_config_initialize_tests {
         close_doc(backend, &main_uri).await;
         until(true, "util.R is missing again once the parent closes").await;
         assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
+        collector.abort();
+    }
+
+    /// A self-contained file indexed on demand through a caller with a
+    /// `# raven: cd` takes no directory from that caller, but its own
+    /// `# raven: sourced-by` still gives it one.
+    #[tokio::test]
+    async fn on_demand_self_contained_file_keeps_its_backward_directory() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["module", "runner", "wd"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        // The closed runner is indexed (through `top.R`) before the forward
+        // chain reaches `init.R`, so `init.R`'s backward directive can see it.
+        fs::write(
+            base.join("runner/main.R"),
+            "# raven: cd ../wd\n# raven: run ../module/init.R\n",
+        )
+        .unwrap();
+        let top_text = "source(\"runner/main.R\")\n";
+        fs::write(base.join("top.R"), top_text).unwrap();
+        let init_path = base.join("module/init.R");
+        let top_uri = Url::from_file_path(base.join("top.R")).unwrap();
+        let init_uri = Url::from_file_path(&init_path).unwrap();
+        for (init_text, expected) in [
+            ("# raven: self-contained\nsource(\"helpers.R\")\n", None),
+            (
+                "# raven: self-contained\n# raven: sourced-by ../runner/main.R\nsource(\"helpers.R\")\n",
+                Some(base.join("wd").to_string_lossy().into_owned()),
+            ),
+        ] {
+            fs::write(&init_path, init_text).unwrap();
+            let (service, _socket) = tower_lsp::LspService::new(Backend::new);
+            let backend = service.inner();
+            backend
+                .initialize(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&base).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            backend.state.write().await.workspace_scan_complete = true;
+            open_doc(backend, &top_uri, "r", 1, top_text).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let metadata = loop {
+                if let Some(metadata) = backend
+                    .state
+                    .read()
+                    .await
+                    .workspace_index
+                    .get_metadata(&init_uri)
+                {
+                    break metadata;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "init.R indexed on demand"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                metadata.inherited_working_directory, expected,
+                "{init_text:?}"
+            );
+        }
+    }
+
+    /// An open file follows its directory when it changes through a CLOSED
+    /// intermediate file: `main.R` (`# raven: cd a`) sources the closed
+    /// `mods/middle.R`, which sources the open `mods/child.R`. Editing the
+    /// directive to `cd b` must reach the child, though the closed middle
+    /// file has no commit of its own and its index entry still carries `a`.
+    #[tokio::test]
+    async fn an_open_file_follows_its_directory_through_a_closed_parent() {
+        use futures_util::{SinkExt, StreamExt};
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["a", "b", "mods"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let main_text = |dir: &str| format!("# raven: cd {dir}\nsource(\"../mods/middle.R\")\n");
+        let child_text = "source(\"constants.R\")\nprint(special_value)\n";
+        fs::write(base.join("main.R"), main_text("a")).unwrap();
+        fs::write(base.join("mods/middle.R"), "source(\"../mods/child.R\")\n").unwrap();
+        fs::write(base.join("mods/child.R"), child_text).unwrap();
+        fs::write(base.join("a/constants.R"), "old_value <- 1\n").unwrap();
+        fs::write(base.join("b/constants.R"), "special_value <- 2\n").unwrap();
+        // Without an inherited directory the child would find this one.
+        fs::write(base.join("mods/constants.R"), "other_value <- 2\n").unwrap();
+        let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
+        let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        // The latest diagnostics published for the child: `Some(true)` while
+        // they report `special_value` undefined.
+        let undefined = Arc::new(std::sync::Mutex::new(None::<bool>));
+        // Answers the server's own requests (`initialized` waits on its
+        // capability registrations) and records the child's diagnostics.
+        let collector =
+            {
+                let undefined = undefined.clone();
+                let child_uri = child_uri.clone();
+                let (mut requests, mut responses) = socket.split();
+                tokio::spawn(async move {
+                    while let Some(message) = requests.next().await {
+                        if let Some(id) = message.id().cloned() {
+                            let _ = responses
+                                .send(tower_lsp::jsonrpc::Response::from_ok(
+                                    id,
+                                    serde_json::Value::Null,
+                                ))
+                                .await;
+                            continue;
+                        }
+                        if message.method() != "textDocument/publishDiagnostics" {
+                            continue;
+                        }
+                        let params: PublishDiagnosticsParams =
+                            serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                        if params.uri == child_uri {
+                            *undefined.lock().unwrap() =
+                                Some(params.diagnostics.iter().any(|diagnostic| {
+                                    diagnostic.message.contains("special_value")
+                                }));
+                        }
+                    }
+                })
+            };
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&base).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "crossFile": { "indexWorkspace": true },
+                        "packages": { "enabled": false },
+                        "diagnosticUris": [main_uri.to_string(), child_uri.to_string()]
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        let backend = svc.inner();
+        // The workspace scan indexes the closed `middle.R` with the directory
+        // `main.R` runs it in, as the editor does.
+        backend.initialized(InitializedParams {}).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !backend.state.read().await.workspace_scan_complete {
+            assert!(std::time::Instant::now() < deadline, "workspace scan");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        open_doc(backend, &main_uri, "r", 1, &main_text("a")).await;
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+        let until = |want: bool, what: &'static str| {
+            let undefined = undefined.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let now = *undefined.lock().unwrap();
+                    if now == Some(want) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{what}, latest {now:?}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+        until(true, "special_value is undefined under a/").await;
+
+        change_doc(backend, &main_uri, 2, &main_text("b")).await;
+        until(false, "special_value is defined under b/").await;
+        change_doc(backend, &main_uri, 3, &main_text("a")).await;
+        until(true, "special_value is undefined again under a/").await;
+        change_doc(backend, &main_uri, 4, &main_text("b")).await;
+        until(false, "special_value is defined again under b/").await;
+        // Closing the unsaved parent reverts it to its file (`cd a`).
+        close_doc(backend, &main_uri).await;
+        until(true, "special_value is undefined once the parent closes").await;
         collector.abort();
     }
 

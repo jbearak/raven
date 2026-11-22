@@ -3455,7 +3455,7 @@ pub(crate) struct PreparedOpenAliasReconcileAnalysis {
 pub(crate) struct CapturedOpenMetadataAnalysis {
     pub(crate) box_context: crate::box_use::search_path::SearchPathContext,
     /// See [`forward_parents`].
-    pub(crate) forward_parents: Vec<ForwardParent>,
+    pub(crate) forward_parents: ForwardParents,
     basis: AnalysisBasis,
     pub(crate) uri: Url,
     pub(crate) expected: AnalysisGeneration,
@@ -9306,7 +9306,11 @@ impl WorldState {
         let (workspace_name, package_workspace_root, library_paths) =
             self.snapshot_system_file_inputs();
         Some(CapturedOpenMetadataAnalysis {
-            forward_parents: forward_parents(&self.cross_file_graph, &graph_roots),
+            forward_parents: forward_parents(
+                &self.cross_file_graph,
+                &graph_roots,
+                self.cross_file_config.max_chain_depth,
+            ),
             box_context: self.box_search_context(),
             basis,
             uri: uri.clone(),
@@ -10763,11 +10767,7 @@ impl WorldState {
                     .symmetric_difference(&after)
                     .map(|(child, _)| child.clone()),
             );
-            for child in refresh {
-                if let Some(open_child) = self.open_document_uri_for_authoritative_uri(&child) {
-                    self.open_wd_refresh_queue.insert(open_child);
-                }
-            }
+            self.queue_open_wd_refresh_through_closed(refresh);
             wd_affected.extend(backward_affected);
         }
         let close_post_graph_neighbors: Vec<Url> = changed_authoritative_roots
@@ -11251,6 +11251,42 @@ impl WorldState {
     /// before path classification, so extension-mismatched Rmd/Quarto files do
     /// not start treating prose as R after close (issue #563). So directives,
     /// `source()`, and `library()` always reflect chunk bodies, never prose.
+    /// Queue for re-derivation (`open_wd_refresh_queue`) the open documents
+    /// whose inherited working directory may follow from a change to the
+    /// directory proposed to `children`.
+    ///
+    /// An open child is queued and stops the walk: its refresh commit queues
+    /// its own children if its directory changes. A closed child has no
+    /// commit of its own to carry the change on, so the walk continues
+    /// through its forward children (up to `max_chain_depth` hops) to the
+    /// open documents below it, which re-derive their directory through it
+    /// (`enrich_open_metadata_with_inherited_wd`).
+    fn queue_open_wd_refresh_through_closed(&mut self, children: Vec<Url>) {
+        let mut seen = HashSet::new();
+        let mut frontier = children;
+        for _ in 0..=self.cross_file_config.max_chain_depth {
+            let mut next = Vec::new();
+            for child in frontier {
+                if !seen.insert(child.clone()) {
+                    continue;
+                }
+                if let Some(open_child) = self.open_document_uri_for_authoritative_uri(&child) {
+                    self.open_wd_refresh_queue.insert(open_child);
+                } else {
+                    next.extend(
+                        forward_children(&self.cross_file_graph, &child)
+                            .into_iter()
+                            .map(|(grandchild, _)| grandchild),
+                    );
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+    }
+
     pub fn get_enriched_metadata(
         &self,
         uri: &Url,
@@ -12414,6 +12450,12 @@ pub(crate) struct WorkspaceGraphDerivationContext {
     pub(crate) system_file_workspace_name: Option<String>,
     pub(crate) system_file_workspace_root: Option<PathBuf>,
     pub(crate) system_file_library_paths: Vec<PathBuf>,
+    /// Keep a closed entry's incoming artifacts when the derivation leaves
+    /// its metadata unchanged, instead of recomputing them. Set it only when
+    /// every incoming entry's artifacts were computed from that entry's own
+    /// metadata, as a fresh scan's are; an index entry can hold metadata
+    /// replaced after its artifacts (`replace_complete_metadata`).
+    pub(crate) reuse_unchanged_artifacts: bool,
 }
 
 /// A file that `source()`s an open document (or names it in a forward
@@ -12430,26 +12472,71 @@ pub(crate) struct ForwardParent {
     pub(crate) child: Url,
 }
 
-/// The [`ForwardParent`]s of a document, over all of its graph `roots` (its
+/// Edges that can pass a working directory down: `source()` calls (and
+/// forward directives) on lending edges, never backward directives.
+fn is_wd_lending_edge(edge: &crate::cross_file::DependencyEdge) -> bool {
+    edge.kind == crate::cross_file::DependencyEdgeKind::OrdinarySource
+        && !edge.is_backward_directive
+        && !edge.non_lending
+}
+
+/// The forward parents a document inherits a working directory through: the
+/// [`ForwardParent`]s of its graph roots, plus the forward parents of each of
+/// those parents' own forward ancestors (up to `max_depth` hops).
+///
+/// The ancestors are what let a document re-derive its directory through a
+/// closed intermediate file. A closed file's index entry carries the
+/// directory the last workspace derivation gave it, which goes stale when an
+/// open ancestor changes its `# raven: cd`; nothing rewrites closed entries on
+/// an editor commit. [`enrich_open_metadata_with_inherited_wd`] therefore
+/// recomputes each parent's directory from these edges instead of trusting
+/// the stored value.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ForwardParents {
+    /// Edges into the document's own graph roots.
+    direct: Vec<ForwardParent>,
+    /// For each forward ancestor, the lending edges into it.
+    ancestors: HashMap<Url, Vec<ForwardParent>>,
+}
+
+/// The [`ForwardParents`] of a document, over all of its graph `roots` (its
 /// editor URI and the aliases its graph edges may name instead).
 pub(crate) fn forward_parents(
     graph: &crate::cross_file::DependencyGraph,
     roots: &[Url],
-) -> Vec<ForwardParent> {
-    roots
-        .iter()
-        .flat_map(|root| graph.get_dependents(root))
-        .filter(|edge| {
-            edge.kind == crate::cross_file::DependencyEdgeKind::OrdinarySource
-                && !edge.is_backward_directive
-                && !edge.non_lending
-        })
-        .map(|edge| ForwardParent {
-            parent: edge.from.clone(),
-            chdir: edge.chdir,
-            child: edge.to.clone(),
-        })
-        .collect()
+    max_depth: usize,
+) -> ForwardParents {
+    let edges_into = |uri: &Url| -> Vec<ForwardParent> {
+        graph
+            .get_dependents(uri)
+            .into_iter()
+            .filter(|edge| is_wd_lending_edge(edge))
+            .map(|edge| ForwardParent {
+                parent: edge.from.clone(),
+                chdir: edge.chdir,
+                child: edge.to.clone(),
+            })
+            .collect()
+    };
+    let direct: Vec<_> = roots.iter().flat_map(&edges_into).collect();
+    let mut ancestors: HashMap<Url, Vec<ForwardParent>> = HashMap::new();
+    let mut frontier: Vec<Url> = direct.iter().map(|edge| edge.parent.clone()).collect();
+    for _ in 0..max_depth {
+        let mut next = Vec::new();
+        for uri in frontier {
+            if ancestors.contains_key(&uri) {
+                continue;
+            }
+            let parents = edges_into(&uri);
+            next.extend(parents.iter().map(|edge| edge.parent.clone()));
+            ancestors.insert(uri, parents);
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    ForwardParents { direct, ancestors }
 }
 
 /// The files `uri` sources on an edge that can pass a working directory
@@ -12458,11 +12545,7 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
     graph
         .get_dependencies(uri)
         .into_iter()
-        .filter(|edge| {
-            edge.kind == crate::cross_file::DependencyEdgeKind::OrdinarySource
-                && !edge.is_backward_directive
-                && !edge.non_lending
-        })
+        .filter(|edge| is_wd_lending_edge(edge))
         .map(|edge| (edge.to.clone(), edge.chdir))
         .collect()
 }
@@ -12473,45 +12556,127 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 /// ([`forward_wd_proposals`]): a directory only when every proposing parent
 /// agrees. Without this, opening a file that inherits only through the files
 /// that source it would drop the directory the workspace scan gave it.
+///
+/// A `# raven: self-contained` file takes no directory from the files that
+/// source it, as in [`forward_wd_proposals`].
+///
+/// Each parent's own directory is re-derived the same way from
+/// `forward_parents`' ancestor edges rather than read from its stored
+/// metadata, which for a closed file is whatever the last workspace
+/// derivation baked in (see [`ForwardParents`]). A parent with its own
+/// `# raven: cd` needs no re-derivation; a cycle or the depth bound stops
+/// the walk, and a parent seen again on the current path proposes nothing.
 pub(crate) fn enrich_open_metadata_with_inherited_wd(
     metadata: &mut crate::cross_file::CrossFileMetadata,
     uri: &Url,
     workspace_root: Option<&Url>,
     get_metadata: impl Fn(&Url) -> Option<Arc<crate::cross_file::CrossFileMetadata>>,
-    forward_parents: &[ForwardParent],
+    forward_parents: &ForwardParents,
     max_depth: usize,
 ) {
-    crate::cross_file::enrich_metadata_with_inherited_wd(
-        metadata,
-        uri,
+    let mut walk = ForwardWdWalk {
         workspace_root,
-        &get_metadata,
+        get_metadata: &get_metadata,
+        ancestors: &forward_parents.ancestors,
         max_depth,
-    );
-    if metadata.working_directory.is_some() || metadata.inherited_working_directory.is_some() {
-        return;
-    }
-    let mut proposals = std::collections::BTreeSet::new();
-    for edge in forward_parents {
-        let Ok(child_path) = edge.child.to_file_path() else {
-            continue;
-        };
-        let Some(parent) = get_metadata(&edge.parent) else {
-            continue;
-        };
-        let Some(context) = crate::cross_file::path_resolve::PathContext::from_metadata(
-            &edge.parent,
-            &parent,
-            workspace_root,
-        ) else {
-            continue;
-        };
-        if let Some(directory) = context.forward_child_inherited_wd(&child_path, edge.chdir) {
-            proposals.insert(directory.to_string_lossy().into_owned());
+        memo: HashMap::new(),
+        on_path: HashSet::from([uri.clone()]),
+    };
+    walk.enrich(metadata, uri, &forward_parents.direct, max_depth);
+}
+
+/// Memoized walk behind [`enrich_open_metadata_with_inherited_wd`].
+struct ForwardWdWalk<'a, F> {
+    workspace_root: Option<&'a Url>,
+    get_metadata: &'a F,
+    ancestors: &'a HashMap<Url, Vec<ForwardParent>>,
+    max_depth: usize,
+    memo: HashMap<Url, Option<Arc<crate::cross_file::CrossFileMetadata>>>,
+    on_path: HashSet<Url>,
+}
+
+impl<F> ForwardWdWalk<'_, F>
+where
+    F: Fn(&Url) -> Option<Arc<crate::cross_file::CrossFileMetadata>>,
+{
+    fn enrich(
+        &mut self,
+        metadata: &mut crate::cross_file::CrossFileMetadata,
+        uri: &Url,
+        parents: &[ForwardParent],
+        depth: usize,
+    ) {
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            metadata,
+            uri,
+            self.workspace_root,
+            self.get_metadata,
+            self.max_depth,
+        );
+        if metadata.working_directory.is_some()
+            || metadata.inherited_working_directory.is_some()
+            || metadata.standalone
+        {
+            return;
+        }
+        let mut proposals = std::collections::BTreeSet::new();
+        for edge in parents {
+            let Ok(child_path) = edge.child.to_file_path() else {
+                continue;
+            };
+            let Some(parent) = self.parent_metadata(&edge.parent, depth) else {
+                continue;
+            };
+            let Some(context) = crate::cross_file::path_resolve::PathContext::from_metadata(
+                &edge.parent,
+                &parent,
+                self.workspace_root,
+            ) else {
+                continue;
+            };
+            if let Some(directory) = context.forward_child_inherited_wd(&child_path, edge.chdir) {
+                proposals.insert(directory.to_string_lossy().into_owned());
+            }
+        }
+        if proposals.len() == 1 {
+            metadata.inherited_working_directory = proposals.pop_first();
         }
     }
-    if proposals.len() == 1 {
-        metadata.inherited_working_directory = proposals.pop_first();
+
+    /// `parent`'s metadata with its inherited directory re-derived, or its
+    /// stored metadata when no ancestor edges were captured for it or the
+    /// depth runs out. `None` (proposes nothing) for a parent already on the
+    /// current path. Every result is memoized, so each ancestor is derived
+    /// once per walk and the walk stays linear in the ancestor edges. The
+    /// price is that inside a `source()` cycle a result can depend on which
+    /// member the walk entered first.
+    fn parent_metadata(
+        &mut self,
+        parent: &Url,
+        depth: usize,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        if self.on_path.contains(parent) {
+            return None;
+        }
+        if let Some(memo) = self.memo.get(parent) {
+            return memo.clone();
+        }
+        let stored = (self.get_metadata)(parent)?;
+        let ancestors = self.ancestors;
+        let Some(grandparents) = ancestors.get(parent) else {
+            return Some(stored);
+        };
+        if stored.working_directory.is_some() || depth == 0 {
+            return Some(stored);
+        }
+        let mut fresh = (*stored).clone();
+        fresh.inherited_working_directory = None;
+        self.on_path.insert(parent.clone());
+        self.enrich(&mut fresh, parent, grandparents, depth - 1);
+        self.on_path.remove(parent);
+        let fresh = Arc::new(fresh);
+        self.memo.insert(parent.clone(), Some(fresh.clone()));
+        Some(fresh)
     }
 }
 
@@ -12525,7 +12690,8 @@ pub(crate) fn enrich_open_metadata_with_inherited_wd(
 /// every proposing parent agrees. Parents that disagree leave it with none,
 /// so its own paths resolve as if no directory were in effect, and the
 /// result never depends on which parent happens to sort first. Files in
-/// `unstable` (see [`derive_workspace_dependency_graph`]) take none.
+/// `unstable` (see [`derive_workspace_dependency_graph`]) take none, and so
+/// does a `# raven: self-contained` file, which is isolated from its callers.
 fn forward_wd_proposals(
     parents: &[(Url, Arc<crate::cross_file::CrossFileMetadata>)],
     children: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
@@ -12561,6 +12727,7 @@ fn forward_wd_proposals(
             };
             if child.working_directory.is_some()
                 || child.inherited_working_directory.is_some()
+                || child.standalone
                 || unstable.contains(&child_uri)
             {
                 continue;
@@ -12759,6 +12926,16 @@ pub(crate) fn derive_workspace_dependency_graph(
     HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
 ) {
     let workspace_root = context.workspace_root.as_ref();
+    // What each entry's incoming artifacts were computed from (see
+    // `reuse_unchanged_artifacts`), before anything below rewrites it.
+    let incoming_closed_metadata: HashMap<_, _> = if context.reuse_unchanged_artifacts {
+        entries
+            .iter()
+            .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let base_open_metadata: HashMap<_, _> = open_overlays
         .iter()
         .map(|open| {
@@ -12924,6 +13101,13 @@ pub(crate) fn derive_workspace_dependency_graph(
             uri,
             workspace_root,
         );
+        if entry.tree.is_some()
+            && incoming_closed_metadata
+                .get(uri)
+                .is_some_and(|incoming| **incoming == *entry.metadata)
+        {
+            continue;
+        }
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::R {
             match entry.tree.as_ref() {
@@ -15987,6 +16171,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             vec![tmp.path().to_path_buf()],
         );
         let context = WorkspaceGraphDerivationContext {
+            reuse_unchanged_artifacts: false,
             workspace_root: Some(root_uri),
             max_depth: 20,
             exclusions,
@@ -16048,6 +16233,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         for max_depth in [20, 21] {
             let mut entries = scan_workspace(std::slice::from_ref(&root_uri), max_depth);
             let context = WorkspaceGraphDerivationContext {
+                reuse_unchanged_artifacts: false,
                 workspace_root: Some(root_uri.clone()),
                 max_depth,
                 exclusions: Default::default(),
@@ -16064,6 +16250,185 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 );
             }
         }
+    }
+
+    /// A `# raven: self-contained` file is isolated from its callers: a
+    /// parent that runs it under a `# raven: cd` gives it no directory, so its
+    /// own `source("helpers.R")` keeps resolving next to it.
+    #[test]
+    fn a_self_contained_file_takes_no_directory_from_its_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["module", "wd", "runner"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("module/helpers.R"), "helper_value <- 17\n").unwrap();
+        fs::write(
+            root.join("module/init.R"),
+            "# raven: self-contained\nsource(\"helpers.R\")\nprint(helper_value)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("runner/main.R"),
+            "# raven: cd ../wd\n# raven: run ../module/init.R\n",
+        )
+        .unwrap();
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+        let context = WorkspaceGraphDerivationContext {
+            reuse_unchanged_artifacts: false,
+            workspace_root: Some(root_uri),
+            max_depth: 20,
+            exclusions: Default::default(),
+            system_file_workspace_name: None,
+            system_file_workspace_root: None,
+            system_file_library_paths: Vec::new(),
+        };
+        let (graph, _) =
+            derive_workspace_dependency_graph(&mut entries, None, &[], &context, false);
+        let init = Url::from_file_path(root.join("module/init.R")).unwrap();
+        assert_eq!(entries[&init].metadata.inherited_working_directory, None);
+        let targets: Vec<_> = graph
+            .get_dependencies(&init)
+            .iter()
+            .map(|edge| edge.to.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Url::from_file_path(root.join("module/helpers.R")).unwrap()]
+        );
+    }
+
+    /// With `reuse_unchanged_artifacts`, the derivation keeps the scan's
+    /// artifacts for a file it leaves unchanged and recomputes them for a
+    /// file whose directory a parent passes on.
+    #[test]
+    fn derivation_recomputes_artifacts_only_for_changed_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["lib", "scripts"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(
+            root.join("main.R"),
+            "# raven: cd lib\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(root.join("scripts/child.R"), "source(\"util.R\")\n").unwrap();
+        fs::write(root.join("lib/util.R"), "f <- function() 1\n").unwrap();
+        fs::write(root.join("other.R"), "g <- function() 2\n").unwrap();
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+        let before: HashMap<_, _> = entries
+            .iter()
+            .map(|(uri, entry)| (uri.clone(), entry.artifacts.clone()))
+            .collect();
+        let context = WorkspaceGraphDerivationContext {
+            reuse_unchanged_artifacts: true,
+            workspace_root: Some(root_uri),
+            max_depth: 20,
+            exclusions: Default::default(),
+            system_file_workspace_name: None,
+            system_file_workspace_root: None,
+            system_file_library_paths: Vec::new(),
+        };
+        derive_workspace_dependency_graph(&mut entries, None, &[], &context, false);
+        let reused = |file: &str| {
+            let uri = Url::from_file_path(root.join(file)).unwrap();
+            Arc::ptr_eq(&before[&uri], &entries[&uri].artifacts)
+        };
+        assert!(reused("other.R"));
+        assert!(reused("main.R"));
+        assert!(!reused("scripts/child.R"), "child.R inherits lib/");
+    }
+
+    /// The forward half of an open buffer's directory derivation honors
+    /// `# raven: self-contained` too.
+    #[test]
+    fn an_open_self_contained_file_takes_no_directory_from_its_callers() {
+        let root = std::path::PathBuf::from(if cfg!(windows) { r"C:\p" } else { "/p" });
+        let parent = Url::from_file_path(root.join("runner/main.R")).unwrap();
+        let child = Url::from_file_path(root.join("module/init.R")).unwrap();
+        let parent_metadata = Arc::new(crate::cross_file::extract_metadata(
+            "# raven: cd ../wd\n# raven: run ../module/init.R\n",
+        ));
+        let parents = ForwardParents {
+            direct: vec![ForwardParent {
+                parent: parent.clone(),
+                chdir: false,
+                child: child.clone(),
+            }],
+            ancestors: HashMap::new(),
+        };
+        let lookup = |uri: &Url| (uri == &parent).then(|| parent_metadata.clone());
+        for (text, expected) in [
+            ("source(\"helpers.R\")\n", Some(root.join("wd"))),
+            ("# raven: self-contained\nsource(\"helpers.R\")\n", None),
+        ] {
+            let mut metadata = crate::cross_file::extract_metadata(text);
+            enrich_open_metadata_with_inherited_wd(
+                &mut metadata,
+                &child,
+                None,
+                lookup,
+                &parents,
+                20,
+            );
+            assert_eq!(
+                metadata.inherited_working_directory.map(PathBuf::from),
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A child inherits its directory through a parent whose own directory is
+    /// inherited. The parent's stored directory is not trusted: a closed
+    /// file's index entry keeps the directory the last workspace derivation
+    /// gave it after an open ancestor changes its `# raven: cd`.
+    #[test]
+    fn an_open_file_rederives_its_directory_through_a_stale_closed_parent() {
+        let root = std::path::PathBuf::from(if cfg!(windows) { r"C:\p" } else { "/p" });
+        let main = Url::from_file_path(root.join("main.R")).unwrap();
+        let middle = Url::from_file_path(root.join("mods/middle.R")).unwrap();
+        let child = Url::from_file_path(root.join("mods/child.R")).unwrap();
+        let main_metadata = Arc::new(crate::cross_file::extract_metadata(
+            "# raven: cd b\nsource(\"../mods/middle.R\")\n",
+        ));
+        let mut stale_middle = crate::cross_file::extract_metadata("source(\"../mods/child.R\")\n");
+        stale_middle.inherited_working_directory =
+            Some(root.join("a").to_string_lossy().into_owned());
+        let stale_middle = Arc::new(stale_middle);
+        let parents = ForwardParents {
+            direct: vec![ForwardParent {
+                parent: middle.clone(),
+                chdir: false,
+                child: child.clone(),
+            }],
+            ancestors: HashMap::from([(
+                middle.clone(),
+                vec![ForwardParent {
+                    parent: main.clone(),
+                    chdir: false,
+                    child: middle.clone(),
+                }],
+            )]),
+        };
+        let lookup = |uri: &Url| {
+            if uri == &main {
+                Some(main_metadata.clone())
+            } else if uri == &middle {
+                Some(stale_middle.clone())
+            } else {
+                None
+            }
+        };
+        let mut metadata = crate::cross_file::extract_metadata("source(\"constants.R\")\n");
+        enrich_open_metadata_with_inherited_wd(&mut metadata, &child, None, lookup, &parents, 20);
+        assert_eq!(
+            metadata.inherited_working_directory.map(PathBuf::from),
+            Some(root.join("b"))
+        );
     }
 
     /// A module admitted because a parent's directory led to it can inherit a
@@ -16101,6 +16466,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         let workspace_uri = Url::from_directory_path(&workspace).unwrap();
         let mut entries = scan_workspace(std::slice::from_ref(&workspace_uri), 20);
         let context = WorkspaceGraphDerivationContext {
+            reuse_unchanged_artifacts: false,
             workspace_root: Some(workspace_uri),
             max_depth: 20,
             exclusions: Default::default(),
@@ -16153,6 +16519,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             .unwrap();
             let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
             let context = WorkspaceGraphDerivationContext {
+                reuse_unchanged_artifacts: false,
                 workspace_root: Some(root_uri.clone()),
                 max_depth: 20,
                 exclusions: Default::default(),
