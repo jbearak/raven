@@ -306,9 +306,10 @@ pub(crate) fn display_fs_path(path: &Path, root: &Path) -> String {
 fn without_verbatim_prefix(path: &str) -> Option<String> {
     let rest = path.strip_prefix(r"\\?\")?;
     if let Some(unc) = rest.strip_prefix(r"UNC\") {
-        // A file URI's host is lowercase.
+        // A file URI's host is normalized (lowercase, IDNA) as `url` does.
         let (server, share) = unc.split_once('\\').unwrap_or((unc, ""));
-        let server = server.to_ascii_lowercase();
+        let server = url::Host::parse(server)
+            .map_or_else(|_| server.to_ascii_lowercase(), |host| host.to_string());
         return Some(if share.is_empty() {
             format!(r"\\{server}")
         } else {
@@ -1320,6 +1321,10 @@ mod tests {
         assert_eq!(
             without_verbatim_prefix(r"\\?\UNC\Server\share\work").as_deref(),
             Some(r"\\server\share\work")
+        );
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\Bücher\share").as_deref(),
+            Some(r"\\xn--bcher-kva\share")
         );
         assert_eq!(without_verbatim_prefix(r"C:\work"), None);
         assert_eq!(without_verbatim_prefix(r"\\?\Volume{x}\work"), None);

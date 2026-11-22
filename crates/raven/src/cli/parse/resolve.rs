@@ -509,8 +509,10 @@ impl LiteralBindings {
         };
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
-            if let Some(name) = parameter.child_by_field_name("name") {
-                let name = &text[name.byte_range()];
+            if let Some(name) = parameter
+                .child_by_field_name("name")
+                .and_then(|name| scope::assignment_identifier_name(name, text))
+            {
                 self.other
                     .insert((Some(function.start_byte()), name.to_string()));
             }
@@ -1220,9 +1222,16 @@ impl<'w> FileResolver<'w> {
             .symbols
             .get(name)
             .filter(|symbol| {
-                symbol.source_uri != names.uri
-                    && !self.global_overwritten.get()
-                    && !self.passes_over(symbol)
+                // At the call site, the file's literal overwrites the caller's
+                // earlier global binding. Read late, the caller's scope is its
+                // whole top level, which already ends with the file's literal
+                // unless the caller binds the name again after `source()`. A
+                // named import (a package symbol) is on the search path, not
+                // in the global environment.
+                let overwritten = self.global_overwritten.get()
+                    && !late
+                    && scope::package_name_from_uri(&symbol.source_uri).is_none();
+                symbol.source_uri != names.uri && !overwritten && !self.passes_over(symbol)
             })
             .cloned();
         if let Some(symbol) = bound.as_ref().filter(|symbol| !is_default_attached(symbol)) {

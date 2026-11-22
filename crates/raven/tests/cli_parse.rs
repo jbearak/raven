@@ -585,7 +585,7 @@ fn a_call_passes_over_a_literal_binding() {
             "(NULL) -> c\n",
             "c(1)\n",
             "source(\"child.R\")\n",
-            "p <- function(mean) { if (TRUE) mean <- 7; mean(1) }\n",
+            "p <- function(`mean`) { if (TRUE) mean <- 7; mean(1) }\n",
         )
         .as_bytes(),
     );
@@ -617,7 +617,7 @@ fn a_call_passes_over_a_literal_binding() {
     // A parameter's value comes from the caller, whatever its function assigns.
     assert_eq!(
         *resolution_of(doc, "mean", 15),
-        serde_json::json!({"kind": "local", "range": range(15, 32, 36)})
+        serde_json::json!({"kind": "local", "range": range(15, 34, 38)})
     );
     // A caller's literal binding is passed over too.
     assert_eq!(
@@ -636,6 +636,40 @@ fn a_literal_binding_hides_the_callers_definitions() {
     write(&ws, "c.R", b"# raven: sourced-by a.R\nmean <- 7\nmean(1)\n");
     let docs = parse_isolated(&ws, &["c.R"], None);
     assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
+}
+
+/// The overwrite is of the global environment only: a caller's named import
+/// is on the search path and still found, and read late (inside a function),
+/// a caller that binds the name again after `source()` wins.
+#[test]
+fn a_literal_overwrite_keeps_caller_imports_and_later_rebindings() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"source(\"c.R\")\n");
+    write(
+        &ws,
+        "b.R",
+        b"import::from(ravenpkga, onlya)\nsource(\"c.R\")\nmean <- function(x) 99\n",
+    );
+    write(
+        &ws,
+        "c.R",
+        b"# raven: sourced-by a.R\nonlya <- 7\nonlya()\nmean <- 7\nf <- function() mean(1)\n",
+    );
+    let docs = parse_isolated(&ws, &["c.R"], None);
+    let range = serde_json::json!({"start": {"line": 2, "character": 0},
+                                   "end": {"line": 2, "character": 4}});
+    assert_eq!(
+        *resolution_of(&docs[0], "onlya", 2),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": {"kind": "unresolved", "reason": "not_found"}},
+            {"path": "b.R", "resolution": package("ravenpkga")}]})
+    );
+    assert_eq!(
+        *resolution_of(&docs[0], "mean", 4),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "a.R", "resolution": package("base")},
+            {"path": "b.R", "resolution": {"kind": "workspace", "path": "b.R", "range": range}}]})
+    );
 }
 
 /// The `target` range of top-level statement `index`'s assignment.
