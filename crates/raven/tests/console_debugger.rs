@@ -2217,7 +2217,7 @@ fn hover_runs_no_user_methods_and_reads_s4_slots() {
          for (g in c(\"[\", \"[[\", \"as.character\")) registerS3method(g, \"labelset\", counted)\n\
          fac <- structure(1L, levels = structure(\"a\", class = \"labelset\"), class = \"factor\")\n\
          when <- structure(0, tzone = structure(\"UTC\", class = \"labelset\"), class = c(\"POSIXct\", \"POSIXt\"))\n\
-         setClass(\"Box\", representation(value = \"numeric\"))\n\
+         setClass(\"Box\", representation(value = \"numeric\", any = \"ANY\"))\n\
          obj <- new(\"Box\", value = 7)\n\
          hv <- function() { browser(); 1 }",
         None,
@@ -2247,6 +2247,8 @@ fn hover_runs_no_user_methods_and_reads_s4_slots() {
     assert_eq!(hits["body"]["result"], "0", "a hover ran a user method");
     let slot = hover(&mut d, "obj@value");
     assert_eq!(slot["body"]["result"], "7", "{slot}");
+    let empty = hover(&mut d, "obj@any");
+    assert_eq!(empty["body"]["result"], "NULL", "{empty}");
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);

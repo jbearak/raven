@@ -610,7 +610,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 if (!(is.character(key) || is.numeric(key)) || length(key) != 1L) return(list(ok = FALSE))
                 if (op == "@") {
                     if (!isS4(x) || !is.character(key)) return(list(ok = FALSE))
-                    return(list(ok = TRUE, value = attr(x, key, exact = TRUE)))
+                    # A slot is an attribute; methods stores a NULL slot as
+                    # the symbol `\001NULL\001`. No attribute (an absent
+                    # slot, or `.Data`, which isn't one) isn't resolved here.
+                    v <- attr(x, key, exact = TRUE)
+                    if (is.null(v)) return(list(ok = FALSE))
+                    if (identical(v, as.name("\001NULL\001"))) v <- NULL
+                    return(list(ok = TRUE, value = v))
                 }
                 cls <- ocls(x)
                 if (typeof(x) == "environment" && is.character(key) && (is.null(cls) || "R6" %in% cls)) {
