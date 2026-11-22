@@ -300,13 +300,20 @@ pub(crate) fn display_fs_path(path: &Path, root: &Path) -> String {
 }
 
 /// A Windows verbatim path in the form a file URI converts back to: `C:\work`
-/// for `\\?\C:\work` and `\\server\share` for `\\?\UNC\server\share`.
+/// for `\\?\C:\work` and `\\server\share` for `\\?\UNC\Server\share`.
 /// `None` for any other path, including every Unix path. Works on the text
 /// so it is testable on every platform.
 fn without_verbatim_prefix(path: &str) -> Option<String> {
     let rest = path.strip_prefix(r"\\?\")?;
     if let Some(unc) = rest.strip_prefix(r"UNC\") {
-        return Some(format!(r"\\{unc}"));
+        // A file URI's host is lowercase.
+        let (server, share) = unc.split_once('\\').unwrap_or((unc, ""));
+        let server = server.to_ascii_lowercase();
+        return Some(if share.is_empty() {
+            format!(r"\\{server}")
+        } else {
+            format!(r"\\{server}\{share}")
+        });
     }
     let bytes = rest.as_bytes();
     let is_disk = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
@@ -1311,7 +1318,7 @@ mod tests {
             Some(r"C:\work")
         );
         assert_eq!(
-            without_verbatim_prefix(r"\\?\UNC\server\share\work").as_deref(),
+            without_verbatim_prefix(r"\\?\UNC\Server\share\work").as_deref(),
             Some(r"\\server\share\work")
         );
         assert_eq!(without_verbatim_prefix(r"C:\work"), None);
@@ -1329,8 +1336,8 @@ mod tests {
         assert_eq!(display_path(&uri, root), "R/a.R");
         let root_uri = Url::from_file_path(r"C:\work").unwrap();
         assert_eq!(display_path(&root_uri, root), ".");
-        let unc_root = Path::new(r"\\?\UNC\server\share\work");
-        let unc = Url::from_file_path(r"\\server\share\work\a.R").unwrap();
+        let unc_root = Path::new(r"\\?\UNC\Server\share\work");
+        let unc = Url::from_file_path(r"\\Server\share\work\a.R").unwrap();
         assert_eq!(display_path(&unc, unc_root), "a.R");
         // A real workspace: canonicalize gives the verbatim form.
         let tmp = TempDir::new().unwrap();

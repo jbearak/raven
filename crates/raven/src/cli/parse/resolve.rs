@@ -450,7 +450,10 @@ impl LiteralBindings {
                 bindings.assignment(node, function, points);
             }
             let function = match node.kind() {
-                "function_definition" => Some(node.start_byte()),
+                "function_definition" => {
+                    bindings.parameters(node, points);
+                    Some(node.start_byte())
+                }
                 _ => function,
             };
             let mut cursor = node.walk();
@@ -493,6 +496,23 @@ impl LiteralBindings {
             }
             (false, true) => {
                 self.other_anywhere.insert(name);
+            }
+        }
+    }
+
+    /// A parameter's value comes from the caller, so a literal assigned to
+    /// it in its function doesn't make it a non-function.
+    fn parameters(&mut self, function: TsNode<'_>, points: &ScopePoints<'_>) {
+        let text = points.text.as_ref();
+        let Some(parameters) = function.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if let Some(name) = parameter.child_by_field_name("name") {
+                let name = &text[name.byte_range()];
+                self.other
+                    .insert((Some(function.start_byte()), name.to_string()));
             }
         }
     }
@@ -587,6 +607,10 @@ struct FileResolver<'w> {
     /// Whether the name being resolved is called (a call's function or an
     /// operator), so a literal binding is passed over; set by `resolve`.
     calling: bool,
+    /// Whether `resolve` passed over this file's own global binding of the
+    /// name: the file overwrote the global environment's binding, so no
+    /// caller's earlier binding of it survives (see `caller_view`).
+    global_overwritten: std::cell::Cell<bool>,
     /// The earliest lending call site of each distinct caller, sorted by
     /// printed path.
     callers: Vec<(Url, u32, u32)>,
@@ -702,6 +726,7 @@ impl<'w> FileResolver<'w> {
             other_points: RefCell::new(HashMap::new()),
             literal_bindings: RefCell::new(HashMap::new()),
             calling: false,
+            global_overwritten: std::cell::Cell::new(false),
             callers,
             hidden_callers,
             caller_scopes: HashMap::new(),
@@ -822,8 +847,15 @@ impl<'w> FileResolver<'w> {
     ) -> Option<Resolution> {
         let name = query.name.as_str();
         self.calling = !query.value;
+        self.global_overwritten.set(false);
         let uri = &self.names.uri;
-        let found = stream.symbol_with_layer_skipping(name, &|symbol| self.passes_over(symbol));
+        let found = stream.symbol_with_layer_skipping(name, &|symbol, layer| {
+            let skip = self.passes_over(symbol);
+            if skip && layer == ScopeLayer::Global {
+                self.global_overwritten.set(true);
+            }
+            skip
+        });
         let found = found.filter(|(symbol, layer)| {
             // As the undefined-variable collector: a same-file binding made
             // later is no binding here, unless R binds it late: a global read
@@ -1187,7 +1219,11 @@ impl<'w> FileResolver<'w> {
         let bound = scope
             .symbols
             .get(name)
-            .filter(|symbol| symbol.source_uri != names.uri && !self.passes_over(symbol))
+            .filter(|symbol| {
+                symbol.source_uri != names.uri
+                    && !self.global_overwritten.get()
+                    && !self.passes_over(symbol)
+            })
             .cloned();
         if let Some(symbol) = bound.as_ref().filter(|symbol| !is_default_attached(symbol)) {
             self.caller_scopes.insert((index, late), scope);

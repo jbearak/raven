@@ -585,6 +585,7 @@ fn a_call_passes_over_a_literal_binding() {
             "(NULL) -> c\n",
             "c(1)\n",
             "source(\"child.R\")\n",
+            "p <- function(mean) { if (TRUE) mean <- 7; mean(1) }\n",
         )
         .as_bytes(),
     );
@@ -613,11 +614,28 @@ fn a_call_passes_over_a_literal_binding() {
     let value = identifiers(doc, "mean", 11);
     assert_eq!(value.len(), 1);
     assert!(value[0].get("resolution").is_none(), "{}", value[0]);
+    // A parameter's value comes from the caller, whatever its function assigns.
+    assert_eq!(
+        *resolution_of(doc, "mean", 15),
+        serde_json::json!({"kind": "local", "range": range(15, 32, 36)})
+    );
     // A caller's literal binding is passed over too.
     assert_eq!(
         *resolution_of(by_path(&docs, "child.R"), "mean", 0),
         package("base")
     );
+}
+
+/// A file's own literal binding overwrites the global environment's, so no
+/// caller's earlier function binding of the name survives it either.
+#[test]
+fn a_literal_binding_hides_the_callers_definitions() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "a.R", b"mean <- function(x) 99\nsource(\"c.R\")\n");
+    write(&ws, "b.R", b"source(\"c.R\")\n");
+    write(&ws, "c.R", b"# raven: sourced-by a.R\nmean <- 7\nmean(1)\n");
+    let docs = parse_isolated(&ws, &["c.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
 }
 
 /// The `target` range of top-level statement `index`'s assignment.

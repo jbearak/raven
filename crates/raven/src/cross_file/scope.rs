@@ -11673,7 +11673,7 @@ where
 
     /// [`Self::symbol_for`], with the layer that bound the name.
     pub(crate) fn symbol_with_layer(&mut self, name: &str) -> Option<(ScopedSymbol, ScopeLayer)> {
-        self.symbol_with_layer_skipping(name, &|_| false)
+        self.symbol_with_layer_skipping(name, &|_, _| false)
     }
 
     /// [`Self::symbol_with_layer`], passing over each frame binding `skip`
@@ -11684,7 +11684,7 @@ where
     pub(crate) fn symbol_with_layer_skipping(
         &mut self,
         name: &str,
-        skip: &dyn Fn(&ScopedSymbol) -> bool,
+        skip: &dyn Fn(&ScopedSymbol, ScopeLayer) -> bool,
     ) -> Option<(ScopedSymbol, ScopeLayer)> {
         self.ensure_r6_methods();
         if let Some(symbol) = self
@@ -11699,7 +11699,11 @@ where
         let mut removed = false;
         let instance_member = self.is_r6_member(name);
         for (_iv, frame) in self.function_stack.iter().rev() {
-            if let Some(sym) = frame.symbols.get(name).filter(|sym| !skip(sym)) {
+            if let Some(sym) = frame
+                .symbols
+                .get(name)
+                .filter(|sym| !skip(sym, ScopeLayer::Function))
+            {
                 return Some((sym.clone(), ScopeLayer::Function));
             }
             if let Some(symbol) = frame
@@ -11717,7 +11721,7 @@ where
         if !removed {
             let global = self.choose_global_frame();
             if let Some(sym) = global.symbols.get(name) {
-                if !skip(sym) {
+                if !skip(sym, ScopeLayer::Global) {
                     return Some((sym.clone(), ScopeLayer::Global));
                 }
                 removed = true;
@@ -11728,7 +11732,12 @@ where
         }
         if !removed {
             let prefix = self.choose_prefix();
-            if let Some(sym) = prefix.symbols.get(name).filter(|sym| !skip(sym)).cloned() {
+            if let Some(sym) = prefix
+                .symbols
+                .get(name)
+                .filter(|sym| !skip(sym, ScopeLayer::Prefix))
+                .cloned()
+            {
                 return Some((sym, ScopeLayer::Prefix));
             }
         }
