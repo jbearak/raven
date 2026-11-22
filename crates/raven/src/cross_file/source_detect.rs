@@ -1254,8 +1254,17 @@ fn visit_node_for_rm(
             && let Some(mut rm_call) = try_parse_rm_call(node, content)
         {
             rm_call.targets_global = rm_call_targets_global(node, content, capture_bindings);
+            // An explicit global spelling (`envir = globalenv()`) whose name
+            // may be rebound has an unknown destination, so it removes nothing
+            // Raven can place; only an omitted destination means this frame.
+            let unproven_global = !rm_call.targets_global
+                && node
+                    .child_by_field_name("arguments")
+                    .is_some_and(|arguments| {
+                        super::binding::arguments_explicitly_target_global(arguments, content)
+                    });
             // Only add if there are symbols to remove.
-            if !rm_call.symbols.is_empty() {
+            if !rm_call.symbols.is_empty() && !unproven_global {
                 rm_calls.push(FramedRmCall {
                     call: rm_call,
                     runtime_function_scope,

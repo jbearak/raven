@@ -336,8 +336,24 @@ print(kept)
 local({ shadow <- 2; rm(shadow, envir = globalenv()); print(shadow) })
 "#,
     );
+    // With `globalenv` rebound the destination is unknown: neither the
+    // block's binding nor the global one is removed.
+    write(
+        dir.path(),
+        "rebound.R",
+        r#"other <- new.env()
+globalenv <- function() other
+probe <- 1
+base::local({
+  probe <- 2
+  rm(probe, envir = globalenv())
+  print(probe)
+})
+print(probe)
+"#,
+    );
     assert_eq!(
-        undefined(dir.path(), &["gone", "gone_pos", "kept", "shadow"]),
+        undefined(dir.path(), &["gone", "gone_pos", "kept", "shadow", "probe"]),
         vec![row("main.R", 2, "gone"), row("main.R", 5, "gone_pos")]
     );
 }
