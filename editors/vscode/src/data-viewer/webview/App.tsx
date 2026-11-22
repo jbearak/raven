@@ -45,7 +45,7 @@ import {
     type ProfileUpdate,
     type ValueCounts,
 } from '../profile';
-import type { Cell } from '../wire-format';
+import { decodeNonFinite, type Cell } from '../wire-format';
 import { TileCache, tileGeometry } from './tile-cache';
 import { StatusLine, createRangeStore, createVersionStore } from './status-line';
 import { formatCell, type FormattedCell } from './cell-render';
@@ -1676,13 +1676,13 @@ export function App({
                     return;
                 case 'profiles':
                     if (m.panelGeneration !== panelGenerationRef.current) return;
-                    setProfiles(prev => applyProfileUpdates(prev, m.updates));
+                    setProfiles(prev => applyProfileUpdates(prev, decodeNonFinite(m.updates)));
                     return;
                 case 'valueCounts': {
                     if (m.panelGeneration !== panelGenerationRef.current) return;
                     const open = valueCountsRef.current;
                     if (!open || open.requestId !== m.requestId) return;
-                    setValueCounts({ ...open, result: m.result, error: m.result ? undefined : m.error ?? 'failed' });
+                    setValueCounts({ ...open, result: m.result && decodeNonFinite(m.result), error: m.result ? undefined : m.error ?? 'failed' });
                     return;
                 }
                 case 'cellDetail':

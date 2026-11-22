@@ -27,6 +27,7 @@ import {
     SortState,
     WebviewToExtension,
 } from './messages';
+import { encodeNonFinite } from './wire-format';
 import { composeEffectivePermutation } from './effective-permutation';
 import { isAbortError, isInterruption } from './abort';
 import { isNumericArrowType } from './histograms';
@@ -464,7 +465,7 @@ export class DataViewerPanel {
                 const msg: ExtensionToWebview = {
                     type: 'profiles',
                     panelGeneration: this.generation,
-                    updates,
+                    updates: encodeNonFinite(updates),
                 };
                 void this.webviewPanel.webview.postMessage(msg);
             },
@@ -1991,7 +1992,8 @@ export class DataViewerPanel {
                 const reply = (body: { result?: ValueCounts; error?: string }) => {
                     if (this.disposed || gen !== this.generation || reader !== this.reader) return;
                     const msg: ExtensionToWebview = {
-                        type: 'valueCounts', panelGeneration: gen, requestId: m.requestId, columnIndex: ci, ...body,
+                        type: 'valueCounts', panelGeneration: gen, requestId: m.requestId, columnIndex: ci,
+                        ...encodeNonFinite(body),
                     };
                     void this.webviewPanel.webview.postMessage(msg);
                 };

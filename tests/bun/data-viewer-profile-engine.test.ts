@@ -29,6 +29,7 @@ import {
     SpaceSaving,
 } from '../../editors/vscode/src/data-viewer/sketches';
 import { materializeSortKey } from '../../editors/vscode/src/data-viewer/sort';
+import { decodeNonFinite, encodeNonFinite } from '../../editors/vscode/src/data-viewer/wire-format';
 import { hash01, writeArrowFixture } from './_helpers/arrow-fixture-writer';
 import type { ColumnSpec } from './_helpers/arrow-fixture-writer';
 
@@ -318,6 +319,65 @@ describe('profile engine', () => {
         const err = await computeProfile(r, 0, { signal: ac.signal }).then(() => undefined, e => e);
         expect((err as Error)?.name).toBe('AbortError');
         await r.close();
+    });
+});
+
+describe('non-finite values', () => {
+    // Expected values are R's: quantile(type 7), mean and sd, na.rm = TRUE.
+    const cols: [string, (number | null)[], [number, number, number], number, number | undefined][] = [
+        ['neg', [-Infinity, 1, 2], [-Infinity, 1, 1.5], -Infinity, NaN],
+        ['pos', [1, 2, Infinity], [1.5, 2, Infinity], Infinity, NaN],
+        ['both', [-Infinity, Infinity, 1], [-Infinity, 1, Infinity], NaN, NaN],
+        ['nan', [NaN, 1, 2], [1.25, 1.5, 1.75], 1.5, Math.SQRT1_2],
+    ];
+    const path = fixture('non-finite', 3, [
+        ...cols.map(([name, v]) => ({ name, kind: 'dbl' as const, gen: (i: number) => v[i] })),
+        { name: 'allna', kind: 'dbl', gen: () => null },
+    ]);
+    const empty = fixture('non-finite-empty', 0, [{ name: 'x', kind: 'dbl', gen: () => null }]);
+    const viaJson = <T>(x: T): T => decodeNonFinite(JSON.parse(JSON.stringify(encodeNonFinite(x))));
+
+    test.each(cols.map((c, i) => [c[0], i] as const))('%s: quantiles, mean and sd as in R, with or without a sort key', async (_name, ci) => {
+        const [, , q, mean, sd] = cols[ci];
+        const r = await ArrowSliceReader.open(path);
+        const key = await materializeSortKey(r, ci, { labelsOn: true, formatOn: true, digits: 3 });
+        for (const opts of [{}, { sortKey: key }]) {
+            const { profile: p } = await computeProfile(r, ci, opts);
+            expect([p.quantiles!.p25, p.quantiles!.p50, p.quantiles!.p75]).toEqual(q);
+            expect(p.mean).toBe(mean);
+            if (Number.isNaN(sd!)) expect(p.sd).toBeNaN();
+            else expect(p.sd!).toBeCloseTo(sd!, 12);
+            // The JSON transport keeps every non-finite statistic.
+            expect(viaJson(p)).toEqual(p);
+        }
+        await r.close();
+    });
+
+    test('all-NA and empty columns have no quantiles, mean or sd', async () => {
+        for (const [file, ci] of [[path, 4], [empty, 0]] as const) {
+            const r = await ArrowSliceReader.open(file);
+            const { profile: p } = await computeProfile(r, ci);
+            expect(p.quantiles).toBeUndefined();
+            expect(p.mean).toBeUndefined();
+            expect(p.sd).toBeUndefined();
+            expect(viaJson(p)).toEqual(p);
+            await r.close();
+        }
+    });
+
+    test('value counts keep infinite values through the transport', async () => {
+        const r = await ArrowSliceReader.open(path);
+        const counts = await countValues(r, 2);
+        expect(viaJson(counts).entries.map(e => e.value).sort()).toEqual([-Infinity, 1, Infinity].sort());
+        await r.close();
+    });
+
+    test('quantileType7 interpolates like R near infinities', () => {
+        expect(quantileType7([-Infinity, 1, 2], 0.25)).toBe(-Infinity);
+        expect(quantileType7([1, 2, Infinity], 0.75)).toBe(Infinity);
+        expect(quantileType7([-Infinity, Infinity], 0.5)).toBeNaN();
+        expect(quantileType7([-Infinity, -Infinity, 1], 0.75)).toBe(-Infinity);
+        expect(quantileType7([Infinity, Infinity], 0.5)).toBe(Infinity);
     });
 });
 

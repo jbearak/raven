@@ -348,8 +348,16 @@ export function quantileType7(sorted: ArrayLike<number>, p: number): number {
     if (n === 0) return NaN;
     const h = (n - 1) * p;
     const lo = Math.floor(h);
-    const hi = Math.min(n - 1, lo + 1);
-    // Equal neighbours (including two infinities) need no interpolation.
-    if (sorted[lo] === sorted[hi]) return sorted[lo];
-    return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+    return interpolateType7(sorted[lo], sorted[Math.min(n - 1, lo + 1)], h - lo);
+}
+
+/** The type-7 step between neighbouring order statistics `a ≤ b` at
+ *  fraction `h`, in R's form `(1 - h) * a + h * b` (`stats::quantile`).
+ *  The form matters: `a + h * (b - a)` is NaN for `a = -Inf` (it adds
+ *  `-Inf` and `+Inf`) where R gives `-Inf`, and rounds differently.
+ *  Equal neighbours (two equal infinities included) and `h = 0` are
+ *  returned as they are, as in R. */
+export function interpolateType7(a: number, b: number, h: number): number {
+    if (a === b || h === 0) return a;
+    return (1 - h) * a + h * b;
 }
