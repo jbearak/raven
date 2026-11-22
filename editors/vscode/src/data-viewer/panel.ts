@@ -115,7 +115,8 @@ function workerEngineFactory(extensionUri: vscode.Uri, log: (line: string) => vo
 }
 
 function specKey(sort: SortState, filter: FilterState): string {
-    return JSON.stringify([sort.keys, sort.stringOrder ?? 'natural', filter.entries]);
+    // encodeNonFinite: JSON.stringify writes Inf, -Inf and NaN all as null.
+    return JSON.stringify(encodeNonFinite([sort.keys, sort.stringOrder ?? 'natural', filter.entries]));
 }
 
 function cloneSortState(sort: SortState): SortState {
@@ -2764,7 +2765,8 @@ function build_html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 }
 
 function sameJson(a: unknown, b: unknown): boolean {
-    return JSON.stringify(a) === JSON.stringify(b);
+    // encodeNonFinite: JSON.stringify writes Inf, -Inf and NaN all as null.
+    return JSON.stringify(encodeNonFinite(a)) === JSON.stringify(encodeNonFinite(b));
 }
 
 /** Whether sorting `column` goes through a string rank (so its order

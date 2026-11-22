@@ -1343,4 +1343,23 @@ describe('DataViewerPanel: non-finite filter values over JSON', () => {
         const applied = fakeWebview.posted.find(m => m.type === 'filterApplied' && m.requestId === 91) as any;
         expect(applied.nrowFiltered).toBe(0);
     });
+
+    test('editing y < Inf to y < -Inf refilters (cache keys keep the sign)', async () => {
+        const { encodeNonFiniteIfAny } = await import('../../editors/vscode/src/data-viewer/wire-format');
+        const { fakeWebview } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const apply = async (requestId: number, value: number) => {
+            fakeWebview.deliverFromWebview(json(encodeNonFiniteIfAny({
+                type: 'setFilters', panelGeneration: init.panelGeneration, requestId, labelsOn: true,
+                entries: [{ id: 'e1', columnIndex: 1, predicate: { kind: 'numCompare', op: '<', value }, enabled: true, includeMissing: false }],
+            })));
+            await flush();
+            return (fakeWebview.posted.find(m => m.type === 'filterApplied' && m.requestId === requestId) as any)?.nrowFiltered;
+        };
+        expect(await apply(92, Infinity)).toBe(2);
+        expect(await apply(93, -Infinity)).toBe(0);
+        expect(await apply(94, Infinity)).toBe(2);
+    });
 });
