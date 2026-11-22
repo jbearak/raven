@@ -134,11 +134,12 @@ async function create_tasks_terminal(): Promise<vscode.Terminal> {
     });
     if (launch.consoleSocket) register_console_terminal(terminal, launch.consoleSocket);
     // `resolve_program()` can yield for seconds (shell `which` validation,
-    // or a "Switch to R / Keep" dialog). If `raven.rTerminal.program`
-    // changed during that window, the config handler cleared
-    // `tasks_creation_in_flight`; don't cache this now-stale terminal —
-    // the next call should launch a fresh one with the updated program.
-    if (tasks_creation_in_flight !== null) {
+    // or a "Switch to R / Keep" dialog). If the program changed during that
+    // window, don't cache this now-stale terminal — the next call should
+    // launch a fresh one with the updated program. "Switch to R" itself
+    // changes the setting, so compare programs rather than relying on the
+    // config handler having cleared `tasks_creation_in_flight`.
+    if (program === terminal_program_now()) {
         tasks_terminal = terminal;
         tasks_program = program;
     }

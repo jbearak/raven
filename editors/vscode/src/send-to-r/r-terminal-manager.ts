@@ -151,6 +151,15 @@ export function terminal_program_of(terminal: vscode.Terminal): TerminalProgram 
     return managed_terminals.get(terminal);
 }
 
+// Perch terminals Raven opened whose session hasn't been reported yet: not
+// managed until then, but already named like one of Raven's consoles.
+const perch_terminals_starting = new WeakSet<vscode.Terminal>();
+
+/** Whether Raven opened `terminal` for an R console, including one still starting in Perch. */
+export function is_raven_console_terminal(terminal: vscode.Terminal): boolean {
+    return managed_terminals.has(terminal) || perch_terminals_starting.has(terminal);
+}
+
 /**
  * The program a terminal opened without asking would run, without prompting:
  * the effective target if it's a terminal program, else Raven's console.
@@ -638,6 +647,7 @@ function handle_terminal_opened(terminal: vscode.Terminal): void {
         // Its console socket is in the session directory, known once Perch
         // reports the session.
         const api = entry.perch;
+        perch_terminals_starting.add(terminal);
         const starting = api.waitForSession(id as string, terminal).then(
             (session) => adopt_perch_terminal(session, terminal, api),
             (err) => report_perch_start_failure(err),
@@ -985,6 +995,7 @@ async function open_perch_terminal(
     launch: { id: string; options: vscode.TerminalOptions },
 ): Promise<vscode.Terminal> {
     const terminal = vscode.window.createTerminal(launch.options);
+    perch_terminals_starting.add(terminal);
     const session = await api.waitForSession(launch.id, terminal);
     adopt_perch_terminal(session, terminal, api);
     return terminal;

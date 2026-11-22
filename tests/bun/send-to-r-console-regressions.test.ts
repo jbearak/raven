@@ -70,49 +70,50 @@ afterAll(() => {
 /** Waits for queued microtasks and timers to run. */
 const settle = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
+/** Mimics Perch's `prepareLaunch`: `env` becomes `--env NAME=VALUE` arguments. */
+function fake_perch_api(wait: () => Promise<void> = async () => undefined) {
+    const launches: { id: string; options: Record<string, unknown> }[] = [];
+    let n = 0;
+    const api = {
+        version: 1 as const,
+        available: async () => true,
+        prepareLaunch(o: { name: string; kind: string; command: string[]; env?: Record<string, string> }) {
+            const id = `sess${String(++n).padStart(4, '0')}`;
+            const args = ['new', '--id', id, '--name', o.name, '--kind', o.kind];
+            for (const [k, v] of Object.entries(o.env ?? {})) args.push('--env', `${k}=${v}`);
+            args.push('--', ...o.command);
+            const launch = { id, options: { name: o.name, shellPath: '/usr/bin/perch', shellArgs: args, isTransient: true } };
+            launches.push(launch);
+            return launch;
+        },
+        waitForSession: async (id: string) => (await wait(), {
+            id, name: 'R', kind: 'r', owner: 'jbearak.raven-r',
+            annotations: { 'raven.program': 'raven', 'raven.console': 'ipc' },
+            dir: path.join(storage, id), degraded: [], cwd: '/', host: 'h',
+            createdAt: new Date().toISOString(), state: 'running' as const,
+            attached: true, attachedHere: true,
+        }),
+        listSessions: async () => [],
+        terminals: () => [],
+        attach: async () => { throw new Error('unused'); },
+        send: async () => 'queued' as const,
+        onDidAttach: () => ({ dispose() {} }),
+        onDidEndSession: () => ({ dispose() {} }),
+    };
+    return { api, launches };
+}
+
+async function connect(api: unknown) {
+    await rtm._connect_perch_for_r_terminals_for_test({
+        host: () => ({ remote: true, reachable: true }),
+        get_extension: () => ({ isActive: true, exports: { getApi: () => api } }) as never,
+    });
+}
+
+
 // ---------------------------------------------------------------------------
 
 describe('Perch launches keep the session token off the command line', () => {
-    /** Mimics Perch's `prepareLaunch`: `env` becomes `--env NAME=VALUE` arguments. */
-    function fake_perch_api() {
-        const launches: { id: string; options: Record<string, unknown> }[] = [];
-        let n = 0;
-        const api = {
-            version: 1 as const,
-            available: async () => true,
-            prepareLaunch(o: { name: string; kind: string; command: string[]; env?: Record<string, string> }) {
-                const id = `sess${String(++n).padStart(4, '0')}`;
-                const args = ['new', '--id', id, '--name', o.name, '--kind', o.kind];
-                for (const [k, v] of Object.entries(o.env ?? {})) args.push('--env', `${k}=${v}`);
-                args.push('--', ...o.command);
-                const launch = { id, options: { name: o.name, shellPath: '/usr/bin/perch', shellArgs: args, isTransient: true } };
-                launches.push(launch);
-                return launch;
-            },
-            waitForSession: async (id: string) => ({
-                id, name: 'R', kind: 'r', owner: 'jbearak.raven-r',
-                annotations: { 'raven.program': 'raven', 'raven.console': 'ipc' },
-                dir: path.join(storage, id), degraded: [], cwd: '/', host: 'h',
-                createdAt: new Date().toISOString(), state: 'running' as const,
-                attached: true, attachedHere: true,
-            }),
-            listSessions: async () => [],
-            terminals: () => [],
-            attach: async () => { throw new Error('unused'); },
-            send: async () => 'queued' as const,
-            onDidAttach: () => ({ dispose() {} }),
-            onDidEndSession: () => ({ dispose() {} }),
-        };
-        return { api, launches };
-    }
-
-    async function connect(api: unknown) {
-        await rtm._connect_perch_for_r_terminals_for_test({
-            host: () => ({ remote: true, reachable: true }),
-            get_extension: () => ({ isActive: true, exports: { getApi: () => api } }) as never,
-        });
-    }
-
     function assert_token_only_in_env(options: Record<string, unknown>) {
         const argv = [String(options.shellPath), ...(options.shellArgs as string[])];
         expect(argv.join(' ')).not.toContain(TOKEN);
@@ -223,6 +224,26 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         expect(fake.errors.length).toBe(1);
     });
 
+    test("a Raven console still starting in Perch isn't vscode-R's", async () => {
+        install_vscode_r();
+        const theirs = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
+        let started!: () => void;
+        const { api } = fake_perch_api(() => new Promise<void>((r) => { started = r; }));
+        await connect(api);
+        const opening = rtm.get_or_create_terminal_for('raven');
+        await settle(10);
+        const ours = fake.window.terminals[1];
+        expect(ours.name).toBe('R');
+        await make_active(ours);
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+
+        expect(await send.send_to_r_console('v <- 5')).toBe(true);
+        expect(ours.typed).toEqual([]);
+        expect(theirs.typed).toEqual(['v <- 5']);
+        started();
+        await opening;
+    });
+
     test('leaves vscode-R alone when no Raven terminal is in its way', async () => {
         install_vscode_r();
         const theirs = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
@@ -262,6 +283,18 @@ describe('Switch to R after a missing program', () => {
         expect(fake.warnings.length).toBe(1);
         expect(fake.window.terminals.length).toBe(1);
         expect(fake.setting('raven.rTerminal.program', 'global')).toBe('R');
+    });
+
+    test('package tasks after switching a user setting reuse one terminal', async () => {
+        build.register_build_commands(context as never);
+        fake.set_setting('raven.rTerminal.program', 'global', 'radian');
+        rtm._set_validator_for_test(async () => false);
+        fake.state.answer_warning = (w) => (w.items.includes('Switch to R') ? 'Switch to R' : undefined);
+
+        const first = await build.get_or_create_tasks_terminal();
+        const second = await build.get_or_create_tasks_terminal();
+        expect(second).toBe(first);
+        expect(fake.window.terminals.length).toBe(1);
     });
 
     test('package tasks after the switch reuse one terminal', async () => {

@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { console_socket_of, type SendLocation } from './console-ipc';
 import { vscode_r_terminal_pick } from './console-choice';
 import { REDITORSUPPORT_EXTENSION_ID } from './console-picker';
-import { resolve_send_target, SendTarget, terminal_program_of } from './r-terminal-manager';
+import { is_raven_console_terminal, resolve_send_target, SendTarget } from './r-terminal-manager';
 import { get_send_options, send_code, type SendOptions } from './send-code';
 
 /**
@@ -26,7 +26,7 @@ export function with_send_queue<T>(fn: () => Promise<T>): Promise<T> {
 const ACTIVATE_TIMEOUT_MS = 1000;
 
 function is_raven_terminal(terminal: vscode.Terminal): boolean {
-    return terminal_program_of(terminal) !== undefined || console_socket_of(terminal) !== undefined;
+    return is_raven_console_terminal(terminal) || console_socket_of(terminal) !== undefined;
 }
 
 /** Shows `terminal` and waits (briefly) until VS Code reports it active. */
