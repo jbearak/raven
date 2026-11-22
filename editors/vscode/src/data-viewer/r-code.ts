@@ -29,6 +29,25 @@
  *     `stringr::str_rank(x, locale = "<ui language>", numeric = TRUE)`.
  *     Descending keys use `desc()`, `decreasing =`, or unary minus.
  *
+ *   - **Columns** are referenced by name only when the name is unique
+ *     and nonempty in the R object; otherwise by position (`dat[[3]]`),
+ *     since a name would read the first column with it. dplyr can't
+ *     filter or sort such a frame (nor touch `...`/`..1` names at all),
+ *     so that flavor refuses it. Every `[` in the base R flavor is one
+ *     `[.data.table` also reads as base R does (row indices, literal
+ *     column positions), so it reproduces the view on a data.table too;
+ *     the data.table flavor parenthesizes an `i` that is a lone symbol or
+ *     starts with `!` (calling-scope lookup, not-join).
+ *
+ * Text from the data (column names, values, labels) is never code: in
+ * comments it goes through `rComment()`,
+ * in code through `rString()` or `rName()`, which escape every line
+ * terminator, control and invisible format character. A name with no
+ * safe symbol spelling is read as `x[["name"]]` (or `.data[["name"]]`).
+ * The `View()` expression is the user's own R code: it is run again as
+ * the code's source (so `View(f(d))` calls `f()` again), and only its
+ * copy in the header comment goes through `rComment()`.
+ *
  * A filter or sort the generator can't express faithfully is left out
  * and named in a comment, never approximated silently.
  */
@@ -63,24 +82,87 @@ const RESERVED = new Set([
     'Inf', 'NaN', 'NA', 'NA_integer_', 'NA_real_', 'NA_character_', 'NA_complex_', 'in',
 ]);
 
-/** `name` as an R symbol, backticked when it isn't syntactic. */
+/**
+ * Characters that must never appear raw in the copied code: C0/C1
+ * controls and DEL; the line and paragraph separators (U+2028/9, which
+ * editors may turn into line breaks) and NEL (U+0085); and invisible
+ * format characters, bidi controls included, that can make text read
+ * differently from how it parses ("Trojan Source").
+ */
+const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'g');
+
+/** Thrown when data-derived text has no R spelling (NUL, which R strings
+ *  can't hold); the caller leaves the piece out with a "Not translated"
+ *  comment, or refuses the whole export. */
+class Unrepresentable extends Error {}
+
+function hex4(c: number): string {
+    return c.toString(16).padStart(4, '0');
+}
+
+/**
+ * Data-derived text (a column name, a value, the `View()` expression) as
+ * the body of a `#` comment: one line, nothing invisible. Every unsafe
+ * character, line terminators included, is written as a visible escape,
+ * so no part of it can end the comment and run as code.
+ */
+export function rComment(s: string): string {
+    return s.replace(UNSAFE_CHARS, ch => {
+        if (ch === '\n') return '\\n';
+        if (ch === '\r') return '\\r';
+        if (ch === '\t') return '\\t';
+        return '\\u' + hex4(ch.charCodeAt(0));
+    });
+}
+
+/** `name` is spelled as a bare or backticked R symbol. Backticks process
+ *  `\\`, `` \` `` and `\xNN` escapes but not `\u`, so a name holding an
+ *  unsafe non-ASCII character (or NUL) has no safe symbol spelling; nor
+ *  do `...` and `..1`, which stay the dots symbols even backticked. */
+export function rNameRepresentable(name: string): boolean {
+    if (name === '...' || /^\.\.[0-9]+$/.test(name)) return false;
+    for (const ch of name) {
+        const c = ch.charCodeAt(0);
+        if (c === 0) return false;
+        if (c >= 0x80 && UNSAFE_CHAR.test(ch)) return false;
+    }
+    return name !== '';
+}
+
+/** `name` as an R symbol, backticked when it isn't syntactic. Throws
+ *  `Unrepresentable` unless `rNameRepresentable(name)`; callers that may
+ *  see such names reach the column as `x[["name"]]` instead. */
 export function rName(name: string): string {
+    if (!rNameRepresentable(name)) throw new Unrepresentable(`column name ${rComment(name)}`);
     if (SYNTACTIC.test(name) && !RESERVED.has(name)) return name;
-    return '`' + name.replace(/\\/g, '\\\\').replace(/`/g, '\\`') + '`';
+    let out = '`';
+    for (const ch of name) {
+        const c = ch.charCodeAt(0);
+        if (ch === '\\') out += '\\\\';
+        else if (ch === '`') out += '\\`';
+        else if (c < 0x20 || c === 0x7f) out += '\\x' + c.toString(16).padStart(2, '0');
+        else out += ch;
+    }
+    return out + '`';
 }
 
 /** A double-quoted R string literal. Non-ASCII text stays literal (R
- *  reads UTF-8 source); control characters are escaped. */
+ *  reads UTF-8 source); control, separator and invisible format
+ *  characters are escaped (as `\uNNNN`). Throws `Unrepresentable` on NUL. */
 export function rString(s: string): string {
     let out = '"';
     for (const ch of s) {
         const c = ch.codePointAt(0)!;
+        if (c === 0) throw new Unrepresentable('a NUL character');
         if (ch === '\\') out += '\\\\';
         else if (ch === '"') out += '\\"';
         else if (ch === '\n') out += '\\n';
         else if (ch === '\r') out += '\\r';
         else if (ch === '\t') out += '\\t';
-        else if (c < 0x20 || c === 0x7f) out += '\\x' + c.toString(16).padStart(2, '0');
+        // `\u` for every other escape: R refuses a literal mixing `\x`
+        // and `\u` escapes.
+        else if (UNSAFE_CHAR.test(ch)) out += '\\u' + hex4(c);
         else out += ch;
     }
     return out + '"';
@@ -113,18 +195,71 @@ const LABEL_HELPER = [
 type Ctx = {
     flavor: CodeFlavor;
     input: CodeInput;
-    /** Name of the frame inside base R's `with()` (rownames lookup). */
+    /** The frame a column reference reads from: base R's frame inside
+     *  `with()` (row names, positional references), data.table's `dt` or
+     *  `out`. */
     frame: string;
     /** True once a rowname column is materialized as a real column. */
     rownamesAsColumn: boolean;
     needs: Set<'stringr' | 'stringi' | 'labelHelper' | 'tibble'>;
     skipped: string[];
+    /** Why the last untranslatable filter is left out, when known. */
+    skipReason?: string;
+    /** Names the R object (with a materialized row name column) has more
+     *  than once, or the empty name: a reference by name would read
+     *  another column, so these are reached by position. */
+    ambiguous: Set<string>;
 };
+
+/** Column `ci`'s 1-based position in the R object the code indexes:
+ *  row names count only once materialized as a column. */
+function columnPosition(ctx: Ctx, ci: number): number {
+    const { columns } = ctx.input;
+    let p = ci + 1;
+    if (!ctx.rownamesAsColumn) {
+        for (let j = 0; j < ci; j++) if (columns[j].isRowname) p--;
+    }
+    return p;
+}
+
+/** The names of the R object's columns, in order. */
+function objectNames(input: CodeInput, rownamesAsColumn: boolean, rownameName: string): string[] {
+    return input.columns
+        .filter(c => !c.isRowname || rownamesAsColumn)
+        .map(c => (c.isRowname ? rownameName : c.name));
+}
+
+function ambiguousNames(names: readonly string[]): Set<string> {
+    const counts = new Map<string, number>();
+    for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+    return new Set(names.filter(n => n === '' || counts.get(n)! > 1));
+}
 
 function colRef(ctx: Ctx, ci: number): string {
     const col = ctx.input.columns[ci];
     if (col.isRowname && !ctx.rownamesAsColumn) return `rownames(${ctx.frame})`;
-    return rName(col.name);
+    const name = col.isRowname ? rownameNameOf(ctx.input) : col.name;
+    if (ctx.ambiguous.has(name)) {
+        // dplyr refuses such frames up front (generateRCode).
+        return `${ctx.frame}[[${columnPosition(ctx, ci)}]]`;
+    }
+    if (!rNameRepresentable(name)) {
+        return ctx.flavor === 'dplyr' ? `.data[[${rString(name)}]]` : `${ctx.frame}[[${rString(name)}]]`;
+    }
+    return rName(name);
+}
+
+/** True when column `ci` is referenced by a bare (possibly backticked)
+ *  name, which data.table's unary minus needs for character keys. */
+function isBareRef(ctx: Ctx, ci: number): boolean {
+    const col = ctx.input.columns[ci];
+    if (col.isRowname && !ctx.rownamesAsColumn) return false;
+    const name = col.isRowname ? rownameNameOf(ctx.input) : col.name;
+    return !ctx.ambiguous.has(name) && rNameRepresentable(name);
+}
+
+function rownameNameOf(input: CodeInput): string {
+    return input.columns.find(c => c.isRowname)?.name ?? 'rowname';
 }
 
 /** A column's values for comparison: value-labelled vectors are
@@ -202,15 +337,19 @@ function predicateCode(
             const needle = p.caseSensitive ? p.value : p.value.toLowerCase();
             return { code: `${fn}(${hay}, ${rString(needle)})`, trueOnNA: false };
         }
-        case 'strRegex':
-            // Only patterns that mean the same in the viewer's JavaScript
-            // RegExp (no `u` flag) and in PCRE; anything else is left out
-            // with a "Not translated" comment rather than run differently.
-            if (!pcreCompatible(p.pattern)) return null;
+        case 'strRegex': {
+            // Translated only where R selects the same strings as the
+            // viewer's JavaScript RegExp; otherwise "Not translated".
+            const t = translateRegex(p.pattern, p.caseSensitive);
+            if ('reason' in t) {
+                ctx.skipReason = t.reason;
+                return null;
+            }
             return {
-                code: `grepl(${rString(p.pattern)}, ${str}, perl = TRUE${p.caseSensitive ? '' : ', ignore.case = TRUE'})`,
+                code: `grepl(${rString(t.pcre)}, ${str}, perl = TRUE${p.caseSensitive ? '' : ', ignore.case = TRUE'})`,
                 trueOnNA: false,
             };
+        }
         case 'dateCompare':
         case 'dateBetween':
         case 'dateNotBetween':
@@ -227,41 +366,308 @@ function predicateCode(
 }
 
 /**
- * Whether a JavaScript (non-Unicode-mode) regex pattern means the same in
- * PCRE (`grepl(perl = TRUE)`). Allows the common subset: literals, classes,
- * groups, alternation, quantifiers, anchors, and the escapes both engines
- * read alike. Rejects escapes the engines read differently (`\u0061` and
- * `\cX` are JS escapes but PCRE errors or differs; `\p`/`\k` are literal
- * letters in non-Unicode JS but properties/backrefs in PCRE; `\0` and other
- * octal forms), `[]`/`[^]` (empty/any class in JS, a PCRE error), and
- * POSIX bracket expressions such as `[[:alpha:]]` (PCRE-only).
+ * The viewer's regex filter (a JavaScript `RegExp` without the `u` flag,
+ * `i` when case-insensitive) as a PCRE pattern for `grepl(perl = TRUE)`
+ * that selects the same strings, or why there is none. The two engines
+ * read the shared syntax alike but differ in what some of it matches, so
+ * the pattern is rewritten where that is exact and refused where not:
+ *   - `.` excludes CR, LF, U+2028 and U+2029 in JS (PCRE: only LF), so it
+ *     becomes that class; `$` is the end of input in JS (PCRE: also
+ *     before a final LF), so it becomes `\z`; `\s`/`\S` cover Unicode
+ *     spaces in JS (PCRE: ASCII), so they become JS's set.
+ *   - JS matches UTF-16 code units, PCRE (in R's UTF-8 mode) code points,
+ *     so on a character outside the BMP (an emoji) the number of
+ *     characters an atom consumes differs. Atoms that can match a lone
+ *     surrogate (`.`, negated classes, `\S`, `\W`, `\D`) are allowed only
+ *     under `*`, or under one `+` outside any quantified group, where the
+ *     count can't change the outcome; a non-BMP character in the pattern,
+ *     or a class range across the surrogates, is refused.
+ *   - Case-insensitive matching folds a few characters in PCRE (Unicode
+ *     simple case folding) that JS's `toUpperCase` canonicalization keeps
+ *     apart, such as the Kelvin sign and `k` (`FOLD_GROUPS`). An atom
+ *     whose fold group is one of these is guarded so that, on those
+ *     characters only, it matches exactly what JS matches.
+ * Everything outside the shared subset (escapes the engines read
+ * differently, POSIX classes, inline flags, back-references, an invalid
+ * pattern) is refused.
  */
-export function pcreCompatible(pattern: string): boolean {
-    let inClass = false;
-    for (let i = 0; i < pattern.length; i++) {
+export function translateRegex(pattern: string, caseSensitive: boolean): { pcre: string } | { reason: string } {
+    const flags = caseSensitive ? '' : 'i';
+    try {
+        new RegExp(pattern, flags);
+    } catch {
+        return { reason: 'invalid pattern' };
+    }
+    const refuse = (reason: string) => ({ reason });
+    const nonBmp = 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R';
+    let out = '';
+    let plusCount = 0;
+    /** Per open group: does it hold a `+`-quantified any-unit atom? */
+    const groups: boolean[] = [];
+    let i = 0;
+    const n = pattern.length;
+    // PCRE compiles a bounded repeat of a group as that many copies, and
+    // R's build refuses a compiled pattern past 64 KiB. `sizes` estimates
+    // the expanded size per open group (translated text length, groups
+    // multiplied by their bound); past `MAX_EXPANDED` the pattern is
+    // refused.
+    const sizes: number[] = [0];
+    let last = { size: 0, group: false };
+    const grow = (k: number) => { sizes[sizes.length - 1] += k; };
+    /** Emit an atom, check the quantifier after it, and copy that. */
+    const atom = (pcre: string, anyUnit: boolean): string | null => {
+        const q = pattern[i];
+        if (anyUnit) {
+            if (q === '*') { /* zero minimum: safe */ }
+            else if (q === '+' && plusCount === 0) {
+                plusCount++;
+                if (groups.length > 0) groups[groups.length - 1] = true;
+            } else return nonBmp;
+        }
+        out += pcre;
+        // A class compiles to a 32-byte bitmap and more; count it high.
+        const size = pcre.length + CLASS_COST * (pcre.split('[').length - 1);
+        grow(size);
+        last = { size, group: pcre.startsWith('(') };
+        return null;
+    };
+    while (i < n) {
         const c = pattern[i];
+        const code = c.charCodeAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) return refuse(nonBmp);
         if (c === '\\') {
-            const next = pattern[i + 1];
-            if (next === undefined) return false;
-            if (!/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(next)) return false;
+            const e = pattern[i + 1];
+            if (e === undefined || !/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(e)) {
+                return refuse(`the escape \\${e ?? ''} means something else in R`);
+            }
+            i += 2;
+            let err: string | null;
+            if (e === 's') err = atom(`[${JS_SPACE}]`, false);
+            else if (e === 'S') err = atom(`[^${JS_SPACE}]`, true);
+            else err = atom(`\\${e}`, e === 'W' || e === 'D');
+            if (err) return refuse(err);
+            continue;
+        }
+        if (c === '[') {
+            const cls = readClass(pattern, i);
+            if ('reason' in cls) return refuse(cls.reason);
+            i = cls.end;
+            const err = atom(caseSensitive ? cls.pcre : foldGuard(cls.js, cls.inner, cls.pcre, false), cls.anyUnit);
+            if (err) return refuse(err);
+            continue;
+        }
+        if (c === '.') {
+            i++;
+            const err = atom(JS_DOT, true);
+            if (err) return refuse(err);
+            continue;
+        }
+        if (c === '$') { out += '\\z'; grow(2); last = { size: 0, group: false }; i++; continue; }
+        if (c === '(') {
+            const named = /^\(\?<([A-Za-z_$][\w$]*)>/.exec(pattern.slice(i));
+            const head = named ? named[0] : /^\((\?(:|=|!))?/.exec(pattern.slice(i))![0];
+            // Lookbehind: JS allows any width, R's PCRE only bounded ones.
+            if (head === '(' && pattern[i + 1] === '?') return refuse('this group syntax means something else in R');
+            // A named group's name may use `$` in JS only; back-references
+            // are refused, so it can be a plain group.
+            out += named ? '(?:' : head;
+            i += head.length;
+            groups.push(false);
+            sizes.push(0);
+            // PCRE2's default nesting limit is 250; translation adds up
+            // to two levels around an atom.
+            if (groups.length > MAX_DEPTH) return refuse('the pattern nests groups too deeply for R');
+            continue;
+        }
+        if (c === ')') {
+            out += c;
+            i++;
+            const inner = (sizes.length > 1 ? sizes.pop()! : 0) + 4;
+            grow(inner);
+            last = { size: inner, group: true };
+            const plusInside = groups.pop() ?? false;
+            if (plusInside && /[*+?{]/.test(pattern[i] ?? '')) return refuse(nonBmp);
+            if (plusInside && groups.length > 0) groups[groups.length - 1] = true;
+            continue;
+        }
+        if (c === '{') {
+            // PCRE caps repeat counts at 65535; JS has no cap.
+            const bound = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(i));
+            if (!bound) {
+                // A literal `{` in JS; PCRE2 10.43+ reads `{,2}` and
+                // `{ 2 }` as repeats, so it is escaped.
+                out += '\\{';
+                grow(2);
+                last = { size: 2, group: false };
+                i++;
+                continue;
+            }
+            if ([bound[1], bound[2]].some(b => b !== undefined && b !== '' && Number(b) > 65535)) {
+                return refuse('the repeat count is too large for R');
+            }
+            if (last.group) {
+                const copies = bound[2] === undefined ? Number(bound[1])
+                    : bound[2] === '' ? Number(bound[1]) + 1 : Math.max(Number(bound[1]), Number(bound[2]));
+                grow(last.size * Math.max(copies - 1, 0));
+                if (sizes.some(z => z > MAX_EXPANDED)) return refuse('the pattern is too large for R once its repeats are expanded');
+            }
+            out += c;
+            grow(1);
+            last = { size: 0, group: false };
             i++;
             continue;
         }
-        if (!inClass) {
-            if (c !== '[') continue;
-            inClass = true;
-            if (pattern[i + 1] === '^') i++;
-            // `[]` / `[^]`: an empty (or "any") class in JS, but in PCRE a
-            // leading `]` is a literal and the class runs on, or errors.
-            if (pattern[i + 1] === ']') return false;
+        if ('*+?|^}'.includes(c)) {
+            out += c;
+            grow(1);
+            last = { size: 0, group: false };
+            i++;
             continue;
         }
-        // POSIX classes and collating elements (`[[:alpha:]]`, `[[.a.]]`,
-        // `[[=a=]]`) exist in PCRE only; JS reads them as literal characters.
-        if (c === '[' && /[:.=]/.test(pattern[i + 1] ?? '')) return false;
-        if (c === ']') inClass = false;
+        // A literal character.
+        i++;
+        const lit = c === ']' ? '\\]' : c;
+        const err = atom(caseSensitive ? lit : foldGuard(`[${classBody(c)}]`, classBody(c), lit, true), false);
+        if (err) return refuse(err);
     }
-    return true;
+    if (sizes.some(z => z > MAX_EXPANDED)) return refuse('the pattern is too large for R once its repeats are expanded');
+    return { pcre: out };
+}
+
+/** Budget for `translateRegex`'s expanded-size estimate, well under the
+ *  64 KiB compiled-pattern limit (estimates count source characters). */
+const MAX_EXPANDED = 10_000;
+/** Deepest group nesting `translateRegex` accepts (PCRE2's limit is 250). */
+const MAX_DEPTH = 200;
+const NON_BMP = 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R';
+/** Extra estimated size per character class (see `MAX_EXPANDED`). */
+const CLASS_COST = 40;
+
+/** JS's `\s`, as the body of a PCRE class (non-ASCII spaces as literal
+ *  characters, so R compiles the pattern in UTF-8 mode). */
+const JS_SPACE = '\\t\\n\\x0b\\f\\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
+/** JS's `.` (without the `s` flag). */
+const JS_DOT = '[^\\n\\r\u2028\u2029]';
+
+/** Case-fold groups (BMP) where PCRE's caseless matching (Unicode simple
+ *  case folding) joins characters that JS's non-Unicode `i` (each
+ *  character's `toUpperCase()`, unless that is several characters or
+ *  turns non-ASCII into ASCII) keeps apart. Generated by comparing
+ *  `/x/iu` with `/x/i` over the BMP; the round trip tests check it
+ *  against R. */
+const FOLD_GROUPS: readonly string[] = [
+    'Kk\u212a', 'Ss\u017f', '\u00c5\u00e5\u212b', '\u00df\u1e9e', '\u0398\u03b8\u03d1\u03f4',
+    '\u03a9\u03c9\u2126',
+    ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1f80 + k, 0x1f88 + k)),
+    ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1f90 + k, 0x1f98 + k)),
+    ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1fa0 + k, 0x1fa8 + k)),
+    '\u1fb3\u1fbc', '\u1fc3\u1fcc', '\u1ff3\u1ffc',
+];
+
+function classBody(chars: string): string {
+    return Array.from(chars, ch => (/[\\\]^-]/.test(ch) ? '\\' + ch : ch)).join('');
+}
+
+/**
+ * A caseless atom that matches, on the characters of `FOLD_GROUPS`,
+ * exactly what JS matches. `js` is the atom as a JS class (a literal `x`
+ * as `[x]`), `inner` the JS class body of its positive members.
+ * When no member is in a fold group the atom is unchanged: PCRE and JS
+ * then agree on every input. Otherwise inputs in the touched groups are
+ * matched case-sensitively against the set JS would accept, and other
+ * inputs go to the atom as before.
+ */
+function foldGuard(js: string, inner: string, pcre: string, literal: boolean): string {
+    const innerRx = new RegExp(`^[${inner}]$`);
+    const touched = FOLD_GROUPS.filter(g => Array.from(g).some(ch => innerRx.test(ch))).join('');
+    if (touched === '') return pcre;
+    const jsRx = new RegExp(`^${js}$`, 'i');
+    const accepted = Array.from(touched).filter(ch => jsRx.test(ch)).join('');
+    const rejected = Array.from(touched).filter(ch => !accepted.includes(ch)).join('');
+    if (literal) {
+        // A literal: PCRE accepts its whole group, JS a subset.
+        return rejected === '' ? pcre : `(?:(?!(?-i:[${classBody(rejected)}]))${pcre})`;
+    }
+    const guard = `(?-i:[${classBody(touched)}])`;
+    return accepted === ''
+        ? `(?:(?!${guard})${pcre})`
+        : `(?:(?=${guard})(?-i:[${classBody(accepted)}])|(?!${guard})${pcre})`;
+}
+
+/** A bracket class at `start`: its PCRE spelling, its JS spelling, its
+ *  positive members (class body), the index after it, and whether it can
+ *  match a lone surrogate. */
+function readClass(p: string, start: number):
+    { pcre: string; js: string; inner: string; end: number; anyUnit: boolean } | { reason: string } {
+    let i = start + 1;
+    const negated = p[i] === '^';
+    if (negated) i++;
+    // `[]` / `[^]`: an empty (or "any") class in JS, but in PCRE a leading
+    // `]` is a literal and the class runs on.
+    if (p[i] === ']') return { reason: '`[]` means something else in R' };
+    let body = '';
+    let lastChar: number | null = null;
+    while (i < p.length && p[i] !== ']') {
+        const c = p[i];
+        const code = c.charCodeAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) {
+            return { reason: 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R' };
+        }
+        // POSIX classes and collating elements exist in PCRE only.
+        if (c === '[' && /[:.=]/.test(p[i + 1] ?? '')) return { reason: 'POSIX bracket expressions exist only in R' };
+        if (c === '\\') {
+            const e = p[i + 1];
+            if (e === undefined || !/[dDwWsbntrf.*+?()[\]{}|^$\\/\-]/.test(e)) {
+                return { reason: `the escape \\${e ?? ''} in a class means something else in R` };
+            }
+            const isSet = /[dDwWs]/.test(e);
+            // `[\d-z]`: a union with `-` in JS, an error in PCRE.
+            if (isSet && p[i + 2] === '-' && p[i + 3] !== ']') {
+                return { reason: 'a range next to a class escape means something else in R' };
+            }
+            body += e === 's' ? JS_SPACE : '\\' + e;
+            lastChar = isSet ? null : (({ n: 10, t: 9, r: 13, f: 12, b: 8 } as Record<string, number>)[e] ?? e.charCodeAt(0));
+            i += 2;
+            continue;
+        }
+        if (c === '-' && lastChar !== null && p[i + 1] !== undefined && p[i + 1] !== ']') {
+            const hiRaw = p[i + 1];
+            if (hiRaw === '\\') {
+                const e = p[i + 2];
+                if (e === undefined || /[dDwWsS]/.test(e)) return { reason: 'a range next to a class escape means something else in R' };
+                if (!/[bntrf.*+?()[\]{}|^$\\/\-]/.test(e)) return { reason: `the escape \\${e} in a class means something else in R` };
+                const hi = (({ n: 10, t: 9, r: 13, f: 12, b: 8 } as Record<string, number>)[e] ?? e.charCodeAt(0));
+                if (lastChar <= 0xdfff && hi >= 0xd800) return { reason: NON_BMP };
+                body += '-\\' + e;
+                i += 3;
+            } else {
+                const hi = hiRaw.charCodeAt(0);
+                if (hi >= 0xd800 && hi <= 0xdfff) {
+                    return { reason: 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R' };
+                }
+                if (lastChar <= 0xdfff && hi >= 0xd800) return { reason: NON_BMP };
+                body += '-' + (hiRaw === ']' ? '\\]' : hiRaw);
+                i += 2;
+            }
+            lastChar = null;
+            continue;
+        }
+        body += c;
+        lastChar = code;
+        i++;
+    }
+    if (p[i] !== ']') return { reason: 'invalid pattern' };
+    const js = p.slice(start, i + 1);
+    const jsInner = p.slice(start + 1 + (negated ? 1 : 0), i);
+    return {
+        pcre: `[${negated ? '^' : ''}${body}]`,
+        js,
+        inner: jsInner,
+        end: i + 1,
+        // A range across the surrogates holds both halves of every emoji
+        // in JS but no emoji in R; it is refused above.
+        anyUnit: negated,
+    };
 }
 
 /** `<x> %in% c(...)` for a set filter, routed as `filter.ts` routes it. */
@@ -342,7 +748,13 @@ function dateCode(
 
 /** One entry's full condition, missing-value semantics included. */
 function entryCode(ctx: Ctx, entry: FilterEntry, labelsOn: boolean): string | null {
-    const pred = predicateCode(ctx, entry, labelsOn);
+    let pred: ReturnType<typeof predicateCode>;
+    try {
+        pred = predicateCode(ctx, entry, labelsOn);
+    } catch (e) {
+        if (e instanceof Unrepresentable) return null;
+        throw e;
+    }
     if (!pred) return null;
     const kind = entry.predicate.kind;
     if (kind === 'isEmpty' || kind === 'isNotEmpty') return pred.code;
@@ -406,7 +818,7 @@ function sortTerms(ctx: Ctx): SortTerm[] {
                 break;
             }
         }
-        const bare = text === colRef(ctx, key.columnIndex) && !(col.isRowname && !ctx.rownamesAsColumn);
+        const bare = text === colRef(ctx, key.columnIndex) && isBareRef(ctx, key.columnIndex);
         if (order === 'natural') {
             ctx.needs.add('stringr');
             terms.push({
@@ -466,27 +878,27 @@ function balancedCall(e: string): boolean {
     return false;
 }
 
-/** Hidden columns that exist in the R object, as names or (with
- *  duplicates or empty names) 1-based positions. */
+/** Hidden columns that exist in the R object, as names (when every one
+ *  is unique and nonempty) or 1-based positions. */
 function hiddenSelection(ctx: Ctx): { names?: string[]; positions?: number[] } {
     const { columns, hiddenColumns } = ctx.input;
     const hidden = [...new Set(hiddenColumns)]
         .filter(ci => columns[ci] && (!columns[ci].isRowname || ctx.rownamesAsColumn))
         .sort((a, b) => a - b);
     if (hidden.length === 0) return {};
-    const counts = new Map<string, number>();
-    for (const c of columns) counts.set(c.name, (counts.get(c.name) ?? 0) + 1);
-    if (hidden.every(ci => columns[ci].name !== '' && counts.get(columns[ci].name) === 1)) {
-        return { names: hidden.map(ci => columns[ci].name) };
-    }
-    const position = (ci: number): number => {
-        let p = ci + 1;
-        if (!ctx.rownamesAsColumn) {
-            for (let j = 0; j < ci; j++) if (columns[j].isRowname) p--;
-        }
-        return p;
-    };
-    return { positions: hidden.map(position) };
+    const positions = hidden.map(ci => columnPosition(ctx, ci));
+    const names = hidden.map(ci => (columns[ci].isRowname ? rownameNameOf(ctx.input) : columns[ci].name));
+    if (names.every(n => !ctx.ambiguous.has(n) && rNameRepresentable(n))) return { names, positions };
+    return { positions };
+}
+
+/** data.table's `i`: a lone symbol is looked up in the calling scope and
+ *  a leading `!` means a not-join, so either is parenthesized to make it
+ *  a plain logical index. */
+function dataTableI(conditions: readonly string[]): string {
+    const i = conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
+    const symbol = /^(?:[A-Za-z.][A-Za-z0-9._]*|`(?:[^`\\]|\\.)*`)$/.test(i);
+    return symbol || i.startsWith('!') ? `(${i})` : i;
 }
 
 function header(ctx: Ctx, extra: string[]): string[] {
@@ -496,14 +908,15 @@ function header(ctx: Ctx, extra: string[]): string[] {
     if (ctx.needs.has('tibble')) req.push('tibble');
     if (ctx.needs.has('stringr')) req.push('stringr >= 1.5.0 (str_rank)');
     if (ctx.needs.has('stringi')) req.push('stringi (a .locale other than "C")');
-    const lines = [`# ${ctx.input.expression.split('\n')[0]} as shown in Raven's data viewer`];
+    const firstLine = ctx.input.expression.trim().split(/\r\n|\r|\n/)[0];
+    const lines = [`# ${rComment(firstLine)} as shown in Raven's data viewer`];
     if (req.length > 0) lines.push(`# Requires ${req.join(', ')}`);
     const order = ctx.input.sort.stringOrder ?? 'natural';
     if (ctx.input.sort.keys.length > 0 && order !== 'c' && (ctx.needs.has('stringr') || ctx.needs.has('stringi'))) {
         lines.push('# String order uses ICU collation, as the viewer does; R and VS Code can ship',
             '# different ICU versions, which may order rare characters differently.');
     }
-    for (const s of ctx.skipped) lines.push(`# Not translated: ${s}`);
+    for (const s of ctx.skipped) lines.push(`# Not translated: ${rComment(s)}`);
     lines.push(...extra);
     if (ctx.needs.has('labelHelper')) lines.push('', ...LABEL_HELPER);
     return lines;
@@ -511,6 +924,17 @@ function header(ctx: Ctx, extra: string[]): string[] {
 
 /** The R code for the current view, or why there is none. */
 export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult {
+    try {
+        return generate(input, flavor);
+    } catch (e) {
+        if (e instanceof Unrepresentable) {
+            return { error: `Copy as R code can't write ${e.message} as R code.` };
+        }
+        throw e;
+    }
+}
+
+function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
     const kind = input.sourceKind ?? 'data.frame';
     if (kind !== 'data.frame' && kind !== 'matrix') {
         return { error: `Copy as R code works for data frames and matrices; this view shows a ${kind}.` };
@@ -523,34 +947,74 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
         ...entries.map(e => e.columnIndex),
         ...input.sort.keys.map(k => k.columnIndex),
     ].some(ci => input.columns[ci]?.isRowname);
+    const rownamesAsColumn = usesRownames && flavor !== 'base';
+    const rownameName = rownameNameOf(input);
+    const ambiguous = ambiguousNames(objectNames(input, rownamesAsColumn, rownameName));
+    if (flavor === 'dplyr') {
+        // dplyr's data mask refuses duplicate and empty names in filter()
+        // and arrange(), and dots names (`...`, `..1`) in every verb.
+        const names = objectNames(input, rownamesAsColumn, rownameName);
+        const dots = names.filter(n => n === '...' || /^\.\.[0-9]+$/.test(n));
+        const hiddenSet = new Set(input.hiddenColumns);
+        const kept = ambiguousNames(objectNames(
+            { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName));
+        const refused = [...new Set([
+            ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
+            // select() itself refuses duplicates it leaves behind.
+            ...(input.hiddenColumns.length > 0 ? kept : []),
+            ...(entries.length > 0 || input.sort.keys.length > 0 || input.hiddenColumns.length > 0 ? dots : []),
+        ])];
+        if (refused.length > 0) {
+            const list = refused.map(n => (n === '' ? 'an empty name' : `"${rComment(n)}"`)).join(', ');
+            return {
+                error: `dplyr can't work with this data frame's column names (${list}: duplicate, empty, `
+                    + 'or `...`/`..1`); copy the base R or data.table code instead.',
+            };
+        }
+    }
+    const src0 = kind === 'matrix' ? `as.data.frame(${input.expression.trim()})` : input.expression.trim();
+    // The code's own bindings (`dat`, `out`, `dt`) are read inside
+    // `with()` and data.table's `[`, where a column of the same name would
+    // shadow them, so each avoids the object's column names.
+    const taken = new Set(objectNames(input, rownamesAsColumn, rownameName));
+    const fresh = (base: string): string => {
+        let name = base;
+        for (let k = 1; taken.has(name); k++) name = `${base}_${k}`;
+        return name;
+    };
+    const DAT = fresh('dat');
+    const OUT = fresh('out');
+    const DT = fresh('dt');
+    // Base R names the frame for rownames() and positional references: the
+    // expression itself when it is a plain name no column shadows, else
+    // `dat`.
+    const simple = /^[A-Za-z.][\w.]*$/.test(src0) && !taken.has(src0);
     const ctx: Ctx = {
         flavor,
         input,
-        frame: 'dat',
-        rownamesAsColumn: usesRownames && flavor !== 'base',
+        frame: flavor === 'data.table' ? DT : flavor === 'base' && simple ? src0 : DAT,
+        rownamesAsColumn,
         needs: new Set(),
         skipped: [],
+        ambiguous,
     };
-    const src0 = kind === 'matrix' ? `as.data.frame(${input.expression.trim()})` : input.expression.trim();
-    // Base R names the frame for rownames(): the expression itself when
-    // it is a plain name, else `dat`.
-    const simple = /^[A-Za-z.][\w.]*$/.test(src0);
-    if (flavor === 'base' && simple) ctx.frame = src0;
-    const rownameName = input.columns.find(c => c.isRowname)?.name ?? 'rowname';
 
     const labelsOn = input.filter.labelsOnWhenFiltered;
     const conditions: string[] = [];
     for (const e of entries) {
+        ctx.skipReason = undefined;
         const code = entryCode(ctx, e, labelsOn);
         if (code === null) {
-            ctx.skipped.push(`filter on ${input.columns[e.columnIndex].name} (${e.predicate.kind})`);
+            const why = ctx.skipReason ? `: ${ctx.skipReason}` : '';
+            ctx.skipped.push(`filter on ${input.columns[e.columnIndex].name} (${e.predicate.kind}${why})`);
         } else {
             conditions.push(code);
         }
     }
+    // Sort keys read the filtered frame (base R and data.table).
+    if (conditions.length > 0 && flavor !== 'dplyr') ctx.frame = OUT;
     const terms = sortTerms(ctx);
     const hidden = hiddenSelection(ctx);
-    const hiddenNames = hidden.names?.map(n => rName(n));
     const order = input.sort.stringOrder ?? 'natural';
 
     if (flavor === 'dplyr') {
@@ -570,7 +1034,7 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
             if (terms.some(t => t.character)) args.push(`.locale = ${rString(order === 'c' ? 'C' : input.locale)}`);
             body.push(`arrange(${args.join(', ')})`);
         }
-        if (hiddenNames) body.push(`select(-${rVector(hiddenNames)})`);
+        if (hidden.names) body.push(`select(-${rVector(hidden.names.map(rName))})`);
         else if (hidden.positions) body.push(`select(-${rVector(hidden.positions.map(String))})`);
         if (body.length === 0) head = src0;
         const lines = header(ctx, ['', 'library(dplyr)', '']);
@@ -580,62 +1044,67 @@ export function generateRCode(input: CodeInput, flavor: CodeFlavor): CodeResult 
 
     if (flavor === 'data.table') {
         const setup = ctx.rownamesAsColumn
-            ? `dt <- as.data.table(${src0}, keep.rownames = ${rString(rownameName)})`
-            : `dt <- as.data.table(${src0})`;
+            ? `${DT} <- as.data.table(${src0}, keep.rownames = ${rString(rownameName)})`
+            : `${DT} <- as.data.table(${src0})`;
         const steps: string[] = [setup];
-        let out = 'dt';
+        let out = DT;
         if (conditions.length > 0) {
-            steps.push(`out <- dt[${conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ')}]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${DT}[${dataTableI(conditions)}]`);
+            out = OUT;
         }
         if (terms.length > 0) {
             const args = terms.map(t => (t.desc ? `-${t.expr}` : t.expr));
-            steps.push(`out <- ${out}[order(${args.join(', ')})]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${out}[order(${args.join(', ')})]`);
+            out = OUT;
         }
-        if (hiddenNames) {
-            steps.push(`out <- ${out}[, !${rVector(hidden.names!.map(rString))}]`);
-            out = 'out';
+        if (hidden.names) {
+            steps.push(`${OUT} <- ${out}[, !${rVector(hidden.names.map(rString))}]`);
+            out = OUT;
         } else if (hidden.positions) {
-            steps.push(`out <- ${out}[, -${rVector(hidden.positions.map(String))}]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${out}[, -${rVector(hidden.positions.map(String))}]`);
+            out = OUT;
         }
-        if (out === 'dt') steps.push('out <- dt');
+        if (out === DT) steps.push(`${OUT} <- ${DT}`);
         const lines = header(ctx, ['', 'library(data.table)', '']);
         lines.push(...steps);
         return { code: lines.join('\n') + '\n' };
     }
 
-    // Base R.
-    const dat = ctx.frame;
-    const conds = conditions;
+    // Base R. Every `[` here is one a data.table also reads as base R
+    // does (row indices with an empty `j`, literal column positions), so
+    // the code reproduces the view whatever the object's class.
+    const dat = simple ? src0 : DAT;
     const steps: string[] = [];
-    if (!simple) steps.push(`dat <- ${src0}`);
+    if (!simple) steps.push(`${DAT} <- ${src0}`);
     let out = dat;
-    if (conds.length > 0) {
-        const joined = conds.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
-        steps.push(`out <- ${dat}[which(with(${dat}, ${joined})), , drop = FALSE]`);
-        out = 'out';
+    if (conditions.length > 0) {
+        const joined = conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
+        steps.push(`${OUT} <- ${dat}[which(with(${dat}, ${joined})), , drop = FALSE]`);
+        out = OUT;
     }
     if (terms.length > 0) {
-        // Sort keys are evaluated in the filtered frame.
-        const sortTermsOut = sortTerms({ ...ctx, frame: out, skipped: [] });
-        const args = sortTermsOut.map(t => t.expr);
-        const decreasing = sortTermsOut.map(t => (t.desc ? 'TRUE' : 'FALSE'));
+        const args = terms.map(t => t.expr);
+        const decreasing = terms.map(t => (t.desc ? 'TRUE' : 'FALSE'));
         const dec = decreasing.every(d => d === 'FALSE') ? ''
             : decreasing.every(d => d === 'TRUE') ? ', decreasing = TRUE'
                 : `, decreasing = c(${decreasing.join(', ')})`;
-        steps.push(`out <- ${out}[with(${out}, order(${args.join(', ')}${dec}, method = "radix")), , drop = FALSE]`);
-        out = 'out';
+        steps.push(`${OUT} <- ${out}[with(${out}, order(${args.join(', ')}${dec}, method = "radix")), , drop = FALSE]`);
+        out = OUT;
     }
-    if (hidden.names) {
-        steps.push(`out <- ${out}[, setdiff(names(${out}), ${rVector(hidden.names.map(rString))}), drop = FALSE]`);
-        out = 'out';
-    } else if (hidden.positions) {
-        steps.push(`out <- ${out}[, -${rVector(hidden.positions.map(String))}, drop = FALSE]`);
-        out = 'out';
+    if (hidden.positions) {
+        // Literal positions: a computed `j` (`setdiff(names(out), ...)`)
+        // would be evaluated as an expression by `[.data.table`.
+        steps.push(`${OUT} <- ${out}[, -${rVector(hidden.positions.map(String))}, drop = FALSE]`);
+        out = OUT;
+        // `[.data.frame` makes kept duplicate (or empty) names unique;
+        // restore them as the view shows them.
+        const keptNames = objectNames(input, false, rownameName)
+            .filter((_, k) => !hidden.positions!.includes(k + 1));
+        if (ambiguousNames(keptNames).size > 0) {
+            steps.push(`${OUT} <- setNames(${OUT}, ${rVector(keptNames.map(rString))})`);
+        }
     }
-    if (out !== 'out') steps.push(`out <- ${out}`);
+    if (out !== OUT) steps.push(`${OUT} <- ${out}`);
     const lines = header(ctx, ['']);
     lines.push(...steps);
     return { code: lines.join('\n') + '\n' };
