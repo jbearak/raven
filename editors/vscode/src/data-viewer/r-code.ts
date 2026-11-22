@@ -15,7 +15,9 @@
  *     (negations). Set filters on factors and value-labelled character
  *     columns use labels when Labels was on at filter time and codes or
  *     values when it was off; labelled numeric columns always use codes.
- *     `numBetween` honors `upperInclusive`.
+ *     `numBetween` honors `upperInclusive`. On an integer64 column the
+ *     numeric predicates compare integer64 with integer64 (`int64Code`),
+ *     as the engine compares the exact integers.
  *   - **Sorts** (`sort.ts`): stable, NA last in both directions, NaN just
  *     before NA. dplyr and base R put NaN and NA together in original
  *     order, so a double key gains an `is.na(x) & !is.nan(x)` tie-break
@@ -54,7 +56,7 @@
 import type { ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState, SortState, StringOrder } from './messages';
 import { keyKind } from './sort';
-import { int64SetKey, isNumberLike } from './filter';
+import { int64Intervals, int64SetKey, isInt64Type, isNumberLike, numBoundValue, type IntInterval } from './filter';
 
 export type CodeFlavor = 'dplyr' | 'base' | 'data.table';
 
@@ -276,7 +278,7 @@ function valueRef(ctx: Ctx, ci: number): string {
 
 /** An Int64/UInt64 column: a `bit64::integer64` in R. */
 function isInt64(col: ColumnSchema): boolean {
-    return /^U?[Ii]nt64$/.test(col.arrowType);
+    return isInt64Type(col.arrowType);
 }
 
 function isFactor(col: ColumnSchema): boolean {
@@ -306,40 +308,29 @@ function predicateCode(
     const col = ctx.input.columns[entry.columnIndex];
     const x = valueRef(ctx, entry.columnIndex);
     const p: FilterPredicate = entry.predicate;
-    // The viewer compares an integer64 column as doubles (each value
-    // rounded to the nearest one); bit64 would instead truncate a
-    // fractional bound and turn an infinite one into NA. The method is
-    // called by name: plain as.double() reads the raw bits unless bit64
-    // happens to be loaded.
-    const num = isInt64(col) ? `bit64::as.double.integer64(${x})` : x;
-    if (isInt64(col) && /^num/.test(p.kind)) ctx.needs.add('bit64');
     const str = isFactor(col) ? `as.character(${x})` : x;
-    // A bound that isn't a number (an Inf saved as null) matches nothing
-    // in the viewer.
-    if ((p.kind === 'numCompare' && typeof p.value !== 'number')
-        || ((p.kind === 'numBetween' || p.kind === 'numNotBetween')
-            && (typeof p.lo !== 'number' || typeof p.hi !== 'number'))) {
-        return { code: 'FALSE', trueOnNA: false };
+    if (p.kind === 'numCompare' || p.kind === 'numBetween' || p.kind === 'numNotBetween') {
+        if (isInt64(col)) return { code: int64Code(ctx, entry.columnIndex, x, p), trueOnNA: false };
+        // A bound that isn't a number (an Inf saved as null) matches
+        // nothing in the viewer.
+        const bounds = p.kind === 'numCompare'
+            ? [numBoundValue(p.value)]
+            : [numBoundValue(p.lo), numBoundValue(p.hi)];
+        if (bounds.some(v => v === undefined)) return { code: 'FALSE', trueOnNA: false };
+        const [b0, b1] = bounds.map(v => rNumber(v!));
+        if (p.kind === 'numCompare') {
+            return { code: `${x} ${p.op === '=' ? '==' : p.op} ${b0}`, trueOnNA: false };
+        }
+        if (p.kind === 'numBetween') {
+            const hiIncl = p.upperInclusive ?? p.inclusive;
+            return { code: `${x} ${p.inclusive ? '>=' : '>'} ${b0} & ${x} ${hiIncl ? '<=' : '<'} ${b1}`, trueOnNA: false };
+        }
+        return { code: `(${x} ${p.inclusive ? '<' : '<='} ${b0} | ${x} ${p.inclusive ? '>' : '>='} ${b1})`, trueOnNA: false };
     }
     switch (p.kind) {
         case 'isEmpty': return { code: naCode(ctx, entry.columnIndex, x), trueOnNA: true };
         case 'isNotEmpty': return { code: `!${naCode(ctx, entry.columnIndex, x)}`, trueOnNA: false };
         case 'bool': return { code: p.value ? x : `!${x}`, trueOnNA: false };
-        case 'numCompare': {
-            const op = p.op === '=' ? '==' : p.op;
-            return { code: `${num} ${op} ${rNumber(p.value)}`, trueOnNA: false };
-        }
-        case 'numBetween': {
-            const hiIncl = p.upperInclusive ?? p.inclusive;
-            const lo = `${num} ${p.inclusive ? '>=' : '>'} ${rNumber(p.lo)}`;
-            const hi = `${num} ${hiIncl ? '<=' : '<'} ${rNumber(p.hi)}`;
-            return { code: `${lo} & ${hi}`, trueOnNA: false };
-        }
-        case 'numNotBetween': {
-            const lo = `${num} ${p.inclusive ? '<' : '<='} ${rNumber(p.lo)}`;
-            const hi = `${num} ${p.inclusive ? '>' : '>='} ${rNumber(p.hi)}`;
-            return { code: `(${lo} | ${hi})`, trueOnNA: false };
-        }
         case 'strCompare': {
             const op = p.op === '=' ? '==' : '!=';
             return p.caseSensitive
@@ -385,6 +376,55 @@ function predicateCode(
                 : { code: `!${set}`, trueOnNA: true };
         }
     }
+}
+
+/** bit64's largest magnitude: -2^63 is its NA, and `as.integer64()` turns
+ *  anything further out into NA. */
+const R_INT64_MAX = (1n << 63n) - 1n;
+
+/**
+ * A numeric predicate on an integer64 column, exact as the viewer
+ * evaluates it (`int64Intervals`): each bound becomes an integer64
+ * literal, so no side is rounded to double. A plain `x >= 2.5` would not
+ * do: bit64 truncates a fractional bound and turns an infinite one into
+ * NA, and a double literal can't hold every 64-bit integer. So the bound
+ * is moved to the integer that keeps the comparison's meaning
+ * (`x >= 2.5` ⇔ `x >= 3`), and a bound no integer64 can reach folds to
+ * "every non-missing row" or `FALSE`.
+ *
+ * The comparison operators dispatch to bit64 because evaluating the
+ * `bit64::as.integer64()` operand loads it first; bit64 doesn't export
+ * the methods to call by name.
+ */
+function int64Code(
+    ctx: Ctx, ci: number, x: string,
+    p: Extract<FilterPredicate, { kind: 'numCompare' | 'numBetween' | 'numNotBetween' }>,
+): string {
+    ctx.needs.add('bit64');
+    const lit = (v: bigint): string => `bit64::as.integer64(${rString(v.toString())})`;
+    const all = `!${naCode(ctx, ci, x)}`;
+    // Clamp to the values an integer64 can hold.
+    const parts: IntInterval[] = [];
+    for (const iv of int64Intervals(p)) {
+        if ((iv.lo !== undefined && iv.lo > R_INT64_MAX) || (iv.hi !== undefined && iv.hi < -R_INT64_MAX)) continue;
+        const lo = iv.lo !== undefined && iv.lo > -R_INT64_MAX ? iv.lo : undefined;
+        const hi = iv.hi !== undefined && iv.hi < R_INT64_MAX ? iv.hi : undefined;
+        if (lo === undefined && hi === undefined) return all;
+        parts.push({ lo, hi });
+    }
+    if (parts.length === 0) return 'FALSE';
+    // `x != v` reads better than the two rays around `v`.
+    if (parts.length === 2 && parts[0].lo === undefined && parts[1].hi === undefined
+        && parts[0].hi !== undefined && parts[1].lo !== undefined && parts[1].lo - parts[0].hi === 2n) {
+        return `${x} != ${lit(parts[0].hi + 1n)}`;
+    }
+    const one = ({ lo, hi }: IntInterval): string => {
+        if (lo !== undefined && hi !== undefined) {
+            return lo === hi ? `${x} == ${lit(lo)}` : `${x} >= ${lit(lo)} & ${x} <= ${lit(hi)}`;
+        }
+        return lo !== undefined ? `${x} >= ${lit(lo)}` : `${x} <= ${lit(hi!)}`;
+    };
+    return parts.length === 1 ? one(parts[0]) : `(${parts.map(one).join(' | ')})`;
 }
 
 /**

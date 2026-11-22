@@ -20,6 +20,13 @@
  *   - **Format independence**: digits / formatOn never affects the
  *     row index. Numeric predicates always match against the raw
  *     double.
+ *   - **Int64 / Uint64 are exact**: a numeric predicate on such a column
+ *     compares the stored integer with the bound's real value
+ *     ({@link int64Intervals}); a bound a double can't hold arrives as
+ *     decimal text (`NumBound`). Nothing is rounded to double, so
+ *     `= 2^53` does not keep 2^53 + 1. Histogram bins are assigned the
+ *     same way (`histograms.ts` `binIndex`), so a brush still filters to
+ *     the rows its bars count.
  *   - **NA / NaN semantics**: missing rows fail any predicate unless
  *     `includeMissing` is true on that entry, in which case the entry
  *     passes for missing rows regardless of predicate value. The two
@@ -40,7 +47,7 @@
  */
 
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
-import type { FilterEntry, FilterState } from './messages';
+import type { FilterEntry, FilterPredicate, FilterState } from './messages';
 import { iterateBatches } from './batch-iter';
 import { throwIfAborted, yieldToEventLoop } from './abort';
 
@@ -158,41 +165,50 @@ async function acceptorFor(
         return (i) => values[i] === want;
     }
 
-    // A bound that isn't a number (a `null` from a lossy transport) matches
-    // nothing; comparing with it would coerce it to 0.
-    if ((predicate.kind === 'numCompare' && typeof predicate.value !== 'number')
-        || ((predicate.kind === 'numBetween' || predicate.kind === 'numNotBetween')
-            && (typeof predicate.lo !== 'number' || typeof predicate.hi !== 'number'))) {
-        return () => false;
-    }
-    if (predicate.kind === 'numCompare') {
-        const values = await loadNumeric(reader, columnIndex, signal);
-        const v = predicate.value;
-        switch (predicate.op) {
-            case '=': return (i) => values[i] === v;
-            case '!=': return (i) => values[i] !== v;
-            case '<': return (i) => values[i] < v;
-            case '<=': return (i) => values[i] <= v;
-            case '>': return (i) => values[i] > v;
-            case '>=': return (i) => values[i] >= v;
+    if (predicate.kind === 'numCompare' || predicate.kind === 'numBetween' || predicate.kind === 'numNotBetween') {
+        if (isInt64Type(schema.arrowType)) {
+            // Exact: the column's integers against the bound's real value.
+            // As doubles, every integer past 2^53 rounds to a neighbour
+            // and `= 2^53` would keep 2^53 + 1 too.
+            const intervals = int64Intervals(predicate);
+            if (intervals.length === 0) return () => false;
+            const values = await loadInt64(reader, columnIndex, signal);
+            const [a, b] = intervals;
+            const inA = intervalTest(a);
+            if (!b) return (i) => inA(values[i]);
+            const inB = intervalTest(b);
+            return (i) => inA(values[i]) || inB(values[i]);
         }
-    }
-    if (predicate.kind === 'numBetween') {
+        // A bound that isn't a number (a `null` from a lossy transport)
+        // matches nothing; comparing with it would coerce it to 0.
+        const bounds = predicate.kind === 'numCompare'
+            ? [numBoundValue(predicate.value)]
+            : [numBoundValue(predicate.lo), numBoundValue(predicate.hi)];
+        if (bounds.some(b => b === undefined)) return () => false;
         const values = await loadNumeric(reader, columnIndex, signal);
-        const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
-        const hiIncl = predicate.upperInclusive ?? incl;
-        if (hiIncl !== incl) {
+        if (predicate.kind === 'numCompare') {
+            const v = bounds[0]!;
+            switch (predicate.op) {
+                case '=': return (i) => values[i] === v;
+                case '!=': return (i) => values[i] !== v;
+                case '<': return (i) => values[i] < v;
+                case '<=': return (i) => values[i] <= v;
+                case '>': return (i) => values[i] > v;
+                case '>=': return (i) => values[i] >= v;
+            }
+        }
+        const lo = bounds[0]!, hi = bounds[1]!, incl = predicate.inclusive;
+        if (predicate.kind === 'numBetween') {
+            const hiIncl = predicate.upperInclusive ?? incl;
+            if (hiIncl !== incl) {
+                return incl
+                    ? (i) => values[i] >= lo && values[i] < hi
+                    : (i) => values[i] > lo && values[i] <= hi;
+            }
             return incl
-                ? (i) => values[i] >= lo && values[i] < hi
-                : (i) => values[i] > lo && values[i] <= hi;
+                ? (i) => values[i] >= lo && values[i] <= hi
+                : (i) => values[i] > lo && values[i] < hi;
         }
-        return incl
-            ? (i) => values[i] >= lo && values[i] <= hi
-            : (i) => values[i] > lo && values[i] < hi;
-    }
-    if (predicate.kind === 'numNotBetween') {
-        const values = await loadNumeric(reader, columnIndex, signal);
-        const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
         return incl
             ? (i) => values[i] < lo || values[i] > hi
             : (i) => values[i] <= lo || values[i] >= hi;
@@ -335,7 +351,7 @@ async function acceptorFor(
         const t = schema.arrowType;
         const isNumericLabelled = !isFactor && hasValueLabels
             && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
-        if (isNumericLabelled && /^U?[Ii]nt64$/.test(t)) {
+        if (isNumericLabelled && isInt64Type(t)) {
             // Int64/UInt64: exact, on the decimal text (Value Counts counts
             // on the bigint and sends values a double can't hold as text).
             const want = new Set(predicate.values.map(int64SetKey).filter(k => k !== undefined));
@@ -367,6 +383,99 @@ async function acceptorFor(
 
     const _exhaustive: never = predicate;
     throw new Error(`filter: unhandled predicate ${(_exhaustive as { kind: string }).kind}`);
+}
+
+/** An Arrow Int64 / Uint64 column (a `bit64::integer64` in R). */
+export function isInt64Type(arrowType: string): boolean {
+    return /^U?[Ii]nt64$/.test(arrowType);
+}
+
+const INT_TEXT = /^[+-]?[0-9]+$/;
+
+/** A numeric bound as a double: the number itself, or numeric text read
+ *  as one. `undefined` when it is no number (a `null` from a lossy
+ *  transport, other text). */
+export function numBoundValue(b: unknown): number | undefined {
+    if (typeof b === 'number') return b;
+    if (typeof b !== 'string' || b.trim() === '') return undefined;
+    const n = Number(b);
+    return Number.isNaN(n) ? undefined : n;
+}
+
+/** A bound's exact floor and ceiling. Infinite bounds stay `±Infinity`;
+ *  `undefined` when the bound is no number, or NaN. */
+function boundFloorCeil(b: unknown): { floor: bigint | number; ceil: bigint | number } | undefined {
+    if (typeof b === 'string' && INT_TEXT.test(b.trim())) {
+        const v = BigInt(b.trim());
+        return { floor: v, ceil: v };
+    }
+    const n = numBoundValue(b);
+    if (n === undefined || Number.isNaN(n)) return undefined;
+    if (!Number.isFinite(n)) return { floor: n, ceil: n };
+    return { floor: BigInt(Math.floor(n)), ceil: BigInt(Math.ceil(n)) };
+}
+
+/** A set of integers `{ n : lo ≤ n ≤ hi }`; an absent side is unbounded. */
+export type IntInterval = { lo?: bigint; hi?: bigint };
+
+/** The integers `n` with `n op bound`, exactly, as a union of intervals
+ *  (`[]` ⇔ none). A fractional bound moves to the nearest integer that
+ *  keeps the comparison's meaning (`n >= 2.5` ⇔ `n >= 3`). */
+function compareIntervals(op: '=' | '!=' | '<' | '<=' | '>' | '>=', bound: unknown): IntInterval[] {
+    const fc = boundFloorCeil(bound);
+    if (!fc) return [];
+    const { floor, ceil } = fc;
+    const from = (x: bigint | number, shift: bigint): IntInterval[] =>
+        typeof x === 'bigint' ? [{ lo: x + shift }] : x > 0 ? [] : [{}];
+    const upTo = (x: bigint | number, shift: bigint): IntInterval[] =>
+        typeof x === 'bigint' ? [{ hi: x + shift }] : x > 0 ? [{}] : [];
+    switch (op) {
+        case '>=': return from(ceil, 0n);
+        case '>': return from(floor, 1n);
+        case '<=': return upTo(floor, 0n);
+        case '<': return upTo(ceil, -1n);
+        case '=': return typeof floor === 'bigint' && floor === ceil ? [{ lo: floor, hi: floor }] : [];
+        case '!=': return typeof floor === 'bigint' && floor === ceil
+            ? [{ hi: floor - 1n }, { lo: floor + 1n }] : [{}];
+    }
+}
+
+/**
+ * The integers a numeric predicate keeps, as a union of at most two
+ * inclusive intervals (`[]` ⇔ none). This is what `num*` filters mean on
+ * an Int64 / Uint64 column: the bound's real value against each stored
+ * integer, with no rounding to double on either side. Shared by the
+ * engine and by Copy as R code (`r-code.ts`), so the two agree.
+ *
+ * A bound that is no number (a `null` from a lossy transport, NaN)
+ * yields `[]` for every operator, `!=` included.
+ */
+export function int64Intervals(
+    p: Extract<FilterPredicate, { kind: 'numCompare' | 'numBetween' | 'numNotBetween' }>,
+): IntInterval[] {
+    if (p.kind === 'numCompare') return compareIntervals(p.op, p.value);
+    if (boundFloorCeil(p.lo) === undefined || boundFloorCeil(p.hi) === undefined) return [];
+    if (p.kind === 'numNotBetween') {
+        return [
+            ...compareIntervals(p.inclusive ? '<' : '<=', p.lo),
+            ...compareIntervals(p.inclusive ? '>' : '>=', p.hi),
+        ];
+    }
+    const hiIncl = p.upperInclusive ?? p.inclusive;
+    const [a] = compareIntervals(p.inclusive ? '>=' : '>', p.lo);
+    const [b] = compareIntervals(hiIncl ? '<=' : '<', p.hi);
+    if (!a || !b) return [];
+    // `a` is unbounded above and `b` below (or either is everything).
+    const lo = a.lo, hi = b.hi;
+    if (lo !== undefined && hi !== undefined && lo > hi) return [];
+    return [{ ...(lo !== undefined ? { lo } : {}), ...(hi !== undefined ? { hi } : {}) }];
+}
+
+function intervalTest({ lo, hi }: IntInterval): (v: bigint) => boolean {
+    if (lo !== undefined && hi !== undefined) return lo === hi ? (v) => v === lo : (v) => v >= lo && v <= hi;
+    if (lo !== undefined) return (v) => v >= lo;
+    if (hi !== undefined) return (v) => v <= hi;
+    return () => true;
 }
 
 /** A set-filter value as an Int64 column's decimal text, or undefined
@@ -480,12 +589,29 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
-            // bigint columns (Int64 / Uint64) lossily coerce to Number;
-            // values outside Number.MAX_SAFE_INTEGER lose precision. For
-            // filter predicates the loss is acceptable because the user
-            // typed a Number-domain `value` field; sort uses BigInt for
-            // exact ordering where precision matters.
+            // bigint values (timestamps; an Int64 / Uint64 set or date
+            // path) coerce to Number. Numeric predicates on Int64 /
+            // Uint64 columns don't come here: they compare the exact
+            // integers (`loadInt64`).
             out[start + r] = typeof v === 'bigint' ? Number(v) : (v as number);
+        }
+    }
+    return out;
+}
+
+/** An Int64 / Uint64 column's exact values (0n at missing rows, which
+ *  the caller's missing mask handles). */
+async function loadInt64(
+    reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal,
+): Promise<BigInt64Array | BigUint64Array> {
+    const unsigned = reader.schema.columns[columnIndex].arrowType.startsWith('U');
+    const out = unsigned ? new BigUint64Array(reader.nrow) : new BigInt64Array(reader.nrow);
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
+        const child = batch.getChildAt(columnIndex);
+        for (let r = 0; r < length; r++) {
+            const v = child.get(r);
+            if (v === null || v === undefined) continue;
+            out[start + r] = typeof v === 'bigint' ? v : BigInt(v as number);
         }
     }
     return out;

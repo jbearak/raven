@@ -10,7 +10,7 @@
  * means touching all three; the round-trip test in
  * tests/bun/data-viewer-filter-popover-seed.test.ts guards that.
  */
-import type { FilterPredicate } from '../messages';
+import type { FilterPredicate, NumBound } from '../messages';
 
 // ── Value-editor state shapes ───────────────────────────────────────────────
 
@@ -138,35 +138,51 @@ function effectiveSetValues(s: FormState, setUsesChecklist: boolean): (string | 
         .filter(Boolean);
 }
 
+/** A typed numeric bound, or null when it isn't a number. On an Int64 /
+ *  Uint64 column, an integer a double can't hold exactly stays decimal
+ *  text, so the filter compares the integer that was typed
+ *  (`9007199254740993`, not the 2^53 it would round to). */
+export function parseBound(text: string, int64 = false): NumBound | null {
+    const t = text.trim();
+    if (int64 && /^[+-]?[0-9]+$/.test(t)) {
+        const exact = BigInt(t);
+        const n = Number(t);
+        if (!Number.isFinite(n) || BigInt(n) !== exact) return exact.toString();
+    }
+    const v = parseFloat(text);
+    return isNaN(v) ? null : v;
+}
+
 /** Build the FilterPredicate from the form state, or null when the input is
  *  incomplete (empty value, unparseable number, regex error). `kind` is the
- *  kind-select option value; `setUsesChecklist` reflects the column kind. */
+ *  kind-select option value; `setUsesChecklist` reflects the column kind,
+ *  and `int64` says the column is Int64 / Uint64 (see {@link parseBound}). */
 export function buildPredicate(
     kind: string,
     s: FormState,
-    opts: { setUsesChecklist: boolean },
+    opts: { setUsesChecklist: boolean; int64?: boolean },
 ): FilterPredicate | null {
     switch (kind) {
         case 'isEmpty': return { kind: 'isEmpty' };
         case 'isNotEmpty': return { kind: 'isNotEmpty' };
         case 'numCompare': {
-            const v = parseFloat(s.numCompare.value);
-            if (isNaN(v)) return null;
+            const v = parseBound(s.numCompare.value, opts.int64);
+            if (v === null) return null;
             return { kind: 'numCompare', op: s.numCompare.op, value: v };
         }
         case 'numBetween': {
-            const lo = parseFloat(s.numBetween.lo);
-            const hi = parseFloat(s.numBetween.hi);
-            if (isNaN(lo) || isNaN(hi)) return null;
+            const lo = parseBound(s.numBetween.lo, opts.int64);
+            const hi = parseBound(s.numBetween.hi, opts.int64);
+            if (lo === null || hi === null) return null;
             return {
                 kind: 'numBetween', lo, hi, inclusive: s.numBetween.inclusive,
                 ...(s.numBetween.upperInclusive !== undefined ? { upperInclusive: s.numBetween.upperInclusive } : {}),
             };
         }
         case 'numNotBetween': {
-            const lo = parseFloat(s.numBetween.lo);
-            const hi = parseFloat(s.numBetween.hi);
-            if (isNaN(lo) || isNaN(hi)) return null;
+            const lo = parseBound(s.numBetween.lo, opts.int64);
+            const hi = parseBound(s.numBetween.hi, opts.int64);
+            if (lo === null || hi === null) return null;
             return { kind: 'numNotBetween', lo, hi, inclusive: s.numBetween.inclusive };
         }
         case 'setIn': {

@@ -432,8 +432,9 @@ edgeSuite('Copy as R code round trip: logical columns and data.table objects (re
 
 // integer64: set values are decimal strings the double can't hold
 // (Value Counts counts on the bigint), so the code compares them as
-// integer64; comparisons and ranges round the column to double, as the
-// viewer does. `lab` carries integer64 value labels.
+// integer64; comparisons and ranges compare the exact integers too, in
+// the viewer and in the code (a bound past 2^53 is decimal text).
+// `lab` carries integer64 value labels.
 edgeSuite('Copy as R code round trip: integer64 (real R)',
     `df <- data.frame(id = 1:3)
 df$big <- bit64::as.integer64(c("9007199254740992", "9007199254740993", "9007199254740993"))
@@ -451,7 +452,20 @@ df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
         { name: 'big > 2^53', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 9007199254740992 } }] },
         { name: 'big = 2^53', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: 9007199254740992 } }] },
         { name: 'big between 2^53 and 2^53', filters: [{ ci: 1, p: { kind: 'numBetween', lo: 9007199254740992, hi: 9007199254740992, inclusive: true } }] },
+        { name: 'big = 2^53 + 1', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: '9007199254740993' } }] },
+        { name: 'big != 2^53 + 1', filters: [{ ci: 1, p: { kind: 'numCompare', op: '!=', value: '9007199254740993' } }] },
+        { name: 'big < 2^53 + 1', filters: [{ ci: 1, p: { kind: 'numCompare', op: '<', value: '9007199254740993' } }] },
+        { name: 'big between 2^53 + 1 and int64 max', filters: [{ ci: 1, p: { kind: 'numBetween', lo: '9007199254740993', hi: '9223372036854775807', inclusive: true } }] },
+        { name: 'big not between 2^53 + 1 and 2^53 + 1', filters: [{ ci: 1, p: { kind: 'numNotBetween', lo: '9007199254740993', hi: '9007199254740993', inclusive: true } }] },
+        { name: 'big in a bin [2^53, 2^53 + 2)', filters: [{ ci: 1, p: { kind: 'numBetween', lo: 9007199254740992, hi: 9007199254740994, inclusive: true, upperInclusive: false } }] },
+        { name: 'big >= -2^63 (below every integer64)', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>=', value: '-9223372036854775808' } }] },
+        { name: 'big > 1e30', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 1e30 } }] },
+        { name: 'labelled = odd code', filters: [{ ci: 3, p: { kind: 'numCompare', op: '=', value: '9007199254740993' } }] },
+        { name: 'labelled = even code', filters: [{ ci: 3, p: { kind: 'numCompare', op: '=', value: 9007199254740992 } }] },
         { name: 'small >= 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
+        { name: 'small != 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '!=', value: 2.5 } }] },
+        { name: 'small != 2.5 or missing', filters: [{ ci: 2, p: { kind: 'numCompare', op: '!=', value: 2.5 }, includeMissing: true }] },
+        { name: 'small > Inf or missing', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>', value: Infinity }, includeMissing: true }] },
         { name: 'small = 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '=', value: 2.5 } }] },
         { name: 'small < Inf', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
         { name: 'small not between 2.5 and 9', filters: [{ ci: 2, p: { kind: 'numNotBetween', lo: 2.5, hi: 9, inclusive: true } }] },
@@ -468,7 +482,8 @@ df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
     ]);
 
 // Comparisons alone, in a session where nothing has loaded bit64 yet:
-// plain as.double() would read an integer64's raw bits.
+// the operators dispatch to bit64 only once it is loaded, which
+// evaluating the `bit64::as.integer64()` operand does.
 // One R session per case: the first bit64 call loads it for the rest.
 const I64_FRAME = `df <- data.frame(id = 1:3)
 df$small <- bit64::as.integer64(c("2", "3", NA))`;
@@ -477,6 +492,11 @@ const I64_FRESH: EdgeCase[] = [
     { name: 'small not in 3', filters: [{ ci: 1, p: { kind: 'setNotIn', values: ['3'] } }] },
     { name: 'small > 2 or missing', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 2 }, includeMissing: true }] },
     { name: 'small is empty', filters: [{ ci: 1, p: { kind: 'isEmpty' } }] },
+    { name: 'small = 3', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: 3 } }] },
+    { name: 'small != 3', filters: [{ ci: 1, p: { kind: 'numCompare', op: '!=', value: 3 } }] },
+    { name: 'small between 3 and 9', filters: [{ ci: 1, p: { kind: 'numBetween', lo: 3, hi: 9, inclusive: true } }] },
+    { name: 'small not between 3 and 9', filters: [{ ci: 1, p: { kind: 'numNotBetween', lo: 3, hi: 9, inclusive: true } }] },
+    { name: 'small < Inf', filters: [{ ci: 1, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
 ];
 for (const c of I64_FRESH) {
     edgeSuite(`Copy as R code round trip: integer64 with bit64 not loaded, ${c.name} (real R)`, I64_FRAME, ['df'], [c]);

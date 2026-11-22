@@ -158,7 +158,7 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     const predicate = buildPredicate(
         selectedKind,
         { numCompare, numBetween, set: setSelected, str, strRegex, dateCompare, dateBetween, bool: boolVal, freeText },
-        { setUsesChecklist },
+        { setUsesChecklist, int64: /^U?[Ii]nt64$/.test(column.arrowType) },
     );
     const canApply = predicate !== null && !(selectedKind === 'strRegex' && strRegex.regexError);
 

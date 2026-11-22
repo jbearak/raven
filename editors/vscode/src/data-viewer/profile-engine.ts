@@ -54,7 +54,8 @@ import type { EncodedKey } from './radix';
 import { CLS_VALUE } from './radix';
 import { iterateBatches } from './batch-iter';
 import { throwIfAborted } from './abort';
-import { BIN_COUNT, binEdges, binIndex, binsFrom } from './histograms';
+import { BIN_COUNT, binEdges, binIndex, binsFrom, coveringDoubles } from './histograms';
+import { isInt64Type } from './filter';
 import { isNullAt } from './sort';
 import {
     BigIntCounter,
@@ -177,6 +178,10 @@ async function profileNumeric(
     let min = Infinity, max = -Infinity, fmin = Infinity, fmax = -Infinity;
     let rawMin: number | bigint | undefined, rawMax: number | bigint | undefined;
     let sum = 0;
+    // Int64 / Uint64: the histograms bin the exact integers, as the filter
+    // a brush builds compares them (`histograms.ts` `binIndex`).
+    const int64 = domain === 'number' && isInt64Type(col.arrowType);
+    let bmin: bigint | undefined, bmax: bigint | undefined;
 
     await scan(reader, columnIndex, opts, (child, length) => {
         const data = child.data[0];
@@ -199,6 +204,10 @@ async function profileNumeric(
                 sum += x;
                 if (x < fmin) fmin = x;
                 if (x > fmax) fmax = x;
+                if (int64 && typeof raw === 'bigint') {
+                    if (bmin === undefined || raw < bmin) bmin = raw;
+                    if (bmax === undefined || raw > bmax) bmax = raw;
+                }
             }
             reservoir.add(x);
             // On the exact integer: label keys of an integer64 are its
@@ -228,9 +237,10 @@ async function profileNumeric(
     if (finite > 0) {
         const m0 = sum / finite;
         let s1 = 0, s2 = 0;
-        const single = fmin === fmax;
-        const e20 = single ? undefined : binEdges(fmin, fmax, PROFILE_BINS);
-        const e50 = single ? undefined : binEdges(fmin, fmax, BIN_COUNT);
+        const [elo, ehi] = bmin !== undefined && bmax !== undefined ? coveringDoubles(bmin, bmax) : [fmin, fmax];
+        const single = elo === ehi;
+        const e20 = single ? undefined : binEdges(elo, ehi, PROFILE_BINS);
+        const e50 = single ? undefined : binEdges(elo, ehi, BIN_COUNT);
         const c20 = new Float64Array(PROFILE_BINS);
         const c50 = new Float64Array(BIN_COUNT);
         await scan(reader, columnIndex, opts, (child, length) => {
@@ -241,15 +251,17 @@ async function profileNumeric(
             const hasNulls = data.nullCount !== 0;
             for (let r = 0; r < length; r++) {
                 if (hasNulls && isNullAt(data, r)) continue;
-                let x: number = big ? Number(vals[off + r]) : vals[off + r];
+                const raw = vals[off + r];
+                let x: number = big ? Number(raw) : raw;
                 if (domain === 'day-ms') x = Math.floor(x / 86_400_000);
                 if (x !== x || x === Infinity || x === -Infinity) continue;
                 const d = x - m0;
                 s1 += d;
                 s2 += d * d;
                 if (e20) {
-                    c20[binIndex(x, e20)]++;
-                    c50[binIndex(x, e50!)]++;
+                    const at = int64 && typeof raw === 'bigint' ? raw : x;
+                    c20[binIndex(x, e20, at)]++;
+                    c50[binIndex(x, e50!, at)]++;
                 }
             }
         });
@@ -263,7 +275,7 @@ async function profileNumeric(
             histogram = binsFrom(e20, c20);
             histogram50 = binsFrom(e50!, c50);
         } else {
-            histogram = [{ lo: fmin, hi: fmax, count: finite }];
+            histogram = [{ lo: elo, hi: ehi, count: finite }];
             histogram50 = histogram;
         }
     } else if (posInf || negInf) {
