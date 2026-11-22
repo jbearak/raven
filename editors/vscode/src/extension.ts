@@ -129,17 +129,19 @@ function hasWordSeparatorsOverride(configValue: unknown): boolean {
 }
 
 function getServerPath(context: vscode.ExtensionContext): string {
+    const { configured, bundled } = getServerBinaries(context);
+    return configured ?? bundled;
+}
+
+/** `raven.server.path` if set, and the binary bundled with the extension. */
+function getServerBinaries(context: vscode.ExtensionContext): { configured: string | undefined; bundled: string } {
     const config = vscode.workspace.getConfiguration('raven');
     const configPath = config.get<string>('server.path');
-    
-    if (configPath) {
-        return configPath;
-    }
-
-    // Use bundled binary
-    const platform = process.platform;
-    const binaryName = platform === 'win32' ? 'raven.exe' : 'raven';
-    return path.join(context.extensionPath, 'bin', binaryName);
+    const binaryName = process.platform === 'win32' ? 'raven.exe' : 'raven';
+    return {
+        configured: configPath ? configPath : undefined,
+        bundled: path.join(context.extensionPath, 'bin', binaryName),
+    };
 }
 
 /**
@@ -449,7 +451,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         );
 
         // Register R terminal and send-to-R commands
-        register_r_terminal(context, plot_services, () => getServerPath(context));
+        register_r_terminal(context, plot_services, () => getServerBinaries(context));
         register_send_to_r_commands(context);
         register_debugger(context);
         register_inspection_commands(context);

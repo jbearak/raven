@@ -54,11 +54,15 @@ To skip the menu, set `raven.rTerminal.program`:
 
 A choice made for this session wins over the setting, so **Raven: Choose R Console** can switch consoles without changing your settings. arf and radian must be on your PATH. Raven's console needs only R itself.
 
+If the console `raven.rTerminal.program` names isn't on your PATH, Raven offers to switch to plain R. The switch lasts for the rest of the session. Raven also saves `R` in your user settings when the missing console came from there, but never changes a workspace setting.
+
 The terminals are named `R` for Raven's console, `R (plain)` for plain R, and `arf` and `radian` for those consoles. The [debugger](debugger.md) always uses Raven's console. It opens one if none is running, and doesn't change your choice.
 
 ### Send to vscode-R
 
 When you choose vscode-R, Raven hands the code to vscode-R's `r.runCommand`, which sends it to vscode-R's R terminal and opens one if needed. vscode-R's `r.bracketedPaste` setting decides how the code is typed in; Raven's `raven.sendToR.sendMethod` doesn't apply. From there vscode-R handles the code as if you'd sent it with its own commands: recent versions may ask where to run it (an Interactive session or an R terminal), and may wait for their session watcher to attach before sending.
+
+vscode-R sends to a terminal named `R` or `R Interactive`, and Raven's console is also named `R`. When vscode-R would pick one of Raven's terminals, Raven first brings vscode-R's own terminal forward, and has vscode-R open one if there is none. If that doesn't work, Raven sends nothing and says so. vscode-R doesn't report whether it ran the code, so after you cancel its question about where to run it, Raven still moves the cursor to the next line.
 
 Raven's plot viewer, data viewer, and debugger work only in terminals Raven opens. `plot()` and `View()` in vscode-R's terminal go to vscode-R's viewers. To have both extensions' `Cmd+Enter` behave the way you expect, see [Cmd+Enter next to vscode-R](coexistence.md#cmdenter-next-to-vscode-r).
 

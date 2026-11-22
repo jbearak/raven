@@ -72,6 +72,30 @@ export function terminal_name_for(program: TerminalProgram): string {
     }
 }
 
+/** Terminal names vscode-R treats as its own R terminals. */
+export const VSCODE_R_TERMINAL_NAMES: readonly string[] = ['R', 'R Interactive'];
+
+/**
+ * The terminal vscode-R's `r.runCommand` sends to, mirroring its selector
+ * (the same in vscode-R 2.8, 3.2 and 3.4): among live terminals whose name
+ * doesn't contain "deactivate", the active terminal if
+ * `r.alwaysUseActiveTerminal` is on; otherwise those named `R` or
+ * `R Interactive`, preferring the active one, else the newest. Undefined
+ * means vscode-R would open its own. Raven's console is also named `R`, so
+ * this can be a Raven terminal.
+ */
+export function vscode_r_terminal_pick<T extends { name: string; exitStatus?: unknown }>(
+    terminals: readonly T[],
+    active: T | undefined,
+    always_use_active: boolean,
+): T | undefined {
+    const live = terminals.filter((t) => t.exitStatus === undefined && !t.name.toLowerCase().includes('deactivate'));
+    if (always_use_active) return live.find((t) => t === active);
+    const named = live.filter((t) => VSCODE_R_TERMINAL_NAMES.includes(t.name));
+    if (named.length === 0) return undefined;
+    return active !== undefined && named.includes(active) ? active : named[named.length - 1];
+}
+
 /**
  * Shell command that prints the path `command -v` resolves for each
  * detectable program. Only `command -v`, `;` and `true`, so it runs the same

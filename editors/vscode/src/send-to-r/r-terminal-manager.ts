@@ -60,6 +60,7 @@ import {
     session_console_socket,
     session_program,
 } from './perch-sessions';
+import { console_binary, ServerBinaries } from './console-binary';
 
 /**
  * Raven-managed R terminals and which console sends go to.
@@ -81,7 +82,9 @@ const PROFILE_ID = 'raven.rTerminal';
 const PENDING_TTL_MS = 30_000;
 
 let plot_services: PlotServices | null = null;
-let server_path_getter: (() => string) | null = null;
+let server_binaries_getter: (() => ServerBinaries) | null = null;
+// Configured server binaries already reported as lacking `console`.
+const console_fallback_reported = new Set<string>();
 let extension_context: vscode.ExtensionContext | null = null;
 // Cache the in-flight (or completed) write promise rather than a "done" flag,
 // so concurrent first calls in one activation share a single write instead of
@@ -301,17 +304,35 @@ export type RTerminalLaunch = {
 };
 
 /**
- * Launch spec for `program` (a `resolve_program()` result). Raven's console is
- * the bundled server binary's `console` subcommand; it finds R itself and
- * falls back to plain R if it can't embed it, so it needs no PATH check.
+ * The binary that runs Raven's console, or undefined before activation. A
+ * configured `raven.server.path` without the `console` subcommand (an older
+ * Raven) is skipped for the bundled binary, saying so once per path; see
+ * `console-binary.ts`.
  */
-export function build_r_terminal_launch(program: string): RTerminalLaunch {
-    if (program !== RAVEN_CONSOLE_PROGRAM || !server_path_getter) {
+async function resolve_console_binary(): Promise<string | undefined> {
+    if (!server_binaries_getter) return undefined;
+    return console_binary(server_binaries_getter(), (configured) => {
+        if (console_fallback_reported.has(configured)) return;
+        console_fallback_reported.add(configured);
+        void vscode.window.showWarningMessage(
+            `Raven: raven.server.path "${configured}" can't run Raven's R console (it has no \`console\` command; it may be an older Raven). The R console uses the binary bundled with the extension instead. Update raven.server.path or clear it to use the bundled binary everywhere.`,
+        );
+    });
+}
+
+/**
+ * Launch spec for `program` (a `resolve_program()` result). Raven's console is
+ * the server binary's `console` subcommand; it finds R itself and falls back
+ * to plain R if it can't embed it, so it needs no PATH check.
+ */
+export async function build_r_terminal_launch(program: string): Promise<RTerminalLaunch> {
+    const binary = program === RAVEN_CONSOLE_PROGRAM ? await resolve_console_binary() : undefined;
+    if (binary === undefined) {
         return { shellPath: program, shellArgs: R_ARGS };
     }
     const socket = make_console_socket_path();
     return {
-        shellPath: server_path_getter(),
+        shellPath: binary,
         shellArgs: console_args(socket, (s) => s),
         consoleSocket: socket,
     };
@@ -345,32 +366,48 @@ function console_args(socket: string, literal: (s: string) => string): string[] 
  * listens in the session directory (`{dir}/ipc`, DAP at `{dir}/d`); every
  * other argument is escaped so Perch passes it literally.
  */
-export function build_perch_r_command(program: TerminalProgram): { command: string[]; console_socket: boolean } {
-    if (program !== RAVEN_CONSOLE_PROGRAM || !server_path_getter) {
+export async function build_perch_r_command(program: TerminalProgram): Promise<{ command: string[]; console_socket: boolean }> {
+    const binary = program === RAVEN_CONSOLE_PROGRAM ? await resolve_console_binary() : undefined;
+    if (binary === undefined) {
         return { command: [escape_perch_text(program), ...R_ARGS], console_socket: false };
     }
     return {
-        command: [escape_perch_text(server_path_getter()), ...console_args(PERCH_CONSOLE_SOCKET, escape_perch_text)],
+        command: [escape_perch_text(binary), ...console_args(PERCH_CONSOLE_SOCKET, escape_perch_text)],
         console_socket: true,
     };
 }
 
-/** Describes a Perch session for `program`, remembering it as started here. */
-function prepare_perch_launch(
+/**
+ * Describes a Perch session for `program`, remembering it as started here.
+ *
+ * Invariant: the session-server token never reaches a command line. Perch
+ * turns `env` into `perch new --env NAME=VALUE` arguments, which any user on
+ * the host can list, so the token goes in the terminal's own environment
+ * instead: `perch new` passes its whole environment to the program (Perch
+ * `docs/cli.md`, "The program gets the environment of `perch new`"). The
+ * other plot variables aren't secret and stay in `env`. A reattached or
+ * reconnected session keeps the environment it started with.
+ */
+async function prepare_perch_launch(
     api: PerchApiV1,
     program: TerminalProgram,
     plot_env: { env: RavenPlotEnv; sessionId: string } | null,
-): { id: string; options: vscode.TerminalOptions } {
-    const { command, console_socket } = build_perch_r_command(program);
+): Promise<{ id: string; options: vscode.TerminalOptions }> {
+    const { command, console_socket } = await build_perch_r_command(program);
+    const { RAVEN_SESSION_TOKEN: token, ...public_env } = plot_env?.env ?? {};
     const launch = api.prepareLaunch({
         name: terminal_name_for(program),
         kind: PERCH_R_KIND,
         command,
-        env: escape_perch_env(plot_env?.env),
+        env: plot_env ? escape_perch_env(public_env) : undefined,
         annotations: perch_annotations(program, console_socket),
     });
     launched_here.set(launch.id, { program, plot_session_id: plot_env?.sessionId });
-    return launch;
+    if (token === undefined) return launch;
+    return {
+        id: launch.id,
+        options: { ...launch.options, env: { ...launch.options.env, RAVEN_SESSION_TOKEN: token } },
+    };
 }
 
 const exec_async = promisify(exec);
@@ -470,8 +507,9 @@ export function _set_validator_for_test(
 // and we never re-spawn the shell. Otherwise we re-validate on every launch:
 // the user may have installed the program mid-session, and the next launch
 // should pick that up and persist. If validation still fails, we prompt at
-// most once per session — Switch-to-R updates the Global (== per-machine in
-// Remote-SSH) setting so the synced User default stays intact; Keep / dismiss
+// most once per session — Switch to R makes plain R the session choice and,
+// when the missing program is the user value, updates the Global (==
+// per-machine in Remote-SSH) setting (see `switch_to_plain_r`); Keep / dismiss
 // proceeds with the configured value and VS Code surfaces any real launch
 // failure (e.g. for setups where terminal.integrated.env.* extends PATH only
 // inside the terminal).
@@ -499,13 +537,40 @@ async function validate_program(configured: TerminalProgram): Promise<TerminalPr
         KEEP,
     );
     if (choice === SWITCH) {
-        await vscode.workspace
-            .getConfiguration('raven.rTerminal')
-            .update('program', 'R', vscode.ConfigurationTarget.Global);
+        await switch_to_plain_r(configured);
         return 'R';
     }
     session_user_kept.add(configured);
     return configured;
+}
+
+/**
+ * "Switch to R" for a `missing` program from the setting. Plain R becomes the
+ * session choice, so later sends reuse the R terminal instead of prompting
+ * again and opening another one. The user setting is changed only when the
+ * missing program is the user (Global) value; when a workspace value names
+ * it, writing Global would change every other workspace and still lose to the
+ * workspace value, so the switch lasts for this session.
+ */
+async function switch_to_plain_r(missing: TerminalProgram): Promise<void> {
+    session_choice = 'R';
+    const config = vscode.workspace.getConfiguration('raven.rTerminal');
+    const inspected = config.inspect<string>('program');
+    const from_workspace = inspected?.workspaceFolderValue !== undefined || inspected?.workspaceValue !== undefined;
+    if (from_workspace || inspected?.globalValue !== missing) {
+        void vscode.window.showInformationMessage(
+            `Raven: using plain R instead of '${missing}' for the rest of this session; the workspace's raven.rTerminal.program setting is unchanged.`,
+        );
+        return;
+    }
+    try {
+        await config.update('program', 'R', vscode.ConfigurationTarget.Global);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        void vscode.window.showWarningMessage(
+            `Raven: couldn't save raven.rTerminal.program to your user settings (${message}). Raven uses plain R for this session.`,
+        );
+    }
 }
 
 /**
@@ -603,7 +668,13 @@ export function _handle_terminal_closed_for_test(terminal: vscode.Terminal): voi
 
 /** Test-only: where Raven's server binary is (activation sets it). */
 export function _set_server_path_for_test(get: (() => string) | null): void {
-    server_path_getter = get;
+    server_binaries_getter = get ? () => ({ configured: undefined, bundled: get() }) : null;
+}
+
+/** Test-only: the configured and bundled server binaries (activation sets them). */
+export function _set_server_binaries_for_test(get: (() => ServerBinaries) | null): void {
+    server_binaries_getter = get;
+    console_fallback_reported.clear();
 }
 
 function handle_terminal_closed(terminal: vscode.Terminal): void {
@@ -693,7 +764,7 @@ async function provide_r_terminal_profile(token: vscode.CancellationToken): Prom
     }
     const perch_profile = await profile_in_perch(program, plot_env);
     if (perch_profile) return perch_profile;
-    const launch = build_r_terminal_launch(program);
+    const launch = await build_r_terminal_launch(program);
     // VS Code opens this terminal itself; the id in its environment is
     // how `handle_terminal_opened` recognizes it.
     const id = crypto.randomUUID();
@@ -721,11 +792,11 @@ export function _provide_r_terminal_profile_for_test(): Promise<vscode.TerminalP
 export function register_r_terminal(
     context: vscode.ExtensionContext,
     services: PlotServices,
-    get_server_path: () => string,
+    get_server_binaries: () => ServerBinaries,
 ): void {
     extension_context = context;
     plot_services = services;
-    server_path_getter = get_server_path;
+    server_binaries_getter = get_server_binaries;
     const provider: vscode.TerminalProfileProvider = { provideTerminalProfile: provide_r_terminal_profile };
 
     start_perch(context, perch_handlers);
@@ -756,7 +827,7 @@ async function profile_in_perch(
     if (!api) return null;
     let launch: { id: string; options: vscode.TerminalOptions };
     try {
-        launch = prepare_perch_launch(api, program, plot_env);
+        launch = await prepare_perch_launch(api, program, plot_env);
     } catch (err) {
         console.warn('raven: Perch could not prepare a session; using an ordinary terminal:', err);
         return null;
@@ -895,7 +966,7 @@ async function create_perch_terminal(
 ): Promise<vscode.Terminal | undefined> {
     let launch: { id: string; options: vscode.TerminalOptions };
     try {
-        launch = prepare_perch_launch(api, program, plot_env);
+        launch = await prepare_perch_launch(api, program, plot_env);
     } catch (err) {
         console.warn('raven: Perch could not prepare a session; using an ordinary terminal:', err);
         return undefined;
@@ -937,7 +1008,7 @@ export async function new_console_in_perch(lookup_ms = PERCH_LAUNCHER_LOOKUP_MS)
     const plot_env = await get_plot_terminal_env();
     let launch: { id: string; options: vscode.TerminalOptions };
     try {
-        launch = prepare_perch_launch(api, program, plot_env);
+        launch = await prepare_perch_launch(api, program, plot_env);
     } catch (err) {
         throw new Error(`Perch couldn't start the R console (${err instanceof Error ? err.message : String(err)}).`);
     }
@@ -963,7 +1034,7 @@ async function create_r_terminal(target: TerminalProgram): Promise<vscode.Termin
     // is fresh (no objects/history) and the baked-in port/token env vars point
     // at a session server from the previous activation that no longer exists,
     // so plot/data-viewer integration silently posts to a dead server.
-    const launch = build_r_terminal_launch(program);
+    const launch = await build_r_terminal_launch(program);
     const terminal = vscode.window.createTerminal({
         name: terminal_name_for(program),
         shellPath: launch.shellPath,

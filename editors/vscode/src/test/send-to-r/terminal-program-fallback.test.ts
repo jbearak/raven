@@ -5,6 +5,8 @@ import {
     _clear_validation_state_for_test,
     _set_validator_for_test,
     _set_extension_context_for_test,
+    _reset_console_choice_for_test,
+    _session_choice_for_test,
 } from '../../send-to-r/r-terminal-manager';
 
 /**
@@ -63,6 +65,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         // Fresh hermetic context per test so persistence asserts cleanly.
         _set_extension_context_for_test(make_fake_context());
         await _clear_validation_state_for_test();
+        _reset_console_choice_for_test();
     });
 
     teardown(async () => {
@@ -71,6 +74,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         _set_validator_for_test(null);
         await _clear_validation_state_for_test();
         _set_extension_context_for_test(null);
+        _reset_console_choice_for_test();
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', original_program, vscode.ConfigurationTarget.Global);
@@ -118,6 +122,7 @@ suite('rTerminal.program shell-validated fallback', () => {
 
         const after = vscode.workspace.getConfiguration('raven.rTerminal').get<string>('program');
         assert.strictEqual(after, 'R');
+        assert.strictEqual(_session_choice_for_test(), 'R', 'later sends reuse plain R without asking again');
     });
 
     test('user picks Keep: subsequent launches re-validate but do not re-prompt', async () => {

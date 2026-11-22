@@ -197,6 +197,8 @@ This project-only setting overrides startup `R_BOX_PATH`, inferred project `.Rpr
 
 `raven.server.path` is the path to the `raven` binary the VS Code extension runs. It is empty by default, which uses the binary bundled with the extension.
 
+Raven's R console and the package-tasks terminal run this binary's `console` command. A binary from Raven 0.21 or older has no `console` command; Raven then says so once and runs the console from the bundled binary instead.
+
 ## Notes on individual settings
 
 The [Settings reference](settings-reference.md) gives a one-line description per key. These notes add what doesn't fit there.
