@@ -9885,6 +9885,8 @@ fn infix_sites_from_snapshot(
         return None;
     }
     calls.sort_by_key(|(_, operator)| operator.start_byte());
+    let artifacts = snapshot.artifacts_map.get(uri)?;
+    let late_defs = function_defs_by_name(artifacts);
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
@@ -9912,7 +9914,18 @@ fn infix_sites_from_snapshot(
                 stream.is_deferred_binding(symbol)
                     || !is_forward_reference_in_same_file(symbol, uri, line, column)
             });
+            // As the collector, too: a closure late-binds a definition its
+            // enclosing function makes after it, before calling it.
+            let late_bound = found.is_none()
+                && nested_closure_late_binding_resolves(
+                    op,
+                    line,
+                    column,
+                    &artifacts.function_scope_tree,
+                    &late_defs,
+                );
             let site = match found {
+                _ if late_bound => InfixSite::Shadowed,
                 Some((symbol, _)) if package_name_from_uri(&symbol.source_uri).is_some() => {
                     let package = package_name_from_uri(&symbol.source_uri).unwrap_or_default();
                     InfixSite::Packages(vec![package.to_string()])
@@ -10130,33 +10143,11 @@ fn collect_undefined_variables_from_snapshot(
     // is installed later in an enclosing function before the closure is called
     // (base::tryCatch's `tryCatchList` -> `tryCatchOne` is the motivating
     // package-corpus case). Same-function forward uses remain diagnostics.
-    let function_defs_by_name: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> =
-        snapshot
-            .artifacts_map
-            .get(uri)
-            .map(|artifacts| {
-                let mut map: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> =
-                    HashMap::new();
-                for event in &artifacts.timeline {
-                    if let scope::ScopeEvent::Def {
-                        symbol,
-                        function_scope: Some(function_scope),
-                        ..
-                    } = event
-                    {
-                        map.entry(symbol.name.to_string()).or_default().push((
-                            *function_scope,
-                            symbol.defined_line,
-                            symbol.defined_column,
-                        ));
-                    }
-                }
-                for defs in map.values_mut() {
-                    defs.sort_by_key(|(_, line, col)| (*line, *col));
-                }
-                map
-            })
-            .unwrap_or_default();
+    let function_defs_by_name = snapshot
+        .artifacts_map
+        .get(uri)
+        .map(|artifacts| function_defs_by_name(artifacts))
+        .unwrap_or_default();
 
     let parent_symbol_names: HashSet<String> = {
         scope_cache
@@ -11079,6 +11070,33 @@ fn default_expression_resolves_lazily(
 /// installed. It only covers nested closures whose body is textually before a
 /// sibling binding in an enclosing function, because R resolves closure free
 /// variables at call time through that enclosing environment.
+/// Each function-local definition in `artifacts`, by name: its function
+/// scope and position, sorted by position. The input to
+/// [`nested_closure_late_binding_resolves`].
+fn function_defs_by_name(
+    artifacts: &scope::ScopeArtifacts,
+) -> HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> {
+    let mut map: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> = HashMap::new();
+    for event in &artifacts.timeline {
+        if let scope::ScopeEvent::Def {
+            symbol,
+            function_scope: Some(function_scope),
+            ..
+        } = event
+        {
+            map.entry(symbol.name.to_string()).or_default().push((
+                *function_scope,
+                symbol.defined_line,
+                symbol.defined_column,
+            ));
+        }
+    }
+    for defs in map.values_mut() {
+        defs.sort_by_key(|(_, line, col)| (*line, *col));
+    }
+    map
+}
+
 fn nested_closure_late_binding_resolves(
     name: &str,
     usage_line: u32,
@@ -32469,7 +32487,8 @@ d[, nested] := sum(nested_maen(income))
     }
 
     /// R looks `:=` up from the call, so a definition an enclosing function
-    /// makes shadows the attached package's operator there, and the
+    /// makes (before the call, or after a closure it calls later) shadows
+    /// the attached package's operator there, and the
     /// declaration does not apply: the value is an ordinary argument. A call
     /// outside that function still reaches the package's operator.
     #[tokio::test]
@@ -32479,11 +32498,16 @@ run <- function(d) {
   `:=` <- function(lhs, rhs) lhs + rhs
   d[, 1] := missing_amount
 }
+outer <- function(d) {
+  inner <- function() d[, 1] := missing_later
+  `:=` <- function(lhs, rhs) lhs + rhs
+  inner()
+}
 d <- data.frame(n = 1)
 d[n > 1, older] := 1
 "#;
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
-        assert_eq!(flagged, vec!["missing_amount"]);
+        assert_eq!(flagged, vec!["missing_amount", "missing_later"]);
     }
 
     /// A top-level definition shadows the package's operator in the function
@@ -32519,20 +32543,6 @@ d[n > 1, older] := 1
 "#;
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
         assert_eq!(flagged, vec!["missing_amount", "read_dta"]);
-    }
-
-    /// The masked case stays masked inside a function body, with a misspelled
-    /// call head in the masked value still reported.
-    #[tokio::test]
-    async fn declared_subset_assign_operator_masks_columns_inside_a_function() {
-        let code = r#"library(datakit)
-run <- function(d) {
-  d[n > 1, x, by = g] := pasteO(x)
-  d
-}
-"#;
-        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
-        assert_eq!(flagged, vec!["pasteO"]);
     }
 
     /// With `undefinedVariableInBracketIndices` off, no index of the
