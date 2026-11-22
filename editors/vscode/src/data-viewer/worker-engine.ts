@@ -99,11 +99,22 @@ class ThreadClient {
         const w = new Worker(this.script, { workerData: this.init });
         this.worker = w;
         this.started = new Promise<void>((resolve, reject) => {
+            // A thread that dies before it opened its file must fail the
+            // start, or every caller (and the panel's message gate) waits
+            // forever.
+            const onEarlyExit = (code: number) => {
+                w.off('message', onMsg);
+                reject(new Error(`${this.name} thread exited (${code}) before it was ready`));
+            };
             const onMsg = (m: ThreadReply) => {
-                if (m.type === 'ready') { w.off('message', onMsg); resolve(); }
-                else if (m.type === 'openFailed') { w.off('message', onMsg); reject(new Error(m.error)); }
+                if (m.type !== 'ready' && m.type !== 'openFailed') return;
+                w.off('message', onMsg);
+                w.off('exit', onEarlyExit);
+                if (m.type === 'ready') resolve();
+                else reject(new Error(m.error));
             };
             w.on('message', onMsg);
+            w.once('exit', onEarlyExit);
         });
         this.started.catch(() => undefined);
         this.ready = this.started;
@@ -197,7 +208,8 @@ class ThreadClient {
 
     /** One-way message (no reply). */
     send(msg: Record<string, unknown>): void {
-        void this.ready.then(() => { if (!this.disposed) this.worker!.postMessage(msg); });
+        // A thread that never became ready drops the message (its start failed).
+        void this.ready.then(() => { if (!this.disposed) this.worker!.postMessage(msg); }, () => undefined);
     }
 
     /** Terminate (awaited), then restart; the waiting request `victim`

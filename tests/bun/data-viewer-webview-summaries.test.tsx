@@ -52,7 +52,9 @@ const canvasContext = new Proxy({
 
 const { App } = await import('../../editors/vscode/src/data-viewer/webview/App');
 const { ValueCountsPopover } = await import('../../editors/vscode/src/data-viewer/webview/value-counts-popover');
-const { setFilterFor, sidebarRows, profileStatLines } = await import('../../editors/vscode/src/data-viewer/webview/summary-model');
+const { setFilterFor, sidebarRows, profileStatLines, entryCell } = await import('../../editors/vscode/src/data-viewer/webview/summary-model');
+const { formatCell } = await import('../../editors/vscode/src/data-viewer/display-format');
+const { encodeNonFinite } = await import('../../editors/vscode/src/data-viewer/wire-format');
 
 /**
  * Phase 4 in the webview: profile interest (what the band and sidebar
@@ -221,6 +223,30 @@ describe('Columns sidebar', () => {
         expect(document.getElementById('columns-sidebar-row-1')!.getAttribute('aria-expanded')).toBe('true');
     });
 
+    test('a profile with infinite statistics survives the JSON transport and expands', async () => {
+        await renderApp();
+        await send(init());
+        openSidebar();
+        // c(-Inf, 1, 2): R gives p25 -Inf, mean -Inf, sd NaN.
+        const p = {
+            ...profile(0, 3, 0).profile, rows: 3, infinite: 1, min: { _: '-inf' }, max: 2,
+            mean: -Infinity, sd: NaN, quantiles: { p25: -Infinity, p50: 1, p75: 1.5, exact: true },
+        };
+        // What postMessage delivers: a JSON copy of the host's message.
+        await send(JSON.parse(JSON.stringify({
+            type: 'profiles', panelGeneration: 1, updates: encodeNonFinite([[0, { state: 'ready', profile: p }]]),
+        })));
+        const tree = document.querySelector('[role="tree"]') as HTMLElement;
+        await act(async () => { tree.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Home', bubbles: true })); });
+        await act(async () => { tree.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })); });
+        const row = document.getElementById('columns-sidebar-row-0')!;
+        expect(row.getAttribute('aria-expanded')).toBe('true');
+        const text = row.textContent ?? '';
+        expect(text).toContain('p25-Inf');
+        expect(text).toContain('mean-Inf');
+        expect(text).toContain('sdNaN');
+    });
+
     test('hidden columns stay listed with an unchecked box; Hide all / Show all', async () => {
         const { posted } = await renderApp();
         await send(init({ layout: { columnWidths: {}, hiddenColumns: [1] } }));
@@ -251,6 +277,15 @@ describe('Columns sidebar', () => {
         expect(sidebarRows(columns as any, info, '', 'missing')).toEqual([2, 3, 0, 1]);
         expect(sidebarRows(columns as any, info, 'MILES', 'position')).toEqual([0]);
         expect(sidebarRows(columns as any, info, '', 'name')).toEqual([1, 0, 3, 2]);
+    });
+
+    test('pure: infinite counted values format as the grid shows them', () => {
+        const col = columns[0] as any;
+        const show = (v: number) => formatCell(entryCell(col, 'numeric', v), col, undefined,
+            { labelsOn: true, formatOn: true, digits: 3, alignPad: false } as any).text;
+        expect(show(Infinity)).toBe('Inf');
+        expect(show(-Infinity)).toBe('-Inf');
+        expect(show(1.5)).toBe('1.500');
     });
 
     test('pure: numeric stat lines mark reservoir quantiles with ≈', () => {

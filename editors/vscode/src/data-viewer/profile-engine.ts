@@ -62,6 +62,7 @@ import {
     hashString,
     HyperLogLog,
     NumberCounter,
+    interpolateType7,
     quantileType7,
     Reservoir,
     SpaceSaving,
@@ -252,7 +253,7 @@ async function profileNumeric(
         mean = posInf && negInf ? NaN : posInf ? Infinity : negInf ? -Infinity : fm;
         if (finite > 1) {
             const v = (s2 - (s1 * s1) / finite) / (finite - 1);
-            sd = posInf || negInf ? NaN : Math.sqrt(Math.max(0, v));
+            sd = Math.sqrt(Math.max(0, v));
         }
         if (e20) {
             histogram = binsFrom(e20, c20);
@@ -264,6 +265,9 @@ async function profileNumeric(
     } else if (posInf || negInf) {
         mean = posInf && negInf ? NaN : posInf ? Infinity : -Infinity;
     }
+    // R's sd is NaN once an infinity is among two or more values, however
+    // few of them are finite.
+    if ((posInf || negInf) && finite + posInf + negInf > 1) sd = NaN;
 
     const present = reader.nrow - na - nan;
     const exact = hll === undefined;
@@ -409,9 +413,7 @@ export function quantilesFromKey(
     const q = (p: number): number => {
         const h = (total - 1) * p;
         const l = Math.floor(h);
-        const a = at(l);
-        const c = at(Math.min(total - 1, l + 1));
-        return a === c ? a : a + (h - l) * (c - a);
+        return interpolateType7(at(l), at(Math.min(total - 1, l + 1)), h - l);
     };
     return { p25: q(0.25), p50: q(0.5), p75: q(0.75) };
 }

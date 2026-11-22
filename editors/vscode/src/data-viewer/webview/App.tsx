@@ -45,7 +45,7 @@ import {
     type ProfileUpdate,
     type ValueCounts,
 } from '../profile';
-import type { Cell } from '../wire-format';
+import { decodeNonFinite, type Cell } from '../wire-format';
 import { TileCache, tileGeometry } from './tile-cache';
 import { StatusLine, createRangeStore, createVersionStore } from './status-line';
 import { formatCell, type FormattedCell } from './cell-render';
@@ -218,6 +218,8 @@ const SUMMARY_DEFAULT_MAX_COLS = 200;
 const SUMMARY_DEFAULT_MAX_ROWS = 1_000_000;
 /** Delay before a changed profile interest is posted (coalesces scroll). */
 const PROFILE_INTEREST_DEBOUNCE_MS = 120;
+/** A label request with no reply after this long may be sent again. */
+const LABEL_REQUEST_RETRY_MS = 2000;
 /** The band tooltip sits this far below the band's top. */
 const BAND_TIP_OFFSET = 26;
 
@@ -763,6 +765,15 @@ export function App({
 
     const postLifecycleRef = useRef<(event: string, range?: VisibleRange) => void>(() => {});
     const onRowsArrivedRef = useRef<() => void>(() => {});
+    /** Labels for unshipped-dictionary codes on screen; set below. A
+     *  scroll within loaded tiles produces no row arrival, so the scroll
+     *  handlers (user and programmatic) call this too. */
+    const requestMissingLabelsRef = useRef<() => void>(() => {});
+    /** Codes whose labels were asked for, by column, with the time asked:
+     *  scroll frames don't re-ask while a reply is pending. Cleared with
+     *  the resolved labels on every paint; an entry older than
+     *  {@link LABEL_REQUEST_RETRY_MS} is asked again. */
+    const labelsInflightRef = useRef(new Map<number, Map<number, number>>());
     const postLifecycle = useCallback((
         event: string,
         range: VisibleRange = visibleRangeRef.current,
@@ -1025,6 +1036,7 @@ export function App({
         shownTransformGenRef.current = undefined;
         adoptTransform(m.transformGeneration, permuted);
         setResolvedLabels({});
+        labelsInflightRef.current.clear();
         setGridSelection(createEmptySelection());
         // Clear only an orphaned in-flight copy: a "copying" toast whose
         // copyDone will never arrive because this replace/init bumped the
@@ -1095,6 +1107,8 @@ export function App({
 
     const applyLabels = useCallback((m: Extract<ExtensionToWebview, { type: 'labels' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
+        const inflight = labelsInflightRef.current.get(m.columnIndex);
+        if (inflight) for (const code of Object.keys(m.labels)) inflight.delete(Number(code));
         setResolvedLabels(previous => ({
             ...previous,
             [m.columnIndex]: {
@@ -1441,6 +1455,7 @@ export function App({
     ) => {
         setVisibleRange(viewport);
         requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
+        requestMissingLabelsRef.current();
         postLifecycle(event, viewport, selection);
     }, [effectiveNrow, gridSelection, postLifecycle, requestRows, setVisibleRange]);
 
@@ -1661,13 +1676,13 @@ export function App({
                     return;
                 case 'profiles':
                     if (m.panelGeneration !== panelGenerationRef.current) return;
-                    setProfiles(prev => applyProfileUpdates(prev, m.updates));
+                    setProfiles(prev => applyProfileUpdates(prev, decodeNonFinite(m.updates)));
                     return;
                 case 'valueCounts': {
                     if (m.panelGeneration !== panelGenerationRef.current) return;
                     const open = valueCountsRef.current;
                     if (!open || open.requestId !== m.requestId) return;
-                    setValueCounts({ ...open, result: m.result, error: m.result ? undefined : m.error ?? 'failed' });
+                    setValueCounts({ ...open, result: m.result && decodeNonFinite(m.result), error: m.result ? undefined : m.error ?? 'failed' });
                     return;
                 }
                 case 'cellDetail':
@@ -1824,23 +1839,29 @@ export function App({
     }, [applyFilters, columns, displayedFilter, filterEntriesForRequest, toolbar.labelsOn]);
 
     /** Ask for labels of unshipped-dictionary codes on screen. Runs when
-     *  rows arrive and when Labels or the resolved set change — not per
-     *  scroll frame (rows for a new viewport arrive anyway). */
+     *  rows arrive, when Labels or the resolved set change, and on scroll
+     *  (a scroll within loaded tiles brings no rows); codes already asked
+     *  for are skipped until their reply or the retry interval. */
     const requestMissingLabels = useCallback(() => {
         if (!toolbar.labelsOn) return;
         const cache = tileCacheRef.current;
         const range = visibleRangeRef.current;
+        const now = Date.now();
         const wantByColumn: Record<number, Set<number>> = {};
         for (let pos = 0; pos < visibleCols.length; pos++) {
             const colIdx = visibleCols[pos];
             const col = columns[colIdx];
             if (!col || col.dictionaryShipped || !col.arrowType.startsWith('Dictionary')) continue;
             const known = resolvedLabels[colIdx] ?? {};
+            let inflight = labelsInflightRef.current.get(colIdx);
+            if (!inflight) labelsInflightRef.current.set(colIdx, inflight = new Map());
             for (let row = range.start; row < range.end; row++) {
                 const cell = cache.cell(row, pos);
-                if (typeof cell === 'number' && known[cell] === undefined) {
-                    (wantByColumn[colIdx] ??= new Set()).add(cell);
-                }
+                if (typeof cell !== 'number' || known[cell] !== undefined) continue;
+                const asked = inflight.get(cell);
+                if (asked !== undefined && now - asked < LABEL_REQUEST_RETRY_MS) continue;
+                inflight.set(cell, now);
+                (wantByColumn[colIdx] ??= new Set()).add(cell);
             }
         }
         for (const [colIndexRaw, indices] of Object.entries(wantByColumn)) {
@@ -1857,6 +1878,7 @@ export function App({
     }, [columns, nextRequestId, panelGeneration, resolvedLabels, toolbar.labelsOn, visibleCols, vscode]);
 
     useEffect(() => { requestMissingLabels(); }, [requestMissingLabels]);
+    requestMissingLabelsRef.current = requestMissingLabels;
 
     /** Copy the selection as TSV. The gutter is never copied, and rowname
      *  columns only with `withRowNames` ("Copy with row names"), which on a
@@ -2578,6 +2600,7 @@ export function App({
         };
         setVisibleRange(viewport);
         requestRows(paddedRange(range.y, range.height, total, OVERSCAN_ROWS));
+        requestMissingLabelsRef.current();
         postLifecycleRef.current('visible', viewport);
         scheduleProfileInterest();
     }, [requestRows, scheduleProfileInterest, setVisibleRange]);

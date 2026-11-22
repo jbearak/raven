@@ -26,6 +26,53 @@ export type Cell =
 
 export const TRUNC_LIMIT_BYTES = 1024;
 
+/** A non-finite number inside a JSON message that is not a cell. */
+type NonFiniteNumber = { $nf: 'NaN' | 'Inf' | '-Inf' };
+
+/**
+ * Deep copy of `value` with every NaN and ±Inf number replaced by a
+ * `{ $nf }` sentinel, so it survives the JSON transport (which turns them
+ * into `null`). For messages whose number fields can be non-finite:
+ * profiles (`mean`, `sd`, quantiles, top values) and value counts. Cells
+ * already carry their own sentinels (`{ _: 'inf' }`, …) and pass through
+ * unchanged. The webview inverts it with {@link decodeNonFinite}.
+ */
+export function encodeNonFinite<T>(value: T): T {
+    return mapNumbers(value, (x): unknown => (Number.isFinite(x)
+        ? x
+        : { $nf: Number.isNaN(x) ? 'NaN' : x > 0 ? 'Inf' : '-Inf' } satisfies NonFiniteNumber)) as T;
+}
+
+/** Inverse of {@link encodeNonFinite}. */
+export function decodeNonFinite<T>(value: T): T {
+    return mapTree(value) as T;
+}
+
+function mapNumbers(v: unknown, f: (x: number) => unknown): unknown {
+    if (typeof v === 'number') return f(v);
+    if (Array.isArray(v)) return v.map(x => mapNumbers(x, f));
+    if (v !== null && typeof v === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const [k, x] of Object.entries(v)) out[k] = mapNumbers(x, f);
+        return out;
+    }
+    return v;
+}
+
+function mapTree(v: unknown): unknown {
+    if (Array.isArray(v)) return v.map(mapTree);
+    if (v !== null && typeof v === 'object') {
+        const nf = (v as Partial<NonFiniteNumber>).$nf;
+        if (nf !== undefined && Object.keys(v).length === 1) {
+            return nf === 'Inf' ? Infinity : nf === '-Inf' ? -Infinity : NaN;
+        }
+        const out: Record<string, unknown> = {};
+        for (const [k, x] of Object.entries(v)) out[k] = mapTree(x);
+        return out;
+    }
+    return v;
+}
+
 export function encodeNumber(x: number | null): Cell {
     if (x === null) return null;
     if (Number.isNaN(x)) return { _: 'nan' };

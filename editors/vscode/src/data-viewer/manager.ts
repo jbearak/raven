@@ -41,19 +41,33 @@ export class DataViewerManager {
             try {
                 const reader = await ArrowSliceReader.open(e.filePath);
                 const source = { expression: e.expression, sourceKind: e.sourceKind, sessionId: e.sessionId };
+                // A closed tab stays registered until its disposal finishes;
+                // never reuse it.
                 const existing = this.panels.get(e.panelName);
-                if (existing) {
+                if (existing?.isDisposed) this.panels.delete(e.panelName);
+                if (existing && !existing.isDisposed) {
                     await existing.replace(reader, e.filePath, source);
-                    existing.reveal();
+                    // The tab may have closed while the replacement started.
+                    if (!existing.isDisposed) existing.reveal();
                     return;
                 }
+                // The hook removes only this panel: a tab closed while its
+                // disposal awaits must not drop a newer same-name panel.
+                let created: DataViewerPanel | undefined;
                 const panel = await DataViewerPanel.create(
                     e.panelName, reader, e.filePath,
                     this.store, this.toolbarStore, this.sortStore, this.filterStore, this.settings(),
                     this.extensionUri,
-                    () => { this.panels.delete(e.panelName); },
+                    () => {
+                        if (created && this.panels.get(e.panelName) === created) this.panels.delete(e.panelName);
+                    },
                     source,
                 );
+                created = panel;
+                // Closed while its engine was starting: the panel already
+                // released its reader and threads; registering it would make
+                // the next same-name View() reuse a dead tab.
+                if (panel.isDisposed) return;
                 this.panels.set(e.panelName, panel);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
