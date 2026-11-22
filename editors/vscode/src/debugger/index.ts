@@ -228,6 +228,14 @@ class ConsoleLink {
     /** The console has pushed a summary on this connection. */
     private heard = false;
     private reprobed = false;
+    /**
+     * The control connection is subscribed. No mirror goes out before, so
+     * the summary it provokes reaches this connection and an edit made
+     * while the console starts doesn't release sends early.
+     */
+    private subscribed = false;
+    /** Files only the console's summary named; cleared, then forgotten. */
+    private discovered = new Set<string>();
     /** A mirror on this connection has been applied (`ok`). */
     private applied = false;
     /** The initial reconciliation is done and sends are released. */
@@ -254,7 +262,6 @@ class ConsoleLink {
         sock.setEncoding('utf8');
         this.control = sock;
         let buf = '';
-        let subscribed = false;
         sock.on('connect', () => {
             sock.write(JSON.stringify({ v: 1, id: 0, op: 'subscribe' }) + '\n');
         });
@@ -266,10 +273,8 @@ class ConsoleLink {
                 buf = buf.slice(nl + 1);
                 let msg: { event?: string; status?: string; breakpoints?: BreakpointState[] };
                 try { msg = JSON.parse(line); } catch { continue; }
-                if (!subscribed && msg.status !== undefined) {
-                    // Mirror only once subscribed, so the summary the
-                    // mirror provokes reaches this connection.
-                    subscribed = true;
+                if (!this.subscribed && msg.status !== undefined) {
+                    this.subscribed = true;
                     this.mirror();
                 }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
@@ -295,7 +300,10 @@ class ConsoleLink {
         const wanted = with_real_paths(Object.keys(editor_breakpoints().files));
         const stale = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
         if (stale.length > 0) {
-            for (const p of stale) this.mirrored.add(p);
+            for (const p of stale) {
+                this.mirrored.add(p);
+                this.discovered.add(p);
+            }
             this.mirror();
         } else if (this.applied && !this.in_flight) {
             // The console pushes a summary after each file it applies, so
@@ -307,6 +315,10 @@ class ConsoleLink {
     /** Sends held for this console may run now. */
     private release(): void {
         this.reconciled = true;
+        // Confirmed cleared; another window sharing this console may arm
+        // them again, and this link's later mirrors mustn't clear them.
+        for (const p of this.discovered) this.mirrored.delete(p);
+        this.discovered.clear();
         this.mirrored_once();
     }
 
@@ -316,6 +328,7 @@ class ConsoleLink {
      * from the breakpoints as they are then.
      */
     mirror(): void {
+        if (!this.subscribed) return;
         if (this.in_flight) {
             this.again = true;
             return;

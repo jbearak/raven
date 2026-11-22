@@ -194,14 +194,24 @@ function set_breakpoints(list: Bp[]): void {
 }
 
 let n = 0;
-async function console_at(): Promise<{ con: FakeConsole; sock: string }> {
+async function console_at(listen = true): Promise<{ con: FakeConsole; sock: string }> {
     const dir = path.join(root, `c${n++}`);
     fs.mkdirSync(dir);
     const sock = path.join(dir, 's');
     const con = new FakeConsole(sock);
-    await con.listen();
+    if (listen) await con.listen();
     consoles.push(con);
     return { con, sock };
+}
+
+/** One request on the console's socket, as another client would send it. */
+function raw_request(sock: string, msg: object): Promise<void> {
+    return new Promise((resolve) => {
+        const c = net.createConnection(sock);
+        c.on('connect', () => c.write(JSON.stringify(msg) + '\n'));
+        c.on('data', () => { c.end(); resolve(); });
+        c.on('error', () => resolve());
+    });
 }
 const consoles: FakeConsole[] = [];
 
@@ -289,6 +299,37 @@ describe('breakpoints across a detach and reattach', () => {
         ipc.send_debug_program(sock, 'source("a.R")');
         await until(() => con.executes.length === 1);
         expect(con.executes[0].armed).toEqual({ [real(a_r)]: [1], [real(b_r)]: [2] });
+    });
+
+    test('a breakpoint edit while the console starts does not release sends early', async () => {
+        const { con, sock } = await console_at(false);
+        set_breakpoints([line_bp(a_r, 1)]);
+        attach(sock);
+        set_breakpoints([line_bp(a_r, 1), line_bp(b_r, 2)]);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await settle(300);
+        await con.listen();
+        await until(() => con.executes.length === 1);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [1], [real(b_r)]: [2] });
+    });
+
+    test("a file cleared on reattach and re-armed by another window isn't cleared again", async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(b_r, 5)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 1);
+        detach(t1);
+        set_breakpoints([line_bp(a_r, 1)]);
+        attach(sock);
+        await until(() => con.files.size === 1 && con.files.has(real(a_r)));
+        await settle();
+        // Another window arms b.R; then an unrelated edit here.
+        await raw_request(sock, { v: 1, id: 9, op: 'breakpoints', files: { [b_r]: [{ line: 4 }] } });
+        await until(() => con.files.has(real(b_r)));
+        set_breakpoints([line_bp(a_r, 1), line_bp(a_r, 2)]);
+        await until(() => con.files.get(real(a_r))?.length === 2);
+        await settle();
+        expect(con.files.get(real(b_r))).toEqual([4]);
     });
 
     test('a symlinked breakpoint re-added after its real path was cleared stays armed', async () => {
