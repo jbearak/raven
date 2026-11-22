@@ -2125,3 +2125,174 @@ fn inspect_last_error_opens_its_frames_after_the_fact() {
     d.session_ended();
     drop(sub);
 }
+
+#[test]
+fn tab_indented_and_non_ascii_sends_run_what_they_echo() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let a = c.write_file("tabs.R", "");
+    // R reports display columns (a tab spans to the next multiple of 8):
+    // slicing by them as characters once ran `e <- 42` here.
+    c.send("\tlongname <- 42", Some(&a));
+    c.send("cat('ran:', exists('longname'), exists('e'), '\\n')", None);
+    c.expect("ran: TRUE FALSE");
+    // Tabs before and inside expressions, non-ASCII strings, and a
+    // multi-line expression whose later lines are tab-indented.
+    c.send(
+        "s <- \"\u{e9}\u{65e5}\"; \tv <- c(1,\n\t\t2); \"\t\u{e9}\" -> q\n\tw <- nchar(q)",
+        Some(&a),
+    );
+    c.send(
+        "cat('vals:', s == '\u{e9}\u{65e5}', identical(v, c(1, 2)), w, '\\n')",
+        None,
+    );
+    c.expect("vals: TRUE TRUE 2");
+    // Breakpoints still bind and stop on the right line of tab-indented,
+    // non-ASCII sent code.
+    let src =
+        "\tf <- function() {\n\t\tz <- \"\u{65e5}\u{672c}\"; \ty <- 2\n\t\ty + nchar(z)\n\t}\n";
+    let b = c.write_file("tabs2.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": b}, "breakpoints": [{"line": 3}]}),
+    );
+    d.req("configurationDone", json!({}));
+    let m = d.mark();
+    c.send(src, Some(&b));
+    let bp = d.event("breakpoint", m);
+    assert_eq!(bp["body"]["breakpoint"]["verified"], true, "{bp}");
+    let m = d.mark();
+    c.send("f()", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("f".to_string(), 3));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("[1] 4");
+}
+
+#[test]
+fn source_exprs_keeps_its_semantics_with_a_breakpoint_armed() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let other = c.write_file("other.R", "x <- 1\nx <- 2\n");
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": other}, "breakpoints": [{"line": 2}]}),
+    );
+    d.req("configurationDone", json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    // The wrapper installed for the breakpoint must leave `exprs` to
+    // base source(), which evaluates it in `local`.
+    c.send(
+        "e <- new.env(); res <- source(exprs = quote(x <- 12), local = e); cat('exprs:', e$x, res$visible, '\\n')",
+        None,
+    );
+    c.expect("exprs: 12 FALSE");
+    // Arguments are still evaluated once, lazily, by source() itself.
+    c.send(
+        "n <- 0; src <- function() { n <<- n + 1; textConnection('k <- 3') }; source(src(), local = e); cat('evals:', n, e$k, '\\n')",
+        None,
+    );
+    c.expect("evals: 1 3");
+}
+
+#[test]
+fn hover_runs_no_user_methods_and_reads_s4_slots() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "hits <- 0\n\
+         counted <- function(x, ...) { hits <<- hits + 1; NextMethod() }\n\
+         for (g in c(\"[\", \"[[\", \"as.character\")) registerS3method(g, \"labelset\", counted)\n\
+         fac <- structure(1L, levels = structure(\"a\", class = \"labelset\"), class = \"factor\")\n\
+         when <- structure(0, tzone = structure(\"UTC\", class = \"labelset\"), class = c(\"POSIXct\", \"POSIXt\"))\n\
+         setClass(\"Box\", representation(value = \"numeric\", any = \"ANY\"))\n\
+         obj <- new(\"Box\", value = 7)\n\
+         hv <- function() { browser(); 1 }",
+        None,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let m = d.mark();
+    c.send("hv()", None);
+    d.event("stopped", m);
+    let hover = |d: &mut Dap, e: &str| {
+        d.req(
+            "evaluate",
+            json!({"expression": e, "frameId": 2, "context": "hover"}),
+        )
+    };
+    let fac = hover(&mut d, "fac");
+    assert_eq!(fac["body"]["result"], "a", "{fac}");
+    let when = hover(&mut d, "when");
+    assert!(
+        when["body"]["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("1970-01-01"),
+        "{when}"
+    );
+    // Hovering reads `hits` without running anything either.
+    let hits = hover(&mut d, "hits");
+    assert_eq!(hits["body"]["result"], "0", "a hover ran a user method");
+    let slot = hover(&mut d, "obj@value");
+    assert_eq!(slot["body"]["result"], "7", "{slot}");
+    let empty = hover(&mut d, "obj@any");
+    assert_eq!(empty["body"]["result"], "NULL", "{empty}");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}
+
+#[test]
+fn user_output_that_looks_like_a_probe_announcement_is_shown() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    c.send("cat(\"debug at <raven-probe>#1\\n\"); print(24680)", None);
+    c.expect("[1] 24680");
+    assert!(
+        c.text()
+            .lines()
+            .any(|l| l.trim_end() == "debug at <raven-probe>#1"),
+        "{}",
+        c.text()
+    );
+}
+
+#[test]
+fn ascii_sends_still_bind_breakpoints_outside_a_utf8_locale() {
+    if !r_available() {
+        return;
+    }
+    // Outside UTF-8, only non-ASCII sends fall back to raw feeding.
+    let c = Console::spawn_with_env(&[("LC_ALL", "C"), ("LANG", "C")]);
+    let a = c.write_file("a.R", F_R);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": a}, "breakpoints": [{"line": 3}]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send("cat('utf8:', l10n_info()[['UTF-8']], '\\n')", None);
+    c.expect("utf8: FALSE");
+    let m = d.mark();
+    c.send(F_R, Some(&a));
+    let bp = d.event("breakpoint", m);
+    assert_eq!(bp["body"]["breakpoint"]["verified"], true, "{bp}");
+    let m = d.mark();
+    c.send("f(1)", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("f".to_string(), 3));
+}

@@ -146,10 +146,15 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     xlen <- function(x) .Call(N$xlength, x)
     # An attribute, or NULL when it is a vector some package implements
     # (ALTREP): attributes are read like values, so the same rule applies.
+    # Unclassed, since an attribute can carry a class of its own (levels of
+    # class "labelset"), and indexing, paste() or %in% on it would dispatch.
     sattr <- function(x, which) {
         a <- attr(x, which, exact = TRUE)
-        if (!is.null(a) && !isTRUE(.Call(N$materialized, a))) NULL else a
+        if (!is.null(a) && !isTRUE(.Call(N$materialized, a))) NULL else unclass(a)
     }
+    # oldClass(), unclassed for the same reason (a class vector can have a
+    # class).
+    ocls <- function(x) unclass(oldClass(x))
     trunc_str <- function(s, n = 200L) {
         s <- s[1L]
         if (is.na(s)) return("NA")
@@ -160,7 +165,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                complex = "cplx", raw = "raw", list = "list", t)
     }
     type_label <- function(x) {
-        cls <- oldClass(x)
+        cls <- ocls(x)
         if (!is.null(cls)) cls[[1L]] else short_type(typeof(x))
     }
     is_df <- function(cls) !is.null(cls) && "data.frame" %in% cls
@@ -204,12 +209,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         out
     }
     elems <- function(x, i) {
-        cls <- oldClass(x)
+        cls <- ocls(x)
         v <- .subset(x, i)
         if (!is.null(cls)) {
             if ("factor" %in% cls && typeof(v) == "integer") {
                 lev <- sattr(x, "levels")
-                out <- as.character(lev[v])
+                out <- as.character(.subset(lev, v))
                 out[is.na(out)] <- "NA"
                 return(out)
             }
@@ -227,7 +232,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             rep("?", length(v)))
     }
     env_label <- function(x) {
-        cls <- oldClass(x)
+        cls <- ocls(x)
         if (identical(x, globalenv())) return("<environment: R_GlobalEnv>")
         if (identical(x, baseenv())) return("<environment: base>")
         if (!is.null(cls) && "R6" %in% cls) return(sprintf("<%s>", cls[[1L]]))
@@ -247,7 +252,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     preview_ <- function(x) {
         t <- typeof(x)
-        cls <- oldClass(x)
+        cls <- ocls(x)
         if (t == "S4") return(sprintf("<S4 %s>", if (is.null(cls)) "object" else cls[[1L]]))
         if (t == "environment") return(env_label(x))
         if (t %in% c("closure", "builtin", "special")) return(trunc_str(fn_label(x)))
@@ -299,7 +304,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (t == "S4") return(c(0, length(attributes(x))))
         if (t %in% c("list", "pairlist")) {
             n <- xlen(x)
-            if (!is.null(sattr(x, "names")) || is_df(oldClass(x))) return(c(0, n))
+            if (!is.null(sattr(x, "names")) || is_df(ocls(x))) return(c(0, n))
             return(c(n, 0))
         }
         if (t %in% c("logical", "integer", "double", "complex", "character", "raw")) {
@@ -597,16 +602,23 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 key <- e[[3L]]
                 # `x$a` names `a`; in `x[[i]]` the symbol is a variable,
                 # which hover doesn't evaluate.
+                # In `x@slot` it names the slot.
                 if (is.symbol(key)) {
-                    if (op != "$") return(list(ok = FALSE))
+                    if (op == "[[") return(list(ok = FALSE))
                     key <- as.character(key)
                 }
                 if (!(is.character(key) || is.numeric(key)) || length(key) != 1L) return(list(ok = FALSE))
                 if (op == "@") {
                     if (!isS4(x) || !is.character(key)) return(list(ok = FALSE))
-                    return(list(ok = TRUE, value = attr(x, key, exact = TRUE)))
+                    # A slot is an attribute; methods stores a NULL slot as
+                    # the symbol `\001NULL\001`. No attribute (an absent
+                    # slot, or `.Data`, which isn't one) isn't resolved here.
+                    v <- attr(x, key, exact = TRUE)
+                    if (is.null(v)) return(list(ok = FALSE))
+                    if (identical(v, as.name("\001NULL\001"))) v <- NULL
+                    return(list(ok = TRUE, value = v))
                 }
-                cls <- oldClass(x)
+                cls <- ocls(x)
                 if (typeof(x) == "environment" && is.character(key) && (is.null(cls) || "R6" %in% cls)) {
                     b <- .Call(N$binding, x, key)
                     if (b[[1L]] %in% c("value", "forced")) return(list(ok = TRUE, value = b[[2L]]))
@@ -966,9 +978,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }, error = function(e) ""))
 
     # Top-level expressions of a submission: one c(first line, first col,
-    # last line, last col) per expression (character columns), or "" when
-    # R can't parse it (the console then feeds it raw).
+    # last line, last col) per expression, or "" when R can't parse it (the
+    # console then feeds it raw). The columns are R's display columns (a
+    # tab advances to the next multiple of 8), which Rust maps back to
+    # characters; the byte columns drift on non-ASCII text in strings.
+    # Outside a UTF-8 locale R counts a multibyte character's every byte,
+    # so non-ASCII text goes raw there.
     env$split_exprs <- function(text) internal(tryCatch({
+        if (!isTRUE(l10n_info()[["UTF-8"]]) && any(charToRaw(text) > as.raw(127L))) return("")
         ex <- parse(text = text, keep.source = TRUE)
         sr <- attr(ex, "srcref")
         if (length(ex) == 0L || length(sr) != length(ex)) return("")
@@ -1088,15 +1105,18 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (!missing(file)) ofile <- file
         orig <- state$orig_source
         if (is.null(orig)) orig <- base::source
-        args <- list(...)
         # `local = TRUE` means the caller's frame, which delegation would lose.
         if (isTRUE(local)) local <- parent.frame()
-        if (missing(file)) return(do.call(orig, c(list(local = local), args)))
-        plain <- function() do.call(orig, c(list(file, local = local), args))
-        unnamed <- length(args) && (is.null(names(args)) || any(!nzchar(names(args))))
+        # A call this wrapper leaves alone passes `...` on as unevaluated
+        # promises: base source() evaluates them itself, when and where it
+        # would have (`exprs = quote(...)` in `local`, for one).
+        if (missing(file)) return(orig(local = local, ...))
+        plain <- function() orig(file, local = local, ...)
+        arg_names <- names(substitute(list(...)))[-1L]
+        unnamed <- ...length() > 0L && (is.null(arg_names) || any(!nzchar(arg_names)))
         if (isTRUE(state$internal) || unnamed || !is.character(file) || length(file) != 1L ||
             grepl("^(https?|ftp|file)://", file) || !file.exists(file) ||
-            !all(names(args) %in% source_args)) {
+            !all(arg_names %in% source_args)) {
             if (is.character(file) && length(file) == 1L && file.exists(file)) {
                 rpc("unsupported_source", normalizePath(file, mustWork = FALSE))
             }
@@ -1107,6 +1127,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         # to guess between, go to the original untouched.
         line_bps <- !identical(rpc("has_bps", path), "0")
         if (!line_bps && !length(state$fbp_names)) return(plain())
+        args <- list(...)
         enc <- if (!is.null(args$encoding)) args$encoding else "unknown"
         if (length(enc) != 1L) return(plain())
         lines <- readLines(file, warn = FALSE, encoding = if (identical(enc, "unknown")) "UTF-8" else enc)
