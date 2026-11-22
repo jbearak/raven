@@ -66,6 +66,18 @@ mock.module('vscode', () => ({
         }),
     },
     ViewColumn: { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3 },
+    // Used by the send-to-R suites (`_helpers/fake-vscode-terminals.ts`).
+    extensions: { getExtension: () => undefined, onDidChange: () => ({ dispose: () => {} }) },
+    ExtensionKind: { UI: 1, Workspace: 2 },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    CancellationError: class extends Error {},
+    CancellationTokenSource: class {},
+    Disposable: class {},
+    TerminalProfile: class {},
+    Position: class {},
+    Range: class {},
+    Selection: class {},
+    ThemeIcon: class {},
     window: {
         activeTextEditor: undefined,
         createOutputChannel: () => ({

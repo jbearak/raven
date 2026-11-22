@@ -125,7 +125,7 @@ function handle_tasks_terminal_closed(terminal: vscode.Terminal): void {
 
 async function create_tasks_terminal(): Promise<vscode.Terminal> {
     const program = await resolve_program();
-    const launch = build_r_terminal_launch(program);
+    const launch = await build_r_terminal_launch(program);
     const terminal = vscode.window.createTerminal({
         name: TASKS_TERMINAL_NAME,
         shellPath: launch.shellPath,
@@ -134,11 +134,12 @@ async function create_tasks_terminal(): Promise<vscode.Terminal> {
     });
     if (launch.consoleSocket) register_console_terminal(terminal, launch.consoleSocket);
     // `resolve_program()` can yield for seconds (shell `which` validation,
-    // or a "Switch to R / Keep" dialog). If `raven.rTerminal.program`
-    // changed during that window, the config handler cleared
-    // `tasks_creation_in_flight`; don't cache this now-stale terminal —
-    // the next call should launch a fresh one with the updated program.
-    if (tasks_creation_in_flight !== null) {
+    // or a "Switch to R / Keep" dialog). If the program changed during that
+    // window, don't cache this now-stale terminal — the next call should
+    // launch a fresh one with the updated program. "Switch to R" itself
+    // changes the setting, so compare programs rather than relying on the
+    // config handler having cleared `tasks_creation_in_flight`.
+    if (program === terminal_program_now()) {
         tasks_terminal = terminal;
         tasks_program = program;
     }
@@ -153,6 +154,13 @@ async function create_tasks_terminal(): Promise<vscode.Terminal> {
  * scrollback into a fresh R process with no shared state).
  */
 export async function get_or_create_tasks_terminal(): Promise<vscode.Terminal> {
+    // A console chosen for this session changes the program without a
+    // settings event, so check on every use. The old terminal keeps running
+    // for its scrollback, as after a settings change.
+    if (tasks_terminal && tasks_program !== terminal_program_now()) {
+        tasks_terminal = null;
+        tasks_program = null;
+    }
     if (tasks_terminal) return tasks_terminal;
     if (tasks_creation_in_flight) return tasks_creation_in_flight;
     tasks_creation_in_flight = create_tasks_terminal().finally(() => {
