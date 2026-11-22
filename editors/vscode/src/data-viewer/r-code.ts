@@ -146,7 +146,7 @@ export function rName(name: string): string {
 
 /** A double-quoted R string literal. Non-ASCII text stays literal (R
  *  reads UTF-8 source); control, separator and invisible format
- *  characters are escaped. Throws `Unrepresentable` on NUL. */
+ *  characters are escaped (as `\uNNNN`). Throws `Unrepresentable` on NUL. */
 export function rString(s: string): string {
     let out = '"';
     for (const ch of s) {
@@ -157,7 +157,8 @@ export function rString(s: string): string {
         else if (ch === '\n') out += '\\n';
         else if (ch === '\r') out += '\\r';
         else if (ch === '\t') out += '\\t';
-        else if (c < 0x20 || c === 0x7f) out += '\\x' + c.toString(16).padStart(2, '0');
+        // `\u` for every other escape: R refuses a literal mixing `\x`
+        // and `\u` escapes.
         else if (UNSAFE_CHAR.test(ch)) out += '\\u' + hex4(c);
         else out += ch;
     }
@@ -449,9 +450,12 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
         if (c === '$') { out += '\\z'; i++; continue; }
         if (c === '(') {
             const named = /^\(\?<([A-Za-z_$][\w$]*)>/.exec(pattern.slice(i));
-            const head = named ? named[0] : /^\((\?(:|=|!|<=|<!))?/.exec(pattern.slice(i))![0];
+            const head = named ? named[0] : /^\((\?(:|=|!))?/.exec(pattern.slice(i))![0];
+            // Lookbehind: JS allows any width, R's PCRE only bounded ones.
             if (head === '(' && pattern[i + 1] === '?') return refuse('this group syntax means something else in R');
-            out += head;
+            // A named group's name may use `$` in JS only; back-references
+            // are refused, so it can be a plain group.
+            out += named ? '(?:' : head;
             i += head.length;
             groups.push(false);
             continue;
@@ -467,6 +471,11 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
         if (c === '{') {
             // `{,n}` is a quantifier in PCRE2 10.43+, a literal in JS.
             if (pattern[i + 1] === ',') return refuse('`{,` means something else in R');
+            // PCRE caps repeat counts at 65535; JS has no cap.
+            const bound = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(i));
+            if (bound && [bound[1], bound[2]].some(b => b !== undefined && b !== '' && Number(b) > 65535)) {
+                return refuse('the repeat count is too large for R');
+            }
             out += c;
             i++;
             continue;
@@ -501,7 +510,6 @@ const FOLD_GROUPS: readonly string[] = [
     ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1fa0 + k, 0x1fa8 + k)),
     'ᾳᾼ', 'ῃῌ', 'ῳῼ',
 ];
-const FOLD_CHARS = FOLD_GROUPS.join('');
 
 function classBody(chars: string): string {
     return Array.from(chars, ch => (/[\\\]^-]/.test(ch) ? '\\' + ch : ch)).join('');
@@ -575,6 +583,7 @@ function readClass(p: string, start: number):
             if (hiRaw === '\\') {
                 const e = p[i + 2];
                 if (e === undefined || /[dDwWsS]/.test(e)) return { reason: 'a range next to a class escape means something else in R' };
+                if (!/[bntrf.*+?()[\]{}|^$\\/\-]/.test(e)) return { reason: `the escape \\${e} in a class means something else in R` };
                 const hi = (({ n: 10, t: 9, r: 13, f: 12, b: 8 } as Record<string, number>)[e] ?? e.charCodeAt(0));
                 if (lastChar <= 0xdfff && hi >= 0xd800) spansSurrogates = true;
                 body += '-\\' + e;
@@ -892,8 +901,13 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         // and arrange(), and dots names (`...`, `..1`) in every verb.
         const names = objectNames(input, rownamesAsColumn, rownameName);
         const dots = names.filter(n => n === '...' || /^\.\.[0-9]+$/.test(n));
+        const hiddenSet = new Set(input.hiddenColumns);
+        const kept = ambiguousNames(objectNames(
+            { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName));
         const refused = [...new Set([
             ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
+            // select() itself refuses duplicates it leaves behind.
+            ...(input.hiddenColumns.length > 0 ? kept : []),
             ...(entries.length > 0 || input.sort.keys.length > 0 || input.hiddenColumns.length > 0 ? dots : []),
         ])];
         if (refused.length > 0) {
@@ -905,13 +919,26 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         }
     }
     const src0 = kind === 'matrix' ? `as.data.frame(${input.expression.trim()})` : input.expression.trim();
+    // The code's own bindings (`dat`, `out`, `dt`) are read inside
+    // `with()` and data.table's `[`, where a column of the same name would
+    // shadow them, so each avoids the object's column names.
+    const taken = new Set(objectNames(input, rownamesAsColumn, rownameName));
+    const fresh = (base: string): string => {
+        let name = base;
+        for (let k = 1; taken.has(name); k++) name = `${base}_${k}`;
+        return name;
+    };
+    const DAT = fresh('dat');
+    const OUT = fresh('out');
+    const DT = fresh('dt');
     // Base R names the frame for rownames() and positional references: the
-    // expression itself when it is a plain name, else `dat`.
-    const simple = /^[A-Za-z.][\w.]*$/.test(src0);
+    // expression itself when it is a plain name no column shadows, else
+    // `dat`.
+    const simple = /^[A-Za-z.][\w.]*$/.test(src0) && !taken.has(src0);
     const ctx: Ctx = {
         flavor,
         input,
-        frame: flavor === 'data.table' ? 'dt' : flavor === 'base' && simple ? src0 : 'dat',
+        frame: flavor === 'data.table' ? DT : flavor === 'base' && simple ? src0 : DAT,
         rownamesAsColumn,
         needs: new Set(),
         skipped: [],
@@ -931,7 +958,7 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         }
     }
     // Sort keys read the filtered frame (base R and data.table).
-    if (conditions.length > 0 && flavor !== 'dplyr') ctx.frame = 'out';
+    if (conditions.length > 0 && flavor !== 'dplyr') ctx.frame = OUT;
     const terms = sortTerms(ctx);
     const hidden = hiddenSelection(ctx);
     const order = input.sort.stringOrder ?? 'natural';
@@ -963,27 +990,27 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
 
     if (flavor === 'data.table') {
         const setup = ctx.rownamesAsColumn
-            ? `dt <- as.data.table(${src0}, keep.rownames = ${rString(rownameName)})`
-            : `dt <- as.data.table(${src0})`;
+            ? `${DT} <- as.data.table(${src0}, keep.rownames = ${rString(rownameName)})`
+            : `${DT} <- as.data.table(${src0})`;
         const steps: string[] = [setup];
-        let out = 'dt';
+        let out = DT;
         if (conditions.length > 0) {
-            steps.push(`out <- dt[${dataTableI(conditions)}]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${DT}[${dataTableI(conditions)}]`);
+            out = OUT;
         }
         if (terms.length > 0) {
             const args = terms.map(t => (t.desc ? `-${t.expr}` : t.expr));
-            steps.push(`out <- ${out}[order(${args.join(', ')})]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${out}[order(${args.join(', ')})]`);
+            out = OUT;
         }
         if (hidden.names) {
-            steps.push(`out <- ${out}[, !${rVector(hidden.names.map(rString))}]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${out}[, !${rVector(hidden.names.map(rString))}]`);
+            out = OUT;
         } else if (hidden.positions) {
-            steps.push(`out <- ${out}[, -${rVector(hidden.positions.map(String))}]`);
-            out = 'out';
+            steps.push(`${OUT} <- ${out}[, -${rVector(hidden.positions.map(String))}]`);
+            out = OUT;
         }
-        if (out === 'dt') steps.push('out <- dt');
+        if (out === DT) steps.push(`${OUT} <- ${DT}`);
         const lines = header(ctx, ['', 'library(data.table)', '']);
         lines.push(...steps);
         return { code: lines.join('\n') + '\n' };
@@ -992,14 +1019,14 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
     // Base R. Every `[` here is one a data.table also reads as base R
     // does (row indices with an empty `j`, literal column positions), so
     // the code reproduces the view whatever the object's class.
-    const dat = simple ? src0 : 'dat';
+    const dat = simple ? src0 : DAT;
     const steps: string[] = [];
-    if (!simple) steps.push(`dat <- ${src0}`);
+    if (!simple) steps.push(`${DAT} <- ${src0}`);
     let out = dat;
     if (conditions.length > 0) {
         const joined = conditions.map(c => (/ \| /.test(c) && !c.startsWith('(') ? `(${c})` : c)).join(' & ');
-        steps.push(`out <- ${dat}[which(with(${dat}, ${joined})), , drop = FALSE]`);
-        out = 'out';
+        steps.push(`${OUT} <- ${dat}[which(with(${dat}, ${joined})), , drop = FALSE]`);
+        out = OUT;
     }
     if (terms.length > 0) {
         const args = terms.map(t => t.expr);
@@ -1007,16 +1034,23 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         const dec = decreasing.every(d => d === 'FALSE') ? ''
             : decreasing.every(d => d === 'TRUE') ? ', decreasing = TRUE'
                 : `, decreasing = c(${decreasing.join(', ')})`;
-        steps.push(`out <- ${out}[with(${out}, order(${args.join(', ')}${dec}, method = "radix")), , drop = FALSE]`);
-        out = 'out';
+        steps.push(`${OUT} <- ${out}[with(${out}, order(${args.join(', ')}${dec}, method = "radix")), , drop = FALSE]`);
+        out = OUT;
     }
     if (hidden.positions) {
         // Literal positions: a computed `j` (`setdiff(names(out), ...)`)
         // would be evaluated as an expression by `[.data.table`.
-        steps.push(`out <- ${out}[, -${rVector(hidden.positions.map(String))}, drop = FALSE]`);
-        out = 'out';
+        steps.push(`${OUT} <- ${out}[, -${rVector(hidden.positions.map(String))}, drop = FALSE]`);
+        out = OUT;
+        // `[.data.frame` makes kept duplicate (or empty) names unique;
+        // restore them as the view shows them.
+        const keptNames = objectNames(input, false, rownameName)
+            .filter((_, k) => !hidden.positions!.includes(k + 1));
+        if (ambiguousNames(keptNames).size > 0) {
+            steps.push(`${OUT} <- setNames(${OUT}, ${rVector(keptNames.map(rString))})`);
+        }
     }
-    if (out !== 'out') steps.push(`out <- ${out}`);
+    if (out !== OUT) steps.push(`${OUT} <- ${out}`);
     const lines = header(ctx, ['']);
     lines.push(...steps);
     return { code: lines.join('\n') + '\n' };

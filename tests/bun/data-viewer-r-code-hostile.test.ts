@@ -150,7 +150,8 @@ describe.skipIf(!READY)('hostile names and values in real R', () => {
     const results = new Map<string, string>();
     beforeAll(async () => {
         const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-hostile-'));
-        const values = [...HOSTILE, 'x', 'é😀'];
+        // `\x` and `\u` escapes can't share an R string literal.
+        const values = [...HOSTILE, 'x', 'é😀', 'x\u000b\u2028y'];
         const goodValues = benign(values, 'v');
         const script: string[] = [
             'suppressPackageStartupMessages({ library(dplyr); library(data.table) })',

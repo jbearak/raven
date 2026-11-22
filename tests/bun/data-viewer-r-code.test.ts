@@ -41,7 +41,7 @@ describe('R literals', () => {
     test('strings escape quotes, backslashes and control characters, keep non-ASCII', () => {
         expect(rString('a"b\\c\n\t')).toBe('"a\\"b\\\\c\\n\\t"');
         expect(rString('café')).toBe('"café"');
-        expect(rString('\u0001')).toBe('"\\x01"');
+        expect(rString('\u0001')).toBe('"\\u0001"');
     });
     test('numbers read back exactly', () => {
         expect(rNumber(0.1 + 0.2)).toBe('0.30000000000000004');
@@ -115,6 +115,9 @@ describe('generateRCode', () => {
         const cols = [...COLS, col('mpg', 'Float64')];
         const r = gen({ columns: cols, hiddenColumns: [4] });
         expect('code' in r && r.code).toContain('select(-4)');
+        // dplyr's select() refuses the duplicates it would leave behind.
+        expect(gen({ columns: cols, hiddenColumns: [2] })).toEqual({ error: expect.stringContaining('"mpg"') });
+        expect('code' in gen({ columns: cols, hiddenColumns: [2] }, 'base')).toBe(true);
     });
 
     test('regex filters are written only when JS and PCRE read the pattern alike', () => {
@@ -135,19 +138,21 @@ describe('generateRCode', () => {
             const t = translateRegex(p, cs);
             return 'pcre' in t ? t.pcre : null;
         };
-        for (const p of ['abc', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\w\\W*', '[\\]]', 'a:b[x:y]', '(?:a)(?=b)(?!c)(?<=d)(?<!e)(?<n>f)'])
+        for (const p of ['abc', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\w\\W*', '[\\]]', 'a:b[x:y]', '(?:a)(?=b)(?!c)'])
             expect([p, pcre(p)]).toEqual([p, p]);
         expect(pcre('^a.*b$')).toBe('^a[^\\n\\r  ]*b\\z');
         expect(pcre('x\\sy')).toBe('x[\\t\\n\\x0b\\f\\r    -     　﻿]y');
         // Caseless `k` must not match the Kelvin sign, as in JS.
         expect(pcre('k', false)).toBe('(?:(?!(?-i:[K]))k)');
         expect(pcre('ab', false)).toBe('ab');
+        // Named groups become plain groups (JS allows `$` in names, PCRE not).
+        expect(pcre('(?<a$b>x)')).toBe('(?:x)');
         // Counts of any-character atoms differ on non-BMP text.
         for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]'])
             expect([p, pcre(p)]).toEqual([p, null]);
         expect(pcre('^.+$')).not.toBeNull();
         expect(pcre('^[^,]*,.*$')).not.toBeNull();
-        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', 'a{,2}', '[\\d-z]', '[\\S]', '(unclosed'])
+        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', 'a{,2}', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]'])
             expect([p, pcre(p)]).toEqual([p, null]);
     });
 

@@ -399,6 +399,17 @@ edgeSuite('Copy as R code round trip: duplicate column names (real R)',
         { name: 'hide the second val', hide: [2] },
     ]);
 
+// Columns named like the code's own bindings (`dat`, `out`, `dt`) and
+// like the object itself: inside `with()` or data.table's `[` such a
+// column would shadow the binding a positional reference reads.
+edgeSuite('Copy as R code round trip: columns named like the bindings (real R)',
+    'df <- data.frame(id = 1:4, out = 4:1, dt = 4:1, dat = 4:1, df = 4:1, dtobj = 4:1, k = 1:4, k = c(9L, 0L, 7L, 5L), check.names = FALSE)',
+    ['df', 'dtobj'],
+    [
+        { name: 'filter and sort the second k', filters: [{ ci: 7, p: { kind: 'numCompare', op: '>', value: 1 } }], sort: [{ ci: 7, dir: 'asc' }], refuse: ['dplyr'] },
+        { name: 'filter by out, hide dt', filters: [{ ci: 1, p: { kind: 'numCompare', op: '<', value: 4 } }], sort: [{ ci: 7, dir: 'desc' }], hide: [2], refuse: ['dplyr'] },
+    ]);
+
 // Logical filters (data.table reads a lone symbol or a leading `!` in `i`
 // specially) and hidden columns, against a data.frame and a data.table
 // (base R's `[` dispatches to `[.data.table`).
