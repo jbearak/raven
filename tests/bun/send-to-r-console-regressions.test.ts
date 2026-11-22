@@ -436,6 +436,26 @@ describe('package tasks follow a session console choice', () => {
     });
 
     // The fixture is a shell script.
+    test.skipIf(process.platform === 'win32')('a creation that finishes after a settings change keeps the newer one shared', async () => {
+        binary._clear_console_probes_for_test();
+        const slow = path.join(storage, 'raven-slow-probe-2');
+        fs.writeFileSync(slow, '#!/bin/sh\nsleep 0.3\necho "raven console"\n', { mode: 0o755 });
+        rtm._set_server_binaries_for_test(() => ({ configured: slow, bundled: BUNDLED }));
+        build.register_build_commands(context as never);
+        fake.set_setting('raven.rTerminal.program', 'global', 'raven');
+        const a = build.get_or_create_tasks_terminal();
+        await settle(20);
+        // radian's PATH check outlasts the first creation.
+        rtm._set_validator_for_test(async () => { await settle(700); return true; });
+        await fake.module.workspace.getConfiguration('raven').update('rTerminal.program', 'radian', fake.module.ConfigurationTarget.Global);
+        const b = build.get_or_create_tasks_terminal();
+        await a;
+        const c = build.get_or_create_tasks_terminal();
+        expect(await c).toBe(await b);
+        expect(fake.window.terminals.length).toBe(2);
+    });
+
+    // The fixture is a shell script.
     test.skipIf(process.platform === 'win32')('a task requested while the first is still starting follows the new choice', async () => {
         binary._clear_console_probes_for_test();
         // The first task's `console --help` probe takes a moment.
@@ -508,13 +528,14 @@ describe('a raven.server.path from before `raven console`', () => {
         expect(await binary.console_binary(b, () => undefined, async () => true)).toBe(file);
     });
 
-    test('a bare command name is stamped as the file PATH finds', async () => {
+    // Windows bare names aren't stamped (libuv's lookup isn't reproduced).
+    test.skipIf(process.platform === 'win32')('a bare command name is stamped as the file PATH finds', async () => {
         const dir = fs.mkdtempSync(path.join(storage, 'bin-'));
         const name = 'raven-on-path';
-        const file = path.join(dir, process.platform === 'win32' ? `${name}.exe` : name);
+        const file = path.join(dir, name);
         fs.writeFileSync(file, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
         const saved = process.env.PATH;
-        process.env.PATH = `${dir}${path.delimiter}${saved ?? ''}`;
+        process.env.PATH = dir;
         try {
             let probes = 0;
             const b = { configured: name, bundled: BUNDLED };

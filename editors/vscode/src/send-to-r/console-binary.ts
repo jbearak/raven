@@ -37,33 +37,22 @@ const probed = new Map<string, { stamp: string; ok: Promise<boolean> }>();
 
 /**
  * The file `execFile(binary)` runs. A bare command name (no directory) is
- * looked up on the extension host's PATH, in order, as `execFile` does
- * (on POSIX an empty entry is the working directory; on Windows the working
- * directory comes first, and each directory is tried with `.com` and
- * `.exe`, after the name as given only if it has an extension, as libuv
- * does). Anything else names a file relative to the working directory.
+ * looked up on the extension host's PATH, in order, as `execvp` does: an
+ * empty entry is the working directory, and files that can't be executed
+ * are passed over. Anything else names a file relative to the working
+ * directory. On Windows, libuv's lookup (working directory, quoted entries,
+ * extension rules) isn't reproduced: a bare name there isn't stamped.
  */
 function file_run_for(binary: string): string | undefined {
     const bare = path.basename(binary) === binary && !binary.includes('/');
     // With PATH unset the lookup falls back to platform defaults; don't
     // guess which file that finds (the result just isn't cached).
-    if (bare && process.env.PATH === undefined) return undefined;
-    // libuv parses quoted Windows PATH entries; don't guess at those either.
-    if (bare && process.platform === 'win32' && process.env.PATH?.includes('"')) return undefined;
+    if (bare && (process.platform === 'win32' || process.env.PATH === undefined)) return undefined;
     const candidates = bare
-        ? [
-            // libuv on Windows looks in the working directory first.
-            ...(process.platform === 'win32' ? [process.cwd()] : []),
-            ...(process.env.PATH ?? '').split(path.delimiter)
-                .map((dir) => (dir === '' && process.platform !== 'win32' ? '.' : dir))
-                .filter(Boolean),
-        ].flatMap((dir) =>
-            (process.platform !== 'win32' ? [''] : path.extname(binary) === '' ? ['.com', '.exe'] : ['', '.com', '.exe'])
-                .map((ext) => path.join(dir, binary + ext)))
+        ? (process.env.PATH ?? '').split(path.delimiter).map((dir) => path.join(dir || '.', binary))
         : [binary];
     return candidates.find((file) => {
         try {
-            // `execvp` passes over files it can't execute.
             if (process.platform !== 'win32') fs.accessSync(file, fs.constants.X_OK);
             return fs.statSync(file).isFile();
         } catch {

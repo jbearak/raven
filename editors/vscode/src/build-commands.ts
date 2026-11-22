@@ -167,10 +167,12 @@ export async function get_or_create_tasks_terminal(): Promise<vscode.Terminal> {
     // binary probe can take a while) means a new terminal, and
     // `create_tasks_terminal` leaves a terminal it finds stale uncached.
     if (tasks_creation_in_flight) return tasks_creation_in_flight.then(() => get_or_create_tasks_terminal());
-    tasks_creation_in_flight = create_tasks_terminal().finally(() => {
-        tasks_creation_in_flight = null;
+    const creation: Promise<vscode.Terminal> = create_tasks_terminal().finally(() => {
+        // A settings change may have started a newer creation meanwhile.
+        if (tasks_creation_in_flight === creation) tasks_creation_in_flight = null;
     });
-    return tasks_creation_in_flight;
+    tasks_creation_in_flight = creation;
+    return creation;
 }
 
 async function run_simple(code: string, target: 'r-console' | 'tasks'): Promise<void> {
