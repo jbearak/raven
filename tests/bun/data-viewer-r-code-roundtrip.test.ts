@@ -455,6 +455,17 @@ df$lab <- lab`,
         { name: 'labelled: even (a safe number)', filters: [{ ci: 3, p: { kind: 'setIn', values: [9007199254740992] } }] },
         { name: 'labelled: not odd', filters: [{ ci: 3, p: { kind: 'setNotIn', values: ['9007199254740993'] } }] },
         { name: 'sort by big desc', sort: [{ ci: 1, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
+        { name: 'sort by label', sort: [{ ci: 3, dir: 'desc' }, { ci: 0, dir: 'asc' }] },
+    ]);
+
+// Comparisons alone, in a session where nothing has loaded bit64 yet:
+// plain as.double() would read an integer64's raw bits.
+edgeSuite('Copy as R code round trip: integer64 comparisons with bit64 not loaded (real R)',
+    `df <- data.frame(id = 1:3)
+df$small <- bit64::as.integer64(c("2", "3", NA))`,
+    ['df'],
+    [
+        { name: 'small >= 2.5', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
     ]);
 
 // Infinite values picked in Value Counts: a labelled double (labels on 5)

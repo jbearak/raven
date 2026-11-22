@@ -184,7 +184,7 @@ function rVector(items: string[]): string {
 const LABEL_HELPER = [
     '# Each value\'s label where it has one, else the value, as the viewer shows with Labels on',
     'label_or_value <- function(x, labels) {',
-    '  key <- as.character(unclass(x))',
+    '  key <- if (inherits(x, "integer64")) bit64::as.character.integer64(x) else as.character(unclass(x))',
     '  out <- unname(labels[key])',
     '  out[is.na(out)] <- key[is.na(out)]',
     '  out[is.na(x)] <- NA',
@@ -308,8 +308,11 @@ function predicateCode(
     const p: FilterPredicate = entry.predicate;
     // The viewer compares an integer64 column as doubles (each value
     // rounded to the nearest one); bit64 would instead truncate a
-    // fractional bound and turn an infinite one into NA.
-    const num = isInt64(col) ? `as.double(${x})` : x;
+    // fractional bound and turn an infinite one into NA. The method is
+    // called by name: plain as.double() reads the raw bits unless bit64
+    // happens to be loaded.
+    const num = isInt64(col) ? `bit64::as.double.integer64(${x})` : x;
+    if (isInt64(col) && /^num/.test(p.kind)) ctx.needs.add('bit64');
     const str = isFactor(col) ? `as.character(${x})` : x;
     switch (p.kind) {
         case 'isEmpty': return { code: `is.na(${x})`, trueOnNA: true };
@@ -833,6 +836,7 @@ function sortTerms(ctx: Ctx): SortTerm[] {
                 text = `as.character(${x})`;
                 break;
             case 'valueLabel':
+                if (isInt64(col)) ctx.needs.add('bit64');
                 text = labelled(ctx, key.columnIndex);
                 break;
             case 'string': {
@@ -992,8 +996,11 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         const keptNames = objectNames(
             { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName);
         const kept = ambiguousNames(keptNames);
+        const names = objectNames(input, rownamesAsColumn, rownameName);
         const refused = [...new Set([
             ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
+            // tibble::rownames_to_column() refuses any dots name.
+            ...(rownamesAsColumn ? names.filter(isDots) : []),
             // select() itself refuses duplicates it leaves behind.
             ...(input.hiddenColumns.length > 0 ? kept : []),
             ...referenced.filter(isDots),

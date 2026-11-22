@@ -202,8 +202,8 @@ describe('generateRCode', () => {
             expect(code).toContain('big %in% bit64::as.integer64(c("9007199254740993", "3"))');
             // No unclass(): it would turn an integer64 into raw doubles.
             expect(code).toContain('lab %in% bit64::as.integer64("9007199254740993")');
-            expect(code).toContain('as.double(big) >= 2.5');
-            expect(code).toContain('as.double(big) >= 1 & as.double(big) <= Inf');
+            expect(code).toContain("bit64::as.double.integer64(big) >= 2.5");
+            expect(code).toContain("bit64::as.double.integer64(big) >= 1 & bit64::as.double.integer64(big) <= Inf");
             expect(code).not.toContain('9007199254740992');
         }
     });
@@ -231,5 +231,20 @@ describe('generateRCode', () => {
         expect(gen({ columns: cols, filter: f(1) })).toHaveProperty('error');
         expect(gen({ columns: cols, hiddenColumns: [0] })).toHaveProperty('error');
         expect(gen({ columns: cols, hiddenColumns: [1] })).toHaveProperty('code');
+        // tibble::rownames_to_column() refuses any dots name.
+        const withRn = [col('rowname', 'Utf8', { isRowname: true, typeTag: '<chr>' }), ...cols];
+        const rnFilter = { entries: [{ id: 'x', columnIndex: 0, predicate: { kind: 'isNotEmpty' as const }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true };
+        expect(gen({ columns: withRn, filter: rnFilter })).toHaveProperty('error');
+        expect(gen({ columns: withRn, filter: rnFilter }, 'base')).toHaveProperty('code');
+    });
+
+    test('integer64: a comparison alone still requires bit64', () => {
+        const r = gen({
+            columns: [col('big', 'Int64', { typeTag: '<integer64>' })],
+            filter: { entries: [{ id: 'x', columnIndex: 0, predicate: { kind: 'numCompare', op: '<', value: 3 }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        }, 'data.table');
+        const code = 'code' in r ? r.code : r.error;
+        expect(code).toContain('# Requires data.table, bit64');
+        expect(code).toContain('bit64::as.double.integer64(big) < 3');
     });
 });
