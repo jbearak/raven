@@ -114,7 +114,7 @@ When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps i
 
 ### Dates and times
 
-Dates print as `2024-03-01`, and date-times as `2024-03-01 09:00:00` in the column's own time zone (its `tzone` attribute), or the R session's zone when it has none. Hover over a date-time for the UTC offset in effect at that moment, so the two 01:30s on the night clocks fall back are told apart. Fractional seconds show 0, 3, or 6 digits, chosen once per column so the width doesn't change as you scroll. Years before 1 and after 9999 print as R prints them (`-044`, `10000`). A value too far from 1970 for the viewer to show reads `<out of range>`; hover for its raw seconds. If a time zone name isn't recognized, values show in UTC and the type line says so.
+Dates print as `2024-03-01`, and date-times as `2024-03-01 09:00:00` in the column's own time zone (its `tzone` attribute), or the R session's zone when it has none. Hover over a date-time for the UTC offset in effect at that moment, so the two 01:30s on the night clocks fall back are told apart. Fractional seconds show 0, 3, or 6 digits, chosen once per column so the width doesn't change as you scroll. (For data sent by an older Raven, each value shows the digits it has.) Years before 1 and after 9999 print as R prints them (`-044`, `10000`). A value too far from 1970 for the viewer to show reads `<out of range>`; hover for its raw seconds. If a time zone name isn't recognized, values show in UTC and the type line says so.
 
 <a id="columns-popover"></a>
 
@@ -166,7 +166,7 @@ Columns start wide enough for their name, type, label, and first loaded values, 
 | `Cmd/Ctrl+End` | Jump to the last cell (bottom-right). |
 | `PageUp` | Scroll one screen up. |
 | `PageDown` | Scroll one screen down. |
-| `Cmd/Ctrl+A` | Select all rows across visible columns. |
+| `Cmd/Ctrl+A` | Select all rows across visible columns, pinned ones included. |
 | `Cmd/Ctrl+C` | Copy the current selection as tab-separated text. |
 | `Cmd/Ctrl+F` | [Find](#find) in the visible columns. |
 | `Cmd/Ctrl+G` | [Go to row](#go-to-row). |

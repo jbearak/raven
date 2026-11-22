@@ -57,6 +57,7 @@ import { throwIfAborted } from './abort';
 import { BIN_COUNT, binEdges, binIndex, binsFrom } from './histograms';
 import { isNullAt } from './sort';
 import {
+    BigIntCounter,
     guaranteedOrder,
     hashNumber,
     hashString,
@@ -165,7 +166,7 @@ async function profileNumeric(
 ): Promise<ProfileResult> {
     const domain = numericDomain(col.arrowType);
     const cap = opts.exactCap ?? EXACT_DISTINCT_CAP;
-    const counter = new NumberCounter(cap);
+    const counter = exactCounter(col.arrowType, domain, cap);
     let hll: HyperLogLog | undefined;
     // Space-Saving past the cap only where top values are shown.
     const wantTop = kind === 'labelled';
@@ -202,13 +203,14 @@ async function profileNumeric(
             reservoir.add(x);
             if (declared) countDeclared(declared, String(x));
             if (hll === undefined) {
-                if (counter.add(x)) continue;
+                if (counter.add(raw, x)) continue;
                 // Overflow: seed the sketches from the exact counts so far.
                 hll = new HyperLogLog();
-                for (const [k] of counter.entries()) hll.addHash(hashNumber(k));
+                const seen = counter.asNumbers();
+                for (const [k] of seen) hll.addHash(hashNumber(k));
                 if (wantTop) {
                     ss = new SpaceSaving<number>(SPACE_SAVING_COUNTERS);
-                    ss.seed(counter.entries());
+                    ss.seed(seen);
                 }
             }
             hll.addHash(hashNumber(x));
@@ -314,11 +316,10 @@ async function profileNumeric(
     const labelOf = (v: number): string | undefined => col.valueLabels?.[String(v)];
     if (exact) {
         const entries: CountedEntry[] = [];
-        for (const [value, count] of counter.entries()) {
-            const label = kind === 'labelled' ? labelOf(value) : undefined;
+        for (const { value, count } of counter.sortedEntries()) {
+            const label = kind === 'labelled' ? labelOf(value as number) : undefined;
             entries.push(label !== undefined ? { value, label, count, error: 0 } : { value, count, error: 0 });
         }
-        entries.sort((a, b) => b.count - a.count || compareKeys(a.value, b.value));
         counts = { columnIndex, exact: true, entries, floor: 0, distinct, present, na: na + nan };
     } else if (ss) {
         const entries = ss.top().map(e => withLabel(e, kind === 'labelled' ? labelOf(e.value) : undefined));
@@ -631,6 +632,51 @@ function withLabel<K extends string | number | boolean>(
     return label !== undefined ? { ...e, label } : { ...e };
 }
 
+/** Exact value counts for a numeric column: on the double, or for a
+ *  64-bit integer column on the exact `bigint` (as doubles, distinct
+ *  integer64 values past 2^53 would merge). */
+type ExactCounter = {
+    readonly size: number;
+    /** Count one value (`raw` from the column, `x` its double); false
+     *  once the cap is reached with a new value. */
+    add(raw: number | bigint, x: number): boolean;
+    /** The counts as doubles, merged, to seed the sketches past the cap. */
+    asNumbers(): [number, number][];
+    /** Count-descending, ties by value. A 64-bit value a double can't
+     *  hold exactly is its decimal string. */
+    sortedEntries(): { value: number | string; count: number }[];
+};
+
+function exactCounter(arrowType: string, domain: NumericDomain, cap: number): ExactCounter {
+    if (domain === 'number' && /^(Int|Uint)64$/.test(arrowType)) {
+        const c = new BigIntCounter(cap);
+        return {
+            get size() { return c.size; },
+            add: (raw, x) => c.add(typeof raw === 'bigint' ? raw : BigInt(x)),
+            asNumbers: () => {
+                const m = new Map<number, number>();
+                for (const [k, n] of c.entries()) m.set(Number(k), (m.get(Number(k)) ?? 0) + n);
+                return [...m];
+            },
+            sortedEntries: () => [...c.entries()]
+                .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+                .map(([k, count]) => {
+                    const n = Number(k);
+                    return { value: Number.isSafeInteger(n) ? n : k.toString(), count };
+                }),
+        };
+    }
+    const c = new NumberCounter(cap);
+    return {
+        get size() { return c.size; },
+        add: (_raw, x) => c.add(x),
+        asNumbers: () => [...c.entries()],
+        sortedEntries: () => [...c.entries()]
+            .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+            .map(([value, count]) => ({ value, count })),
+    };
+}
+
 function compareKeys(a: CountedEntry['value'], b: CountedEntry['value']): number {
     if (typeof a === 'number' && typeof b === 'number') return a - b;
     const sa = String(a), sb = String(b);
@@ -683,7 +729,8 @@ function labelledLevels(col: ColumnSchema, declared: Map<string, number>): Colum
 export function valueCountsFrom(s: CountSummary, order: 'desc' | 'asc', limit: number): ValueCounts {
     const sorted = order === 'desc'
         ? s.entries
-        : [...s.entries].sort((a, b) => a.count - b.count || compareKeys(a.value, b.value));
+        // Stable: ties keep the summary's order (by value).
+        : [...s.entries].sort((a, b) => a.count - b.count);
     const entries = sorted.slice(0, limit);
     return {
         columnIndex: s.columnIndex,
@@ -715,11 +762,11 @@ export async function countValues(
         return r.counts!;
     }
     const cap = opts.exactCap ?? EXACT_DISTINCT_CAP;
-    const counter = new NumberCounter(cap);
+    const domain = numericDomain(col.arrowType);
+    const counter = exactCounter(col.arrowType, domain, cap);
     let ss: SpaceSaving<number> | undefined;
     let hll: HyperLogLog | undefined;
     let na = 0;
-    const domain = numericDomain(col.arrowType);
     await scan(reader, columnIndex, opts, (child, length) => {
         const data = child.data[0];
         const vals = data.values;
@@ -728,15 +775,17 @@ export async function countValues(
         const hasNulls = data.nullCount !== 0;
         for (let r = 0; r < length; r++) {
             if (hasNulls && isNullAt(data, r)) { na++; continue; }
-            let x: number = big ? Number(vals[off + r]) : vals[off + r];
+            const raw = vals[off + r];
+            let x: number = big ? Number(raw) : raw;
             if (domain === 'day-ms') x = Math.floor(x / 86_400_000);
             if (x !== x) { na++; continue; }
             if (!ss) {
-                if (counter.add(x)) continue;
+                if (counter.add(raw, x)) continue;
+                const seen = counter.asNumbers();
                 ss = new SpaceSaving<number>(SPACE_SAVING_COUNTERS);
-                ss.seed(counter.entries());
+                ss.seed(seen);
                 hll = new HyperLogLog();
-                for (const [k] of counter.entries()) hll.addHash(hashNumber(k));
+                for (const [k] of seen) hll.addHash(hashNumber(k));
             }
             ss.add(x);
             hll!.addHash(hashNumber(x));
@@ -745,8 +794,7 @@ export async function countValues(
     const present = reader.nrow - na;
     if (!ss) {
         const entries: CountedEntry[] = [];
-        for (const [value, count] of counter.entries()) entries.push({ value, count, error: 0 });
-        entries.sort((a, b) => b.count - a.count || (a.value as number) - (b.value as number));
+        for (const { value, count } of counter.sortedEntries()) entries.push({ value, count, error: 0 });
         return {
             columnIndex, exact: true, entries, floor: 0,
             distinct: { value: counter.size, exact: true }, present, na,

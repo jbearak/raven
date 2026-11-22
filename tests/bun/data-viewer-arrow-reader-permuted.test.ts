@@ -7,10 +7,13 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
 import { computePermutation } from '../../editors/vscode/src/data-viewer/sort';
+import { writeArrowFixture } from './_helpers/arrow-fixture-writer';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = (n: string) =>
@@ -134,6 +137,57 @@ describe('getRows without permutation: backwards compatibility', () => {
         });
         expect(out.rows.map(r => r[0])).toEqual([1, 2, 3]);
         expect(out.originalRowIndices).toBeUndefined();
+        await r.close();
+    });
+});
+
+describe('getRows with permutation: bulk windows (a large sorted copy)', () => {
+    const N = 3 * 4096;
+    const dir = mkdtempSync(join(tmpdir(), 'raven-dv-bulk-'));
+    const path = join(dir, 'bulk.arrow');
+    writeArrowFixture(path, {
+        nrow: N, chunkRows: 4096, columns: [
+            { name: 'i', kind: 'int', gen: i => (i % 7 === 0 ? null : i) },
+            { name: 'x', kind: 'dbl', gen: i => (i % 11 === 0 ? null : i / 4) },
+            { name: 's', kind: 'chr', gen: i => (i % 5 === 0 ? null : `s${i}`) },
+            { name: 'b', kind: 'lgl', gen: i => (i % 3 === 0 ? null : i % 2 === 0) },
+        ],
+    });
+    const columns = [0, 1, 2, 3];
+    const spy = (r: any) => {
+        const calls = { gather: 0, gatherColumn: 0 };
+        for (const k of ['gather', 'gatherColumn'] as const) {
+            const orig = r[k].bind(r);
+            r[k] = (...a: any[]) => { calls[k]++; return orig(...a); };
+        }
+        return calls;
+    };
+
+    test('a densely covered batch reads fixed-width columns as chunks; strings still gather', async () => {
+        // A fresh reader, read first: the chunks come from disk, not a warm cache.
+        const r = await ArrowSliceReader.open(path);
+        const calls = spy(r);
+        const reverse = Uint32Array.from({ length: N }, (_, i) => N - 1 - i);
+        const out = await r.getRows({ start: 0, end: N, columns, viewportGeneration: 1, permutation: reverse });
+        // One gather, for the one string column only.
+        expect(calls.gather).toBe(1);
+        expect(calls.gatherColumn).toBe(1);
+        const plain = await r.getRows({ start: 0, end: N, columns, viewportGeneration: 1 });
+        expect(out.rows).toEqual([...plain.rows].reverse());
+        await r.close();
+    });
+
+    test('a sparse window gathers one column at a time, with the same cells', async () => {
+        const r = await ArrowSliceReader.open(path);
+        const calls = spy(r);
+        const plain = await r.getRows({ start: 0, end: N, columns, viewportGeneration: 1 });
+        // Every 64th row, last first: under a quarter of each batch.
+        const picks = Uint32Array.from({ length: N / 64 }, (_, i) => N - 1 - i * 64);
+        const out = await r.getRows({ start: 0, end: picks.length, columns, viewportGeneration: 1, permutation: picks });
+        // Fixed-width columns, then strings: each column gathered once.
+        expect(calls.gather).toBe(2);
+        expect(calls.gatherColumn).toBe(columns.length);
+        expect(out.rows).toEqual([...picks].map(p => plain.rows[p]));
         await r.close();
     });
 });

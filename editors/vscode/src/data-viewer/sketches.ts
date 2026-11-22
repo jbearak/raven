@@ -120,6 +120,33 @@ export class HyperLogLog {
  * values; existing ones keep counting). NaN must not be added (callers
  * count it separately); `-0` counts as `+0`.
  */
+/**
+ * Exact counts of 64-bit integers (R's `bit64::integer64`), keyed on the
+ * `bigint` itself: as doubles, distinct values past 2^53 would merge.
+ * Same contract as {@link NumberCounter}.
+ */
+export class BigIntCounter {
+    private readonly counts = new Map<bigint, number>();
+    constructor(readonly cap: number) {}
+
+    get size(): number { return this.counts.size; }
+
+    add(x: bigint): boolean {
+        const c = this.counts.get(x);
+        if (c !== undefined) {
+            this.counts.set(x, c + 1);
+            return true;
+        }
+        if (this.counts.size >= this.cap) return false;
+        this.counts.set(x, 1);
+        return true;
+    }
+
+    entries(): IterableIterator<[bigint, number]> {
+        return this.counts.entries();
+    }
+}
+
 export class NumberCounter {
     private readonly keys: Float64Array;
     private readonly counts: Uint32Array;

@@ -171,6 +171,14 @@ describe('timestamps', () => {
         expect(formatCell(tsCell(0), utc3, undefined, on).text).toBe('1970-01-01 00:00:00.000');
         expect(formatCell(tsCell(0.5), utc3, undefined, on).text).toBe('1970-01-01 00:00:00.500');
     });
+    test('without raven.subsecond_digits (older writers) each value shows the digits it has', () => {
+        const old = ts({ timeZone: 'UTC' });
+        expect(formatCell(tsCell(1738540800.125), old, undefined, on).text).toBe('2025-02-03 00:00:00.125');
+        expect(formatCell(tsCell(1738540800.875), old, undefined, on).text).toBe('2025-02-03 00:00:00.875');
+        expect(formatCell(tsCell(1738540800), old, undefined, on).text).toBe('2025-02-03 00:00:00');
+        expect(formatCell(encodeTimestampMicros(123456n), old, undefined, on).text).toBe('1970-01-01 00:00:00.123456');
+        expect(formatCell(tsCell(-0.25), old, undefined, on).text).toBe('1969-12-31 23:59:59.750');
+    });
     test('microsecond digits 4-6 come from the wire us part', () => {
         const utc6 = ts({ timeZone: 'UTC', subsecondDigits: 6 });
         expect(formatCell(encodeTimestampMicros(123456n), utc6, undefined, on).text).toBe('1970-01-01 00:00:00.123456');

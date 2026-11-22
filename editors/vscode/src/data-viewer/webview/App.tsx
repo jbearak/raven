@@ -56,6 +56,7 @@ import {
     clampToData,
     copyColumns,
     displayIndexOf,
+    firstSelectableDisplayIndex,
     frozenFits,
     isGutter,
     isPinned,
@@ -2011,7 +2012,7 @@ export function App({
             if (document.activeElement?.closest?.('.grid-bar')) return;
             if (event.key === 'a' || event.key === 'A') {
                 event.preventDefault();
-                const next = createAllColumnsSelection(display.count, display.freezeColumns);
+                const next = createAllColumnsSelection(display.count, firstSelectableDisplayIndex(display));
                 setGridSelection(next);
                 postLifecycle('select-all', visibleRangeRef.current, next);
             } else if (event.key === 'c' || event.key === 'C') {
@@ -3067,18 +3068,17 @@ export function App({
                     experimental={glideExperimental}
                     gridSelection={gridSelection}
                     onGridSelectionChange={selection => {
-                        // The gutter and rowname columns (the frozen
-                        // display indices) are never part of a column
-                        // selection.
-                        const frozen: [number, number] = [0, display.freezeColumns];
-                        const next = selection.columns.hasIndex(0) || display.freezeColumns > 1
-                            ? { ...selection, columns: selection.columns.remove(frozen) }
+                        // The gutter and rowname columns are never part
+                        // of a column selection; pinned columns are.
+                        const firstSelectable = firstSelectableDisplayIndex(display);
+                        const next = selection.columns.hasIndex(0) || firstSelectable > 1
+                            ? { ...selection, columns: selection.columns.remove([0, firstSelectable]) }
                             : selection;
                         setGridSelection(next);
                         postLifecycle('selection', visibleRangeRef.current, next);
                     }}
                     onHeaderClicked={colIndex => {
-                        if (colIndex < display.freezeColumns) return;
+                        if (colIndex < firstSelectableDisplayIndex(display)) return;
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
                         postLifecycle('header-click', visibleRangeRef.current, next);

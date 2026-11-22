@@ -124,6 +124,13 @@ export function firstDataDisplayIndex(dc: DisplayColumns): number {
     return dc.dataCols.length > 0 ? 1 : -1;
 }
 
+/** First display index a column selection may hold: past the gutter
+ *  and the rowname columns. Pinned columns are frozen too, but they are
+ *  data, so they can be selected and copied. */
+export function firstSelectableDisplayIndex(dc: DisplayColumns): number {
+    return 1 + dc.rownameCols.length;
+}
+
 /** Clamp a display index into the data range (never the gutter). */
 export function clampToData(dc: DisplayColumns, displayIndex: number): number {
     return Math.max(1, Math.min(dc.count - 1, displayIndex));
