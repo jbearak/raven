@@ -39732,6 +39732,31 @@ mod project_config_initialize_tests {
     /// file has no commit of its own and its index entry still carries `a`.
     #[tokio::test]
     async fn an_open_file_follows_its_directory_through_a_closed_parent() {
+        follow_directory_through_closed_parent("source(\"../mods/child.R\")\n", "").await;
+    }
+
+    /// As above, with the child also naming the closed file in a
+    /// `# raven: sourced-by` directive: the directive reads the closed
+    /// parent's directory, which must be re-derived too rather than read from
+    /// its stale index entry.
+    #[tokio::test]
+    async fn an_open_file_follows_its_directory_through_a_closed_sourced_by_parent() {
+        follow_directory_through_closed_parent(
+            "source(\"../mods/child.R\")\n",
+            "# raven: sourced-by middle.R\n",
+        )
+        .await;
+    }
+
+    /// As above, with the directive the child's only link to the closed
+    /// file: the refresh must reach the child over the backward-directive
+    /// edge.
+    #[tokio::test]
+    async fn an_open_file_follows_its_directory_through_a_closed_sourced_by_only_parent() {
+        follow_directory_through_closed_parent("x <- 1\n", "# raven: sourced-by middle.R\n").await;
+    }
+
+    async fn follow_directory_through_closed_parent(middle_text: &str, child_header: &str) {
         use futures_util::{SinkExt, StreamExt};
         use tower::{Service, ServiceExt};
         use tower_lsp::jsonrpc::Request;
@@ -39742,9 +39767,10 @@ mod project_config_initialize_tests {
             fs::create_dir_all(base.join(dir)).unwrap();
         }
         let main_text = |dir: &str| format!("# raven: cd {dir}\nsource(\"../mods/middle.R\")\n");
-        let child_text = "source(\"constants.R\")\nprint(special_value)\n";
+        let child_text = format!("{child_header}source(\"constants.R\")\nprint(special_value)\n");
+        let child_text = child_text.as_str();
         fs::write(base.join("main.R"), main_text("a")).unwrap();
-        fs::write(base.join("mods/middle.R"), "source(\"../mods/child.R\")\n").unwrap();
+        fs::write(base.join("mods/middle.R"), middle_text).unwrap();
         fs::write(base.join("mods/child.R"), child_text).unwrap();
         fs::write(base.join("a/constants.R"), "old_value <- 1\n").unwrap();
         fs::write(base.join("b/constants.R"), "special_value <- 2\n").unwrap();
