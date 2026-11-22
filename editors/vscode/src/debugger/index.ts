@@ -368,7 +368,11 @@ class ConsoleLink {
                 // after that, stop holding sends for it.
                 setTimeout(() => {
                     if (this.heard || this.closed) return;
-                    if (this.reprobed) return this.release();
+                    if (this.reprobed) {
+                        // A mirror still to land schedules its own timer.
+                        if (!this.in_flight && !this.again) this.release();
+                        return;
+                    }
                     this.reprobed = true;
                     this.mirror();
                 }, 1_000);
