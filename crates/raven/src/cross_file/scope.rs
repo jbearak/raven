@@ -9437,15 +9437,13 @@ where
             })
         };
         let graph_uri = || {
-            graph
-                .get_dependencies(uri)
-                .iter()
-                .find(|edge| {
-                    edge.is_ordinary_source()
-                        && edge.call_site_line == Some(src_line)
-                        && edge.call_site_column == Some(src_col)
-                })
-                .map(|edge| edge.to.clone())
+            super::dependency::ordinary_source_edge_at(
+                &graph.get_dependencies(uri),
+                src_line,
+                src_col,
+                source,
+            )
+            .map(|edge| edge.to.clone())
         };
         if prefer_supplied_path_context && source.system_file.is_none() {
             resolve_lexically()
@@ -10460,7 +10458,7 @@ where
     /// One-shot child-source resolution cache, keyed by source-call effect
     /// position. The same call site may be applied to both the strict and
     /// late frames; computing once and reusing is the whole point.
-    source_contributions: HashMap<(u32, u32, u64), ChildSourceContribution>,
+    source_contributions: HashMap<(u32, u32, bool, u64), ChildSourceContribution>,
     /// Ordered `targets::tar_source()` batch contributions. Kept separate
     /// from ordinary source contributions because the two event kinds have
     /// different merge semantics.
@@ -11256,6 +11254,7 @@ where
                 let key = (
                     *src_line,
                     *src_col,
+                    source.is_directive,
                     package_set_fingerprint(&attached_for_child),
                 );
                 if !self.source_contributions.contains_key(&key) {
@@ -11909,7 +11908,7 @@ where
         // Dedup note: contributions at different call sites are distinct; there
         // is no double-counting risk from the strict/late frame both hitting the
         // same `source_contributions` entry (both share the cached struct).
-        for (&(src_line, src_col, _), contrib) in &self.source_contributions {
+        for (&(src_line, src_col, _, _), contrib) in &self.source_contributions {
             let effect_col = src_col.saturating_add(1);
             if (src_line, effect_col) <= self.cursor {
                 scope.chain.extend(contrib.chain.iter().cloned());
@@ -12419,6 +12418,7 @@ where
                 let key = (
                     *src_line,
                     *src_col,
+                    source.is_directive,
                     package_set_fingerprint(&attached_for_child),
                 );
                 if !self.source_contributions.contains_key(&key) {
@@ -12561,29 +12561,27 @@ where
         src_col: u32,
         source: &ForwardSource,
     ) -> Option<Url> {
-        self.graph
-            .get_dependencies(self.queried_uri)
-            .iter()
-            .find(|edge| {
-                edge.is_ordinary_source()
-                    && edge.call_site_line == Some(src_line)
-                    && edge.call_site_column == Some(src_col)
-            })
-            .map(|edge| edge.to.clone())
-            .or_else(|| {
-                source.resolved_uri.clone().or_else(|| {
-                    self.path_ctx.as_ref().and_then(|ctx| {
-                        // Forward source()/directive paths use the workspace-root
-                        // fallback variant so this last-resort seam honors the same
-                        // fallback invariant as the graph edge it stands in for.
-                        let resolved = super::path_resolve::resolve_path_with_workspace_fallback(
-                            &source.path,
-                            ctx,
-                        )?;
-                        super::path_resolve::path_to_uri(&resolved)
-                    })
+        super::dependency::ordinary_source_edge_at(
+            &self.graph.get_dependencies(self.queried_uri),
+            src_line,
+            src_col,
+            source,
+        )
+        .map(|edge| edge.to.clone())
+        .or_else(|| {
+            source.resolved_uri.clone().or_else(|| {
+                self.path_ctx.as_ref().and_then(|ctx| {
+                    // Forward source()/directive paths use the workspace-root
+                    // fallback variant so this last-resort seam honors the same
+                    // fallback invariant as the graph edge it stands in for.
+                    let resolved = super::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        ctx,
+                    )?;
+                    super::path_resolve::path_to_uri(&resolved)
                 })
             })
+        })
     }
 
     /// The net global effects a top-level current-frame `source()` brings in;

@@ -456,13 +456,21 @@ where
             let mut found_matching_directive = false;
             let directive_covers_ast = directive_candidates
                 .iter()
-                .map(|candidate| &candidate.edge)
-                .filter(|edge| edge.directive_conflict_identity() == pair)
-                .any(|dir_edge| {
+                .filter(|candidate| candidate.edge.directive_conflict_identity() == pair)
+                .any(|candidate| {
                     found_matching_directive = true;
+                    let dir_edge = &candidate.edge;
                     let directive_call_site = dir_edge.call_site_identity();
 
-                    if directive_call_site.is_known_directive_call_site() {
+                    if let (CallSiteBasis::Line, PlanEntry::Source(directive)) =
+                        (candidate.basis, candidate.entry)
+                    {
+                        // A `line=N` forward directive covers a call to the
+                        // same file anywhere on line N. Extraction keeps
+                        // every call, so this is the only place a call on
+                        // the directive's line is dropped (issue #814).
+                        meta.sources[directive].is_line_directive_at_call(source)
+                    } else if directive_call_site.is_known_directive_call_site() {
                         // A known directive covers only an AST edge at the
                         // same call site. All matching directives participate
                         // because one relationship can retain multiple

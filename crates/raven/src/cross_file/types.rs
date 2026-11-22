@@ -902,6 +902,24 @@ impl<'de> Deserialize<'de> for ForwardSource {
 }
 
 impl ForwardSource {
+    /// Whether this is a `line=N` forward directive whose call site is the
+    /// line the `source()` call `call` is on.
+    ///
+    /// Such a directive stands in for the call when both also resolve to the
+    /// same file; the caller compares the targets with its own resolver. The
+    /// column isn't compared, because a directive's is always 0. Batch members
+    /// are never covered. The edge plan and the missing-file collector share
+    /// this so they agree on which calls a directive covers (issue #814).
+    pub(crate) fn is_line_directive_at_call(&self, call: &ForwardSource) -> bool {
+        self.is_directive
+            && self.explicit_line
+            && self.line != u32::MAX
+            && !call.is_directive
+            && !call.is_source_batch_member()
+            && call.source_batch_kind.is_none()
+            && call.line == self.line
+    }
+
     /// Whether this source is one member of an ordered expansion batch.
     pub fn is_source_batch_member(&self) -> bool {
         self.tar_source_ordinal.is_some()

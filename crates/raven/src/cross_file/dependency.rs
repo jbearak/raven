@@ -12,7 +12,7 @@ pub(crate) mod export;
 pub(crate) mod plan;
 
 use super::path_resolve::{PathContext, path_to_uri, resolve_path};
-use super::types::{CrossFileMetadata, SourceBatchKind, SourceLocality};
+use super::types::{CrossFileMetadata, ForwardSource, SourceBatchKind, SourceLocality};
 use plan::{ExcludedGraphEntries, GraphTrace};
 
 /// Resolve the effective working directory of a parent file for inheritance,
@@ -576,6 +576,36 @@ pub struct DependencyEdge {
 struct DirectiveConflictIdentity {
     from: Url,
     to: Url,
+}
+
+/// The ordinary source edge among a file's outgoing `edges` that the timeline
+/// source `source` at (`line`, `column`) stands for.
+///
+/// A `line=N` forward directive and a `source()` call at column 0 of line N
+/// share a call site while naming different files, so among the edges at the
+/// site the one with the source's own provenance (forward directive or not)
+/// wins. Any other edge at the site is the fallback: a call the directive
+/// covers has no edge of its own, and a backward directive's edge can sit on
+/// the call it matched.
+pub(crate) fn ordinary_source_edge_at<'a>(
+    edges: &[&'a DependencyEdge],
+    line: u32,
+    column: u32,
+    source: &ForwardSource,
+) -> Option<&'a DependencyEdge> {
+    let mut at_site = edges.iter().copied().filter(|edge| {
+        edge.is_ordinary_source()
+            && edge.call_site_line == Some(line)
+            && edge.call_site_column == Some(column)
+    });
+    let first = at_site.next()?;
+    let is_own = |edge: &DependencyEdge| {
+        (edge.is_directive && !edge.is_backward_directive) == source.is_directive
+    };
+    if is_own(first) {
+        return Some(first);
+    }
+    Some(at_site.find(|edge| is_own(edge)).unwrap_or(first))
 }
 
 /// Position component of a source invocation identity.
