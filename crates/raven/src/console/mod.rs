@@ -117,6 +117,11 @@ fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
             it.next().ok_or_else(|| format!("{name} needs a value"))
         };
         match a.to_str() {
+            // The rest belongs to the R program (`commandArgs(TRUE)`).
+            Some("--args") => {
+                o.r_args.push(a);
+                o.r_args.extend(it.by_ref());
+            }
             Some("--help") => return Ok(None),
             Some("--r-home") => o.r_home = Some(PathBuf::from(value("--r-home")?)),
             Some("--ipc") => o.ipc = Some(PathBuf::from(value("--ipc")?)),
@@ -1475,6 +1480,14 @@ mod tests {
         assert!(runs_a_program(&args(&["--file=x.R"])));
         assert!(!runs_a_program(&args(&["--no-save", "-q"])));
         assert!(!runs_a_program(&args(&["--args", "-e", "1"])));
+        // Raven's own options after `--args` are the program's, not Raven's.
+        let o = parse_args(args(&["-e", "1", "--args", "--help", "--no-history"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            o.r_args,
+            args(&["-e", "1", "--args", "--help", "--no-history"])
+        );
     }
 
     #[test]

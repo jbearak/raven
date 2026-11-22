@@ -773,6 +773,8 @@ fn forked_workers_output_reaches_the_terminal() {
          mc.cores = 2)); cat('ALL', 'DONE\\n', sep = '')",
     );
     let out = c.expect("ALLDONE");
+    let all = strip_ansi(&String::from_utf8_lossy(&c.out));
+    assert!(!all.contains("starting plain R"), "{all}");
     for i in 1..=2 {
         for w in ["first", "last"] {
             let line = format!("worker {i} {w}");

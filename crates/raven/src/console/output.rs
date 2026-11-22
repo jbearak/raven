@@ -760,9 +760,6 @@ impl Output {
     }
 
     pub fn set_headers(&self, headers: Headers) {
-        if forked() {
-            return;
-        }
         self.lock().stderr_class.headers = headers;
     }
 
