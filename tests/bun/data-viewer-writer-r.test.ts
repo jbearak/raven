@@ -362,4 +362,41 @@ describe('View() writer (real R)', () => {
         expect(cols[fmts.length].arrowType.startsWith('Date')).toBe(true);
         await reader.close();
     }, 60_000);
+
+    // The writer addresses columns by position: a name would reach the
+    // first of two columns that share it, or no column for an empty name.
+    test.skipIf(!HAS_ARROW)('duplicate names: each column gets its own conversion and metadata', async () => {
+        const r = await runR([
+            'df <- data.frame(id = 1:2)',
+            'df$a <- as.difftime(c(1, 2), units = "hours")',
+            'df$b <- as.difftime(c(1, 2), units = "mins")',
+            'attr(df$b, "label") <- "Minutes"',
+            'names(df) <- c("id", "d", "d")',
+            'View(df)',
+        ].join('\n'));
+        expect(r.files).toHaveLength(1);
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const cols = reader.schema.columns;
+        expect(cols.map(c => c.name)).toEqual(['id', 'd', 'd']);
+        expect(cols.map(c => c.typeTag)).toEqual(['<int>', '<drtn hours>', '<drtn mins>']);
+        expect(cols.map(c => c.variableLabel)).toEqual([undefined, undefined, 'Minutes']);
+        const cell = async (row: number, col: number) => (await reader.getCellText(row, col, 100)).text;
+        expect([await cell(0, 1), await cell(0, 2), await cell(1, 2)]).toEqual(['1', '1', '2']);
+        await reader.close();
+    }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('an empty column name opens', async () => {
+        const r = await runR([
+            'df <- data.frame(id = 1:3, x = c(10, 20, 30), y = c("a", "b", "c"))',
+            'names(df)[2] <- ""',
+            // R echoes its input, so the marker is assembled at run time.
+            'tryCatch(View(df), error = function(e) cat(paste0("VIEW_", "ERROR="), conditionMessage(e), sep = ""))',
+        ].join('\n'));
+        expect(r.stdout).not.toContain('VIEW_ERROR');
+        expect(r.files).toHaveLength(1);
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        expect(reader.schema.columns.map(c => [c.name, c.typeTag])).toEqual([['id', '<int>'], ['', '<dbl>'], ['y', '<chr>']]);
+        expect((await reader.getCellText(2, 1, 100)).text).toBe('30');
+        await reader.close();
+    }, 60_000);
 });

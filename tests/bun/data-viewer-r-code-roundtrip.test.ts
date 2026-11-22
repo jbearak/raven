@@ -474,3 +474,19 @@ df$y <- c(Inf, 0, 5, -Inf, NaN)`,
         { name: 'plain: < Inf', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: Infinity } }] },
         { name: 'plain: between -Inf and 0', filters: [{ ci: 2, p: { kind: 'numBetween', lo: -Infinity, hi: 0, inclusive: true } }] },
     ]);
+
+// Empty and duplicate names through the real writer (which addresses
+// columns by position): the code reaches each column by position.
+edgeSuite('Copy as R code round trip: empty and duplicate names from the writer (real R)',
+    `df <- data.frame(id = 1:3, x = c(30, 10, 20), y = c(1, 2, 3))
+names(df)[2] <- ""
+df$d <- as.difftime(c(2, 1, 3), units = "hours")
+df$e <- as.difftime(c(60, 180, 120), units = "mins")
+names(df)[4:5] <- c("d", "d")`,
+    ['df', 'dtobj'],
+    [
+        { name: 'filter the empty-named column', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 15 } }], refuse: ['dplyr'] },
+        { name: 'sort by the second d (minutes)', sort: [{ ci: 4, dir: 'asc' }], refuse: ['dplyr'] },
+        { name: 'filter the first d (hours)', filters: [{ ci: 3, p: { kind: 'numCompare', op: '>=', value: 2 } }], refuse: ['dplyr'] },
+        { name: 'hide the empty-named column', hide: [1], refuse: ['dplyr'] },
+    ]);
