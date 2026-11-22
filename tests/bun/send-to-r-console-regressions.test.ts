@@ -340,7 +340,8 @@ describe("every send to Raven's console goes through its ordered socket", () => 
         return { terminal, socket, server };
     }
 
-    test('Source File does not type into the prompt', async () => {
+    // The fixture listens on a Unix socket path; Windows consoles use a named pipe.
+    test.skipIf(process.platform === 'win32')('Source File does not type into the prompt', async () => {
         const { terminal, server } = await raven_console();
         await send.deliver_to_target({ kind: 'terminal', terminal: terminal as never }, 'source("/a.R", echo = TRUE)', { how: 'text' });
         await settle(100);
@@ -349,7 +350,8 @@ describe("every send to Raven's console goes through its ordered socket", () => 
         server.close();
     });
 
-    test('a quick inspection waits behind an earlier gated send', async () => {
+    // The fixture listens on a Unix socket path; Windows consoles use a named pipe.
+    test.skipIf(process.platform === 'win32')('a quick inspection waits behind an earlier gated send', async () => {
         const { terminal, socket, server } = await raven_console();
         let open!: () => void;
         ipc.gate_sends(socket, new Promise<void>((r) => { open = r; }));
