@@ -20,7 +20,9 @@ const SAS_SPSS_INTEGER_NAMES: ReadonlySet<string> = new Set([
     'DOLLAR',
     'Z',
     'N',
-    'PERCENT', 'PCT',
+    // SPSS PCT shows the stored value; SAS PERCENT multiplies it by 100,
+    // so PERCENTw.0 says nothing about the stored value being whole.
+    'PCT',
 ]);
 
 export function formatDeclaresInteger(fmt: string | undefined): boolean {

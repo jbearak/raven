@@ -41,8 +41,11 @@ describe('formatDeclaresInteger — SAS / SPSS', () => {
     test('Z3. → integer', () => {
         expect(formatDeclaresInteger('Z3.')).toBe(true);
     });
-    test('PERCENT8.0 → integer', () => {
-        expect(formatDeclaresInteger('PERCENT8.0')).toBe(true);
+    test('PCT8.0 → integer (SPSS shows the stored value)', () => {
+        expect(formatDeclaresInteger('PCT8.0')).toBe(true);
+    });
+    test('PERCENT8.0 → not integer (SAS multiplies the stored value by 100)', () => {
+        expect(formatDeclaresInteger('PERCENT8.0')).toBe(false);
     });
     test('bare width "8.0" → integer (defaults to F)', () => {
         expect(formatDeclaresInteger('8.0')).toBe(true);

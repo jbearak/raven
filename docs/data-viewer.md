@@ -110,7 +110,7 @@ On by default in new panels. When on, non-integer numeric columns are rounded to
 - A number too wide for its column shows `###` rather than its leading digits. Hover over it for the full value, or widen the column.
 - With Format off, numbers show at full precision, with R-style exponents (`1e-07`).
 
-When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps it), Format uses it instead of the dropdown. Raven honors Stata `%w.df`, `%w.dfc` (with thousands separators), and `%w.dg` (significant digits), and SPSS and SAS `Fw.d`, `COMMAw.d`, `DOLLARw.d` (with a `$`), `PCTw.d` and `PERCENTw.d` (with a `%`, value unchanged), and `Zw.` (zero-padded). Other formats fall back to the dropdown. A column formatted for whole numbers (`%9.0f`, `F8.0`) is treated like an integer column, and the toggle is hidden when no other column would be affected.
+When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps it), Format uses it instead of the dropdown. Raven honors Stata `%w.df`, `%w.dfc` (with thousands separators), and `%w.dg` (significant digits), and SPSS and SAS `Fw.d`, `COMMAw.d`, `DOLLARw.d` (with a `$`), and `Zw.` (zero-padded). SPSS `PCTw.d` adds a `%` to the value as stored (25 shows as `25.00%`). SAS `PERCENTw.d` multiplies by 100 and shows negatives in parentheses (0.25 shows as `25.00%`, -0.25 as `(25.00%)`); `PERCENTNw.d` uses a minus sign instead. Other formats fall back to the dropdown. A column formatted for whole numbers (`%9.0f`, `F8.0`) is treated like an integer column, and the toggle is hidden when no other column would be affected.
 
 ### Dates and times
 

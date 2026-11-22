@@ -23,6 +23,11 @@ describe('render_tsv', () => {
         expect(tsv).toBe('1\t1.5\t1\t1\n2\t2.25\t2\t2');
     });
 
+    test('SAS PERCENT copies as shown: the value × 100', () => {
+        const pct: ColumnSchema = { name: 'p', arrowType: 'Float64', isInteger: false, dictionaryShipped: false, format: 'PERCENT8.2' };
+        expect(render_tsv([[0.25] as any, [0.75] as any], [0], [pct], {}, false, true, 3)).toBe('25.00%\n75.00%');
+    });
+
     test('Labels on swaps dictionary index for level', () => {
         const rows = [[1, 1.5, 2, 1] as any];
         const tsv = render_tsv(rows, [0, 1, 2, 3], cols, dictionaries, true, false, 3);

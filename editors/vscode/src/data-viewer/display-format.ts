@@ -39,6 +39,11 @@ export type NumberFormatSpec =
         thousands: boolean;
         prefix: string;
         suffix: string;
+        /** Multiplier applied before formatting (100 for SAS `PERCENT`). */
+        scale: number;
+        /** How a negative value shows: `-$5.00`, or `(25.00%)` (SAS
+         *  `PERCENT`). The sign goes before the prefix, as in SAS and SPSS. */
+        negative: 'minus' | 'parens';
     }
     | { kind: 'significant'; digits: number }
     | { kind: 'zeroPadded'; width: number };
@@ -48,9 +53,16 @@ export type NumberFormatSpec =
  *
  *   Stata     `%w.df`, `%w.dfc` (thousands), `%w.0f`, `%w.dg` (d > 0,
  *             significant digits; `%w.0g` means "as needed" and falls back)
- *   SPSS/SAS  `Fw.d`, `COMMAw.d`, `DOLLARw.d` (prefix `$`, thousands),
- *             `PCTw.d` / `PERCENTw.d` (suffix `%`, value unchanged),
- *             `Zw.` (zero-padded integer)
+ *   SPSS/SAS  `Fw.d`, `COMMAw.d`, `DOLLARw.d` (prefix `$`, thousands;
+ *             negatives `-$5.00`), `Zw.` (zero-padded integer)
+ *   SPSS      `PCTw.d`: the value as stored, then `%` (25 → `25.00%`)
+ *   SAS       `PERCENTw.d`: the value × 100, then `%`, negatives in
+ *             parentheses (0.25 → `25.00%`, -0.25 → `(25.00%)`);
+ *             `PERCENTNw.d` the same with a minus sign
+ *
+ * The writer stores one format string without saying which program it
+ * came from, so names are read by their documented meaning: `PCT` is
+ * SPSS-only and `PERCENT` is SAS-only.
  */
 export function parseDisplayFormat(fmt: string | undefined): NumberFormatSpec | undefined {
     if (!fmt) return undefined;
@@ -61,7 +73,7 @@ export function parseDisplayFormat(fmt: string | undefined): NumberFormatSpec | 
         if (stata[3].startsWith('g')) {
             return decimals > 0 ? { kind: 'significant', digits: decimals } : undefined;
         }
-        return { kind: 'fixed', decimals, thousands: stata[3] === 'fc', prefix: '', suffix: '' };
+        return fixedSpec(decimals, { thousands: stata[3] === 'fc' });
     }
     const named = /^([A-Z]*)(\d+)\.(\d*)$/.exec(t.toUpperCase());
     if (!named) return undefined;
@@ -70,19 +82,31 @@ export function parseDisplayFormat(fmt: string | undefined): NumberFormatSpec | 
     switch (name) {
         case '':
         case 'F':
-            return { kind: 'fixed', decimals, thousands: false, prefix: '', suffix: '' };
+            return fixedSpec(decimals, {});
         case 'COMMA':
-            return { kind: 'fixed', decimals, thousands: true, prefix: '', suffix: '' };
+            return fixedSpec(decimals, { thousands: true });
         case 'DOLLAR':
-            return { kind: 'fixed', decimals, thousands: true, prefix: '$', suffix: '' };
+            return fixedSpec(decimals, { thousands: true, prefix: '$' });
         case 'PCT':
+            return fixedSpec(decimals, { suffix: '%' });
         case 'PERCENT':
-            return { kind: 'fixed', decimals, thousands: false, prefix: '', suffix: '%' };
+            return fixedSpec(decimals, { suffix: '%', scale: 100, negative: 'parens' });
+        case 'PERCENTN':
+            return fixedSpec(decimals, { suffix: '%', scale: 100 });
         case 'Z':
             return dec === '' || decimals === 0 ? { kind: 'zeroPadded', width: Number(width) } : undefined;
         default:
             return undefined;
     }
+}
+
+function fixedSpec(
+    decimals: number,
+    o: Partial<Omit<Extract<NumberFormatSpec, { kind: 'fixed' }>, 'kind' | 'decimals'>>,
+): NumberFormatSpec {
+    return {
+        kind: 'fixed', decimals, thousands: false, prefix: '', suffix: '', scale: 1, negative: 'minus', ...o,
+    };
 }
 
 // ---------------------------------------------------------------------
@@ -161,9 +185,20 @@ export function formatNumber(x: number, o: NumberFormatOptions): string {
         return formatFullPrecision(Number(x.toPrecision(spec.digits)));
     }
     if (spec?.kind === 'fixed') {
-        if (needsScientific(x, spec.decimals)) return formatScientific(x, Math.max(1, spec.decimals));
-        const fixed = x.toFixed(usableDecimals(x, spec.decimals));
-        return `${spec.prefix}${spec.thousands ? withThousands(fixed) : fixed}${spec.suffix}`;
+        const v = x * spec.scale;
+        const a = Math.abs(v);
+        let body: string;
+        if (needsScientific(a, spec.decimals)) {
+            body = formatScientific(a, Math.max(1, spec.decimals));
+        } else {
+            const fixed = a.toFixed(usableDecimals(a, spec.decimals));
+            body = spec.thousands ? withThousands(fixed) : fixed;
+        }
+        // Negative only when something nonzero shows (no `-0.00`).
+        const negative = v < 0 && /[1-9]/.test(body);
+        const text = `${spec.prefix}${body}${spec.suffix}`;
+        if (!negative) return text;
+        return spec.negative === 'parens' ? `(${text})` : `-${text}`;
     }
     if (o.isInteger) return Number.isInteger(x) ? String(x) : formatFullPrecision(x);
     if (needsScientific(x, o.digits)) return formatScientific(x, Math.max(1, o.digits));

@@ -99,9 +99,18 @@ describe('source display formats', () => {
         ['F8.', 3.6, '4'],
         ['COMMA10.1', 9876543.21, '9,876,543.2'],
         ['DOLLAR10.2', 1234.5, '$1,234.50'],
-        ['DOLLAR10.2', -1234.5, '$-1,234.50'],
+        // SAS and SPSS put the sign before the dollar.
+        ['DOLLAR10.2', -1234.5, '-$1,234.50'],
+        // SPSS PCT: the stored value with a percent sign.
         ['PCT6.1', 45.25, '45.3%'],
-        ['PERCENT6.0', 45, '45%'],
+        ['PCT6.1', -45.25, '-45.3%'],
+        // SAS PERCENT: the value × 100; negatives in parentheses.
+        ['PERCENT8.2', 0.25, '25.00%'],
+        ['PERCENT6.0', 0.45, '45%'],
+        ['PERCENT8.2', -0.25, '(25.00%)'],
+        ['PERCENT8.1', 1.5, '150.0%'],
+        ['PERCENTN8.2', -0.25, '-25.00%'],
+        ['PERCENT8.2', -0.00001, '(1e-03%)'],
         ['Z5.', 42, '00042'],
         ['Z5.', -42, '-0042'],
     ])('%s: %p → %s', (fmt, x, want) => {
