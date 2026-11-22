@@ -441,7 +441,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 - `0`: every requested file has a parsed document. A file with syntax errors still gets a full document.
 - `3`: at least one file couldn't be read or decoded. Its error document is printed in its place, and every other document is still printed.
 - `1`: a usage error, such as an unknown flag or a `--format` other than `json`.
-- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory. Nothing is printed on stdout.
+- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory. Nothing is printed on stdout. Output that can't be written, such as to a full disk, is an operator error too, reported on stderr. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
 
 <!-- example: parse-unreadable -->
 ```console
@@ -706,6 +706,8 @@ Raven resolves a name with the scope `raven check` uses for its undefined-variab
 3. Attached packages, the most recently attached first, so a later `library()` masks an earlier one. Attaching a package again doesn't move it, as in R. Packages a caller attached before its `source()` call come after this file's own.
 4. The packages R attaches at startup: base, stats, graphics, grDevices, utils, datasets, and methods. So `filter()` is stats' until `library(dplyr)` and dplyr's after it.
 5. R's builtin functions and `T` and `F`, which Raven knows without any package data.
+
+A call skips a binding whose value is a literal, as R skips a binding that isn't a function when it looks up a function. So `mean(1:3)` after `mean <- 7` is base's `mean`. That holds only when every assignment to the name in the same function body, or at the top level, is a literal. A binding whose value Raven doesn't know, such as a parameter or `k <- foo()`, is still what the call resolves to.
 
 Every loader `raven check` reads counts as an attach; see [Package awareness](cross-file.md#package-awareness). A namespace access such as `dplyr::filter()` is the package as written, whatever is attached.
 

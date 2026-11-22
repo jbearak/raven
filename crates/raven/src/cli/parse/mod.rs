@@ -169,9 +169,7 @@ pub async fn run(args: ParseArgs) -> i32 {
 
     let package_data = prepared.package_data;
     let state = &mut prepared.state;
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    let mut code = EXIT_OK;
-    for request in requests {
+    let documents = requests.into_iter().map(|request| {
         let document = match &request.target {
             Target::RFile(fs_path) => {
                 document::document_for_file(fs_path, request.path, package_data, &mut |text| {
@@ -183,18 +181,45 @@ pub async fn run(args: ParseArgs) -> i32 {
                 "only .R and .r files are supported".to_string(),
             ),
         };
-        if document.is_error() {
+        let line = serde_json::to_string(&document).expect("parse document serializes");
+        (line, document.is_error())
+    });
+    print_documents(std::io::stdout().lock(), documents)
+}
+
+/// Writes each document's JSON line, with whether it is an error document,
+/// and returns the exit code. A closed pipe (`raven parse | head -1`) ends
+/// the output, not the run's verdict on the files already printed. Any other
+/// failure to write or flush, such as a full disk, means documents were lost:
+/// it is printed to stderr and the run is an operator error.
+fn print_documents(
+    out: impl std::io::Write,
+    documents: impl Iterator<Item = (String, bool)>,
+) -> i32 {
+    let mut out = std::io::BufWriter::new(out);
+    let mut code = EXIT_OK;
+    for (line, is_error) in documents {
+        if is_error {
             code = EXIT_UNREADABLE;
         }
-        let line = serde_json::to_string(&document).expect("parse document serializes");
-        // A closed pipe (`raven parse | head -1`) ends the output, not the run's
-        // verdict on the files already printed.
-        if writeln!(out, "{line}").is_err() {
-            return code;
+        if let Err(error) = writeln!(out, "{line}") {
+            return output_failed(&error, code);
         }
     }
-    let _ = out.flush();
-    code
+    match out.flush() {
+        Ok(()) => code,
+        Err(error) => output_failed(&error, code),
+    }
+}
+
+/// The exit code after stdout failed: `code` for a closed pipe, otherwise an
+/// operator error, reported on stderr.
+fn output_failed(error: &std::io::Error, code: i32) -> i32 {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return code;
+    }
+    eprintln!("raven parse: cannot write output: {error}");
+    EXIT_OPERATOR_ERROR
 }
 
 /// One requested file: its printed `path` and what to do with it.

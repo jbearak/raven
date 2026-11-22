@@ -275,8 +275,20 @@ pub(crate) fn display_path(uri: &Url, root: &Path) -> String {
 }
 
 /// The root itself (a working directory) is `.`.
+///
+/// On Windows the canonical root has the verbatim prefix (`\\?\C:\work`),
+/// while a path that came back from a file URI doesn't (`C:\work\a.R`): the
+/// URI form drops it. Such a path is still under the root, so it is compared
+/// with the root's prefix dropped too (see `without_verbatim_prefix`).
 pub(crate) fn display_fs_path(path: &Path, root: &Path) -> String {
-    match path.strip_prefix(root) {
+    let relative = path.strip_prefix(root).or_else(|error| {
+        let root = root.to_string_lossy();
+        match without_verbatim_prefix(&root) {
+            Some(plain) => path.strip_prefix(Path::new(&plain)),
+            None => Err(error),
+        }
+    });
+    match relative {
         Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
         Ok(relative) => relative
             .components()
@@ -285,6 +297,20 @@ pub(crate) fn display_fs_path(path: &Path, root: &Path) -> String {
             .join("/"),
         Err(_) => path.to_string_lossy().into_owned(),
     }
+}
+
+/// A Windows verbatim path in the form a file URI converts back to: `C:\work`
+/// for `\\?\C:\work` and `\\server\share` for `\\?\UNC\server\share`.
+/// `None` for any other path, including every Unix path. Works on the text
+/// so it is testable on every platform.
+fn without_verbatim_prefix(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        return Some(format!(r"\\{unc}"));
+    }
+    let bytes = rest.as_bytes();
+    let is_disk = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    is_disk.then(|| rest.to_string())
 }
 
 fn locality_name(locality: SourceLocality) -> &'static str {
@@ -792,12 +818,12 @@ fn file_row(
     });
     row.syntax_errors = match state.workspace_index.get(uri) {
         Some(entry) => entry.tree.is_some_and(|tree| tree.root_node().has_error()),
-        // Artifact without full text: parse the file once to answer.
+        // Artifact without full text: parse the file once to answer, decoded
+        // as the indexer decodes it (a BOM-marked UTF-16 file included).
         None => path
             .as_deref()
-            .and_then(|path| std::fs::read(path).ok())
-            .map(|bytes| {
-                let text = String::from_utf8_lossy(&bytes);
+            .and_then(|path| crate::state::read_source(path).ok())
+            .map(|text| {
                 crate::state::Document::new_with_uri(&text, None, uri)
                     .tree
                     .is_some_and(|tree| tree.root_node().has_error())
@@ -1273,6 +1299,67 @@ mod tests {
         assert!(report.complete, "{:?}", report.warnings);
         let row = edge(&report, "big.R", "a.R", 0);
         assert!(row.resolution.as_ref().unwrap().exists);
+    }
+
+    /// The text form of the Windows verbatim-prefix fix, run on every
+    /// platform; `verbatim_root_relativizes_uri_paths` runs the path form on
+    /// Windows CI.
+    #[test]
+    fn verbatim_root_prefix_is_dropped_as_a_file_uri_drops_it() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\C:\work").as_deref(),
+            Some(r"C:\work")
+        );
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\server\share\work").as_deref(),
+            Some(r"\\server\share\work")
+        );
+        assert_eq!(without_verbatim_prefix(r"C:\work"), None);
+        assert_eq!(without_verbatim_prefix(r"\\?\Volume{x}\work"), None);
+        assert_eq!(without_verbatim_prefix("/private/var/work"), None);
+    }
+
+    /// The canonical root is `\\?\C:\...` on Windows, while a file's URI
+    /// converts back to `C:\...`; the file still prints relative.
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_root_relativizes_uri_paths() {
+        let root = Path::new(r"\\?\C:\work");
+        let uri = Url::from_file_path(r"C:\work\R\a.R").unwrap();
+        assert_eq!(display_path(&uri, root), "R/a.R");
+        let root_uri = Url::from_file_path(r"C:\work").unwrap();
+        assert_eq!(display_path(&root_uri, root), ".");
+        let unc_root = Path::new(r"\\?\UNC\server\share\work");
+        let unc = Url::from_file_path(r"\\server\share\work\a.R").unwrap();
+        assert_eq!(display_path(&unc, unc_root), "a.R");
+        // A real workspace: canonicalize gives the verbatim form.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "a.R", "x <- 1\n");
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        let uri = Url::from_file_path(canonical.join("a.R")).unwrap();
+        assert_eq!(display_path(&uri, &canonical), "a.R");
+        let report = report(tmp.path(), true);
+        let paths: Vec<_> = report.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.R"]);
+    }
+
+    /// An oversized file has no stored text, so `syntax_errors` rereads it.
+    /// It must decode it as the indexer does: read as UTF-8, a valid
+    /// UTF-16 file is all NUL bytes and parses with errors.
+    #[test]
+    fn oversized_utf16_file_has_no_syntax_errors() {
+        let tmp = TempDir::new().unwrap();
+        let text = format!("x <- 1\n#{}\n", "a".repeat(280_000));
+        for (name, text) in [("big.R", text.as_str()), ("small.R", "x <- 1\n")] {
+            let mut bytes = vec![0xFF, 0xFE];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            std::fs::write(tmp.path().join(name), bytes).unwrap();
+        }
+        let report = report(tmp.path(), true);
+        for row in &report.files {
+            assert!(!row.syntax_errors, "{} has syntax_errors", row.path);
+        }
+        assert_eq!(report.files.len(), 2);
     }
 
     #[test]

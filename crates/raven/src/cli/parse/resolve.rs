@@ -37,7 +37,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -416,6 +416,115 @@ impl<'t> ScopePoints<'t> {
 }
 
 /// Resolves names against the workspace, as `raven check` sees it.
+/// A file's bindings whose value is statically not a function, which R's
+/// function lookup passes over (`mean <- 7; mean(1:3)` calls base's
+/// `mean`). Only a literal (a number, a string, `TRUE`, `NULL`, `NA`, ...)
+/// assigned with `<-`, `=`, or `->` counts, and only when every assignment
+/// of the name in the same function body (or at the top level) is a literal
+/// too: the scope keeps the latest binding, so in
+/// `helper <- function(x) x; if (debug) helper <- NULL` either may be what R
+/// finds. A binding whose value Raven doesn't know, such as `k <- foo()` or a
+/// parameter, is never passed over.
+#[derive(Default)]
+struct LiteralBindings {
+    /// Each literal assignment's target: its scope position, and the
+    /// enclosing function (its start byte; `None` at the top level) and name.
+    literal: HashMap<(u32, u32), (Option<usize>, String)>,
+    /// The enclosing function and name of every other assignment.
+    other: HashSet<(Option<usize>, String)>,
+    /// Names a `<<-` or `->>` assigns something other than a literal, in a
+    /// frame this doesn't work out.
+    other_anywhere: HashSet<String>,
+}
+
+impl LiteralBindings {
+    fn new(points: &ScopePoints<'_>) -> Self {
+        let mut bindings = LiteralBindings::default();
+        let text = points.text.as_ref();
+        let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(text, None)) else {
+            return bindings;
+        };
+        let mut stack = vec![(tree.root_node(), None)];
+        while let Some((node, function)) = stack.pop() {
+            if node.kind() == "binary_operator" {
+                bindings.assignment(node, function, points);
+            }
+            let function = match node.kind() {
+                "function_definition" => Some(node.start_byte()),
+                _ => function,
+            };
+            let mut cursor = node.walk();
+            stack.extend(
+                node.named_children(&mut cursor)
+                    .map(|child| (child, function)),
+            );
+        }
+        bindings
+    }
+
+    fn assignment(&mut self, node: TsNode<'_>, function: Option<usize>, points: &ScopePoints<'_>) {
+        let text = points.text.as_ref();
+        let (Some(lhs), Some(op), Some(rhs)) = (
+            node.child_by_field_name("lhs"),
+            node.child_by_field_name("operator"),
+            node.child_by_field_name("rhs"),
+        ) else {
+            return;
+        };
+        let (target, value, superassignment) = match &text[op.byte_range()] {
+            "<-" | "=" => (lhs, rhs, false),
+            "->" => (rhs, lhs, false),
+            "<<-" => (lhs, rhs, true),
+            "->>" => (rhs, lhs, true),
+            _ => return,
+        };
+        let Some(name) = scope::assignment_identifier_name(target, text) else {
+            return;
+        };
+        let name = name.to_string();
+        match (is_literal(value), superassignment) {
+            (true, false) => {
+                self.literal
+                    .insert(points.at(target.start_byte()), (function, name));
+            }
+            (true, true) => {}
+            (false, false) => {
+                self.other.insert((function, name));
+            }
+            (false, true) => {
+                self.other_anywhere.insert(name);
+            }
+        }
+    }
+
+    fn passes_over(&self, symbol: &ScopedSymbol) -> bool {
+        self.literal
+            .get(&(symbol.defined_line, symbol.defined_column))
+            .is_some_and(|key| {
+                key.1 == *symbol.name
+                    && !self.other.contains(key)
+                    && !self.other_anywhere.contains(&key.1)
+            })
+    }
+}
+
+/// A literal, which `raven parse` prints as a `number`, `string`, or
+/// `constant` node, in parentheses or not.
+fn is_literal(node: TsNode<'_>) -> bool {
+    match node.kind() {
+        "integer" | "float" | "complex" | "string" | "true" | "false" | "null" | "inf" | "nan"
+        | "na" => true,
+        "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            let mut inner = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "comment");
+            matches!((inner.next(), inner.next()), (Some(only), None) if is_literal(only))
+        }
+        _ => false,
+    }
+}
+
 pub(crate) struct WorkspaceNames {
     snapshot: DiagnosticsSnapshot,
     uri: Url,
@@ -473,6 +582,11 @@ struct FileResolver<'w> {
     /// Other files' texts, read once, for their definitions' document
     /// positions. `None` for a file that can't be read.
     other_points: RefCell<HashMap<Url, Option<Rc<ScopePoints<'static>>>>>,
+    /// Each defining file's literal bindings, read once.
+    literal_bindings: RefCell<HashMap<Url, Rc<LiteralBindings>>>,
+    /// Whether the name being resolved is called (a call's function or an
+    /// operator), so a literal binding is passed over; set by `resolve`.
+    calling: bool,
     /// The earliest lending call site of each distinct caller, sorted by
     /// printed path.
     callers: Vec<(Url, u32, u32)>,
@@ -586,6 +700,8 @@ impl<'w> FileResolver<'w> {
             cancel,
             points,
             other_points: RefCell::new(HashMap::new()),
+            literal_bindings: RefCell::new(HashMap::new()),
+            calling: false,
             callers,
             hidden_callers,
             caller_scopes: HashMap::new(),
@@ -642,8 +758,16 @@ impl<'w> FileResolver<'w> {
         if *uri == self.names.uri {
             return self.points.symbol_range(symbol);
         }
-        let points = self
-            .other_points
+        match self.other_points(uri) {
+            Some(points) => points.symbol_range(symbol),
+            None => ScopePoints::new("").symbol_range(symbol),
+        }
+    }
+
+    /// Another file's text, read as `raven parse` reads it, once. `None` for
+    /// a file that can't be read.
+    fn other_points(&self, uri: &Url) -> Option<Rc<ScopePoints<'static>>> {
+        self.other_points
             .borrow_mut()
             .entry(uri.clone())
             .or_insert_with(|| {
@@ -651,11 +775,34 @@ impl<'w> FileResolver<'w> {
                 let text = crate::state::decode_source(bytes).ok()?;
                 Some(Rc::new(ScopePoints::new(text)))
             })
-            .clone();
-        match points {
-            Some(points) => points.symbol_range(symbol),
-            None => ScopePoints::new("").symbol_range(symbol),
+            .clone()
+    }
+
+    /// Whether R's lookup for a called name passes over `symbol`: a binding
+    /// whose value is a literal (see [`LiteralBindings`]). Never for a value.
+    fn passes_over(&self, symbol: &ScopedSymbol) -> bool {
+        if !self.calling || symbol.kind != scope::SymbolKind::Variable || symbol.is_declared {
+            return false;
         }
+        let uri = &symbol.source_uri;
+        let cached = self.literal_bindings.borrow().get(uri).cloned();
+        let bindings = match cached {
+            Some(bindings) => bindings,
+            None => {
+                let bindings = Rc::new(if *uri == self.names.uri {
+                    LiteralBindings::new(self.points)
+                } else {
+                    self.other_points(uri)
+                        .map(|points| LiteralBindings::new(&points))
+                        .unwrap_or_default()
+                });
+                self.literal_bindings
+                    .borrow_mut()
+                    .insert(uri.clone(), bindings.clone());
+                bindings
+            }
+        };
+        bindings.passes_over(symbol)
     }
 
     fn snapshot(&self) -> &'w DiagnosticsSnapshot {
@@ -674,8 +821,9 @@ impl<'w> FileResolver<'w> {
         column: u32,
     ) -> Option<Resolution> {
         let name = query.name.as_str();
+        self.calling = !query.value;
         let uri = &self.names.uri;
-        let found = stream.symbol_with_layer(name);
+        let found = stream.symbol_with_layer_skipping(name, &|symbol| self.passes_over(symbol));
         let found = found.filter(|(symbol, layer)| {
             // As the undefined-variable collector: a same-file binding made
             // later is no binding here, unless R binds it late: a global read
@@ -1039,7 +1187,7 @@ impl<'w> FileResolver<'w> {
         let bound = scope
             .symbols
             .get(name)
-            .filter(|symbol| symbol.source_uri != names.uri)
+            .filter(|symbol| symbol.source_uri != names.uri && !self.passes_over(symbol))
             .cloned();
         if let Some(symbol) = bound.as_ref().filter(|symbol| !is_default_attached(symbol)) {
             self.caller_scopes.insert((index, late), scope);
