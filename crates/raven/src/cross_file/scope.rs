@@ -1368,7 +1368,7 @@ fn merge_global_effects_into_point_scope(
     child: &ScopeArtifacts,
     queried: &ScopeArtifacts,
     queried_uri: &Url,
-    merge: GlobalEffectMerge,
+    merge: GlobalEffectMerge<'_>,
     visibility: EventVisibility,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) {
@@ -1377,12 +1377,14 @@ fn merge_global_effects_into_point_scope(
     for (name, effect) in effects {
         let Some(symbol) = effect else {
             // The flat scope also holds the query's enclosing local
-            // bindings, which a global removal leaves alone.
-            if scope
-                .symbols
-                .get(&name)
-                .is_some_and(|existing| point_binding_is_local(queried, queried_uri, existing))
-            {
+            // bindings, and the child's own bindings in the calling frame
+            // when the query sees the call, which a global removal leaves
+            // alone.
+            if scope.symbols.get(&name).is_some_and(|existing| {
+                point_binding_is_local(queried, queried_uri, existing)
+                    || matches!(merge, GlobalEffectMerge::RemovalsOnly { child_uri }
+                        if existing.source_uri == *child_uri)
+            }) {
                 continue;
             }
             scope.symbols.remove(&name);
@@ -1392,7 +1394,7 @@ fn merge_global_effects_into_point_scope(
             continue;
         };
         let execution_order = match merge {
-            GlobalEffectMerge::RemovalsOnly => continue,
+            GlobalEffectMerge::RemovalsOnly { .. } => continue,
             GlobalEffectMerge::FirstWins => false,
             GlobalEffectMerge::ExecutionOrder => true,
         };
@@ -1414,13 +1416,15 @@ fn merge_global_effects_into_point_scope(
 /// How [`merge_global_effects_into_point_scope`] applies a child's net
 /// bindings; net removals always apply.
 #[derive(Clone, Copy)]
-enum GlobalEffectMerge {
+enum GlobalEffectMerge<'a> {
     /// First binding wins, as for other source contributions.
     FirstWins,
     /// Later bindings override, under execution-order merging.
     ExecutionOrder,
-    /// Bindings are skipped: the ordinary child merge already brought them in.
-    RemovalsOnly,
+    /// Bindings are skipped: the ordinary merge of the child at `child_uri`
+    /// already brought them in, and the child's own bindings in the calling
+    /// frame survive its global removals.
+    RemovalsOnly { child_uri: &'a Url },
 }
 
 /// Whether `symbol`, bound in the recursive resolver's flat scope, is a local
@@ -4279,8 +4283,9 @@ fn finalize_scope_timeline(artifacts: &mut ScopeArtifacts, line_index: &LineInde
 /// are detected in a separate pass from definitions. Each entry shares its
 /// anchor with the event pushed alongside it. A definition sorts by the
 /// position it takes effect (after its right-hand side, so
-/// `x <<- { rm(x, envir = globalenv()); 2 }` leaves `x` bound); a removal or
-/// load sorts by its call.
+/// `x <<- { rm(x, envir = globalenv()); 2 }` leaves `x` bound), a `data()`
+/// load right after its literal-stem definitions (the sort is stable), and a
+/// removal by its call.
 fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
     if artifacts.global_effects.is_empty() {
         return;
@@ -4324,6 +4329,12 @@ fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
             _ => {}
         }
     }
+    // A `data()` load takes effect at the end of its call, right after the
+    // literal-stem definitions that share its anchor.
+    let call_end: HashMap<(u32, u32), (u32, u32)> = top_level_defs
+        .iter()
+        .map(|((_, line, column), visible)| ((*line, *column), *visible))
+        .collect();
     let mut retained: Vec<((u32, u32), GlobalEffect)> = artifacts
         .global_effects
         .iter()
@@ -4337,9 +4348,14 @@ fn retain_top_level_global_effects(artifacts: &mut ScopeArtifacts) {
                 GlobalEffect::Removal { line, column, .. } => top_level_removals
                     .contains(&(*line, *column))
                     .then_some((*line, *column))?,
-                GlobalEffect::DataLoad { line, column, .. } => top_level_data_loads
-                    .contains(&(*line, *column))
-                    .then_some((*line, *column))?,
+                GlobalEffect::DataLoad { line, column, .. } => {
+                    top_level_data_loads.contains(&(*line, *column)).then_some(
+                        call_end
+                            .get(&(*line, *column))
+                            .copied()
+                            .unwrap_or((*line, *column)),
+                    )?
+                }
             };
             Some((effect_position, effect.clone()))
         })
@@ -9915,7 +9931,9 @@ where
                                 &child_artifacts,
                                 &artifacts,
                                 uri,
-                                GlobalEffectMerge::RemovalsOnly,
+                                GlobalEffectMerge::RemovalsOnly {
+                                    child_uri: &child_uri,
+                                },
                                 visibility,
                                 data_alias_provider,
                             );
@@ -14597,7 +14615,7 @@ mod tests {
 
     /// Global removals and `data()` loads join the definitions in execution
     /// order, though `rm()` calls are detected in a separate pass; a
-    /// definition takes effect at the end of its call. Removals
+    /// `data()` load follows its literal-stem definitions. Removals
     /// inside a function body, from the calling frame, or to an unproven
     /// destination are left out.
     #[test]
@@ -14628,8 +14646,8 @@ local({ rm(by_pos, pos = 1) })
                 "rm early",
                 "def captured",
                 "rm captured",
-                "data api Some(\"survey\")",
                 "def api",
+                "data api Some(\"survey\")",
                 "rm by_pos",
             ]
         );
@@ -14647,7 +14665,11 @@ local({ rm(by_pos, pos = 1) })
                 "wrong",
             ),
             ("delayedAssign(value = 1, \"named\")\n", "named", "value"),
-            ("delayedAssign(\"wrong\", \"x\" = \"right\")\n", "right", "wrong"),
+            (
+                "delayedAssign(\"wrong\", \"x\" = \"right\")\n",
+                "right",
+                "wrong",
+            ),
             (
                 "local({ delayedAssign(\"wrong\", x = \"right\", assign.env = globalenv()) })\n",
                 "right",
@@ -14882,16 +14904,19 @@ local({ caught <- 0; local({ caught <<- 12 }) })
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let workspace_root = Url::parse("file:///project").unwrap();
-        let child_code = "rm(x, y, envir = globalenv())\n\
-                          z <<- { rm(z, envir = globalenv()); 2 }\n";
+        let child_code = "rm(x, y, w, envir = globalenv())\n\
+                          z <<- { rm(z, envir = globalenv()); 2 }\n\
+                          w <- 3\n";
         let child_artifacts = Arc::new(compute_artifacts(
             &child_uri,
             &parse_r(child_code),
             child_code,
         ));
-        for source_line in [
-            "  source(\"child.R\", local = TRUE)",
-            "  local({ source(\"child.R\", local = TRUE) })",
+        // The child's own `w <- 3` binds in the frame running it: the
+        // block when the source is directly in it, else the inner block.
+        for (source_line, direct) in [
+            ("  source(\"child.R\", local = TRUE)", true),
+            ("  local({ source(\"child.R\", local = TRUE) })", false),
         ] {
             let parent_code = format!(
                 "x <- 1\ny <- 1\nlocal({{\n  y <- 2\n{source_line}\n  y\n}})\nafter <- 1\n"
@@ -14922,8 +14947,16 @@ local({ caught <- 0; local({ caught <<- 12 }) })
             // (line, column, [(name, visible)]): inside the block after the
             // source, then after the block.
             for (line, column, expected) in [
-                (5, 2, [("x", false), ("y", true), ("z", true)]),
-                (7, 0, [("x", false), ("y", false), ("z", true)]),
+                (
+                    5,
+                    2,
+                    [("x", false), ("y", true), ("z", true), ("w", direct)],
+                ),
+                (
+                    7,
+                    0,
+                    [("x", false), ("y", false), ("z", true), ("w", false)],
+                ),
             ] {
                 let scope = scope_at_position_with_graph(
                     &parent_uri,
