@@ -281,3 +281,49 @@ describe('data viewer App: debounced setState', () => {
         expect(states.map(s => [s.panelGeneration, s.schemaHash])).toEqual([[2, 'schema-2']]);
     });
 });
+
+describe('data viewer App: labels of an unshipped dictionary', () => {
+    // More levels than the shipping threshold: labels come per code.
+    const factor = { ...column, arrowType: 'Dictionary<Int32, Utf8>', isInteger: false };
+
+    async function loadedFirstTile() {
+        const app = await renderApp();
+        await send(init({ nrow: 100_001, columns: [factor] }));
+        await act(async () => { await new Promise(r => setTimeout(r, 30)); });
+        const get = app.posted.find(m => m.type === 'getRows');
+        await send({
+            type: 'rows', panelGeneration: 1, requestId: get.requestId, viewportGeneration: get.viewportGeneration,
+            start: get.start, end: get.end,
+            rows: Array.from({ length: get.end - get.start }, (_, i) => [get.start + i]),
+            stale: false, columnRange: get.columnRange,
+        });
+        const asked = app.posted.filter(m => m.type === 'getLabels').at(-1);
+        await send({ type: 'labels', panelGeneration: 1, requestId: asked.requestId, columnIndex: 0,
+            labels: Object.fromEntries(asked.indices.map((i: number) => [i, `level ${i}`])) });
+        return { ...app, tileEnd: get.end as number };
+    }
+
+    test('a scroll within a fetched tile asks for the labels now on screen', async () => {
+        const { posted, tileEnd } = await loadedFirstTile();
+        posted.length = 0;
+        // Row 80: inside the first tile, so no rows are fetched.
+        await send({ type: 'testScrollToFraction', panelGeneration: 1, fraction: 80 / 100_001 });
+        await act(async () => { await new Promise(r => setTimeout(r, 30)); });
+        expect(tileEnd).toBeGreaterThan(81);
+        expect(posted.some(m => m.type === 'getRows')).toBe(false);
+        const asked = posted.filter(m => m.type === 'getLabels');
+        expect(asked.length).toBe(1);
+        expect(asked[0].indices).toContain(80);
+    });
+
+    test('scroll frames do not re-ask for labels already pending', async () => {
+        const { posted } = await loadedFirstTile();
+        posted.length = 0;
+        await send({ type: 'testScrollToFraction', panelGeneration: 1, fraction: 80 / 100_001 });
+        await send({ type: 'testScrollToFraction', panelGeneration: 1, fraction: 0 });
+        await send({ type: 'testScrollToFraction', panelGeneration: 1, fraction: 80 / 100_001 });
+        await act(async () => { await new Promise(r => setTimeout(r, 30)); });
+        const asked = posted.filter(m => m.type === 'getLabels').flatMap(m => m.indices);
+        expect(asked.filter((i: number) => i === 80).length).toBe(1);
+    });
+});
