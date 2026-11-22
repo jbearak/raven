@@ -299,11 +299,13 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
     STATE.with(|s| s.borrow_mut().as_mut().map(f))
 }
 
-/// argv for R: program name and R's options. The strings must outlive R,
-/// so they are leaked.
+/// argv for R: program name, the console's own options (`extra`), then the
+/// user's, which may end in `--args` and the program's arguments. The strings
+/// must outlive R, so they are leaked.
 fn r_argv(opts: &Options, extra: &[&[u8]]) -> &'static mut [*mut c_char] {
     let leak = |s: &[u8]| CString::new(s).unwrap_or_default().into_raw();
     let mut argv = vec![leak(b"R")];
+    argv.extend(extra.iter().map(|e| leak(e)));
     for a in &opts.r_args {
         #[cfg(unix)]
         let a = std::os::unix::ffi::OsStrExt::as_bytes(a.as_os_str());
@@ -313,7 +315,6 @@ fn r_argv(opts: &Options, extra: &[&[u8]]) -> &'static mut [*mut c_char] {
         let a = a.as_bytes();
         argv.push(leak(a));
     }
-    argv.extend(extra.iter().map(|e| leak(e)));
     Vec::leak(argv)
 }
 

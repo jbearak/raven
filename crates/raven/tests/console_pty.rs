@@ -826,3 +826,15 @@ fn expression_and_file_arguments_run_and_exit() {
         assert!(out.contains("FILERAN"), "{args:?}: {out}");
     }
 }
+
+#[test]
+fn program_arguments_reach_r_unchanged() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&["--args", "--help", "x"]);
+    c.expect("> ");
+    c.line("cat(commandArgs(TRUE), 'END\\n', sep = '|')");
+    let out = c.expect("|END");
+    assert!(out.contains("--help|x|END"), "{out}");
+}
