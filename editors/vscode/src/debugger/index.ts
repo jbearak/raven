@@ -121,9 +121,9 @@ function editor_breakpoints(): { files: Record<string, object[]>; functions: str
  * breakpoints in: the editor's path and its real path (the console reports
  * `canonicalize`d paths; macOS's /tmp and /var are symlinks).
  */
-function editor_breakpoint_paths(): Set<string> {
+function with_real_paths(files: Iterable<string>): Set<string> {
     const out = new Set<string>();
-    for (const f of Object.keys(editor_breakpoints().files)) {
+    for (const f of files) {
         out.add(f);
         try { out.add(fs.realpathSync.native(f)); } catch { /* file gone: the console keeps the path as given */ }
     }
@@ -138,7 +138,15 @@ function editor_breakpoint_paths(): Set<string> {
 function mirror_payload(previous: Set<string>): { msg: object; files: Set<string> } {
     const { files, functions } = editor_breakpoints();
     const now = new Set(Object.keys(files));
-    for (const p of previous) if (!now.has(p)) files[p] = [];
+    // Another spelling of a file in `now` (a symlink, or the console's
+    // canonical path) must not clear what `now` sets.
+    const kept = with_real_paths(now);
+    for (const p of previous) {
+        if (kept.has(p)) continue;
+        let real = p;
+        try { real = fs.realpathSync.native(p); } catch { /* as given */ }
+        if (!kept.has(real)) files[p] = [];
+    }
     const filters = exception_filters(context_ref?.workspaceState.get<string[]>(FILTERS_KEY));
     return {
         msg: { v: 1, id: 0, op: 'breakpoints', files, functions, exceptionFilters: filters },
@@ -186,7 +194,7 @@ function update_status(): void {
  * file entry, so this makes every mirror answer with one, even when the
  * editor has no line breakpoints left.
  */
-export function probe_path(ipc: string): string {
+function probe_path(ipc: string): string {
     return path.join(path.dirname(ipc), 'breakpoint-probe');
 }
 
@@ -201,7 +209,10 @@ export function probe_path(ipc: string): string {
  * file, so the link can't know from its own history which files to clear.
  * It asks the console instead: every mirror carries `probe_path`, the
  * console answers with its summary, and any file in that summary the editor
- * has no breakpoints in is cleared by the next mirror (`reconcile`).
+ * has no breakpoints in is cleared by the next mirror (`reconcile`). This
+ * happens once per connection, before sends to the console are released;
+ * later summaries aren't acted on, so two windows sharing a console don't
+ * clear each other's breakpoints back and forth.
  */
 class ConsoleLink {
     /** The console's line breakpoint states, as last pushed. */
@@ -217,6 +228,10 @@ class ConsoleLink {
     /** The console has pushed a summary on this connection. */
     private heard = false;
     private reprobed = false;
+    /** A mirror on this connection has been applied (`ok`). */
+    private applied = false;
+    /** The initial reconciliation is done and sends are released. */
+    private reconciled = false;
     /** One mirror at a time, so the console applies them in order. */
     private in_flight = false;
     private again = false;
@@ -276,16 +291,23 @@ class ConsoleLink {
      * console's set; the mirror at the session's end reconciles.
      */
     private reconcile(): void {
-        if (this.closed || sessions.has(this.ipc)) return;
-        const wanted = editor_breakpoint_paths();
+        if (this.closed || this.reconciled || sessions.has(this.ipc)) return;
+        const wanted = with_real_paths(Object.keys(editor_breakpoints().files));
         const stale = this.states.map((s) => s.source.path).filter((p) => !wanted.has(p));
-        if (stale.length === 0) {
-            // Sends held for this console may run now.
-            this.mirrored_once();
-            return;
+        if (stale.length > 0) {
+            for (const p of stale) this.mirrored.add(p);
+            this.mirror();
+        } else if (this.applied && !this.in_flight) {
+            // The console pushes a summary after each file it applies, so
+            // only a summary seen once a whole mirror is in counts.
+            this.release();
         }
-        for (const p of stale) this.mirrored.add(p);
-        this.mirror();
+    }
+
+    /** Sends held for this console may run now. */
+    private release(): void {
+        this.reconciled = true;
+        this.mirrored_once();
     }
 
     /**
@@ -305,24 +327,30 @@ class ConsoleLink {
     private send_mirror(attempt: number): void {
         const finish = (applied = false) => {
             this.in_flight = false;
+            // A change made meanwhile goes first, so `reconcile` below
+            // doesn't release sends while it is still to be applied.
+            if (this.again) {
+                this.again = false;
+                this.mirror();
+            }
             if (!applied) {
                 // No summary will follow; don't hold sends for one.
                 this.mirrored_once();
-            } else if (!this.heard) {
+            } else if (this.heard) {
+                this.applied = true;
+                this.reconcile();
+            } else {
+                this.applied = true;
                 // The console answers an applied mirror with its summary,
                 // which `reconcile` uses. Not heard yet: give it a moment,
                 // then mirror once more in case the subscription raced;
                 // after that, stop holding sends for it.
                 setTimeout(() => {
                     if (this.heard || this.closed) return;
-                    if (this.reprobed) return this.mirrored_once();
+                    if (this.reprobed) return this.release();
                     this.reprobed = true;
                     this.mirror();
                 }, 1_000);
-            }
-            if (this.again) {
-                this.again = false;
-                this.mirror();
             }
         };
         if (this.closed || !fs.existsSync(this.ipc)) return finish();

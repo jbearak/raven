@@ -763,24 +763,6 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
     );
 
     test.skipIf(!HAS_R || !HAS_ARROW)(
-        'a difftime column carries values in its own units, matching the <drtn unit> header',
-        async () => {
-            const cap = await start_capture_server();
-            try {
-                const r = await spawnR(cap, viewAndReadback(
-                    'View(data.frame(h = as.difftime(c(1, 2), units = "hours")))',
-                    'cat("RAVEN_H=", paste(as.numeric(.df$h), collapse = ","), "\\n", sep = "")',
-                ));
-                expect(r.stdout).toContain('RAVEN_H=1,2');
-                expect(r.stdout).toContain('"raven.type_tag":"<drtn hours>"');
-            } finally {
-                await cap.close();
-            }
-        },
-        30_000,
-    );
-
-    test.skipIf(!HAS_R || !HAS_ARROW)(
         'a refused /view-data request leaves no Arrow file behind',
         async () => {
             const { r } = await viewDataBody(

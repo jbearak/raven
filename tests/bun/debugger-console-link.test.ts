@@ -83,7 +83,7 @@ mock.module('../../editors/vscode/src/send-to-r/r-terminal-manager', () => ({
     get_or_create_raven_console: async () => { throw new Error('not in this test'); },
 }));
 
-const { register_debugger, probe_path } = await import('../../editors/vscode/src/debugger/index');
+const { register_debugger } = await import('../../editors/vscode/src/debugger/index');
 const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
 
 // --------------------------------------------------------------- fake console
@@ -130,24 +130,29 @@ class FakeConsole {
                 return;
             case 'breakpoints': {
                 const files = (msg.files ?? {}) as Record<string, Array<{ line: number }>>;
-                for (const [p, list] of Object.entries(files)) {
-                    let key = p;
-                    try { key = fs.realpathSync(p); } catch { /* as given, like canonical() */ }
-                    if (list.length === 0) this.files.delete(key);
-                    else this.files.set(key, list.map((b) => b.line));
-                }
-                if (Object.keys(files).length > 0) {
-                    const states = [...this.files].flatMap(([p, lines]) =>
-                        lines.map((line) => ({ verified: false, line, source: { path: p } })));
-                    const push = JSON.stringify({ event: 'breakpoints', breakpoints: states }) + '\n';
-                    for (const s of this.subscribers) s.write(push);
-                }
-                this.reply(sock, msg.id, 'ok');
-                sock.end();
+                // Like set_file_breakpoints: one file at a time, each
+                // followed by a full summary (with a gap, so a client that
+                // acts on a summary before the reply is caught).
+                void (async () => {
+                    for (const [p, list] of Object.entries(files)) {
+                        await new Promise((r) => setTimeout(r, 30));
+                        let key = p;
+                        try { key = fs.realpathSync(p); } catch { /* as given, like canonical() */ }
+                        if (list.length === 0) this.files.delete(key);
+                        else this.files.set(key, list.map((b) => b.line));
+                        const states = [...this.files].flatMap(([f, lines]) =>
+                            lines.map((line) => ({ verified: false, line, source: { path: f } })));
+                        const push = JSON.stringify({ event: 'breakpoints', breakpoints: states }) + '\n';
+                        for (const s of this.subscribers) s.write(push);
+                    }
+                    this.reply(sock, msg.id, 'ok');
+                    sock.end();
+                })();
                 return;
             }
             case 'execute':
-                this.executes.push(msg);
+                // What the console held when the code arrived.
+                this.executes.push({ ...msg, armed: Object.fromEntries(this.files) });
                 this.reply(sock, msg.id, 'queued');
                 this.reply(sock, msg.id, 'done');
                 sock.end();
@@ -263,8 +268,45 @@ describe('breakpoints across a detach and reattach', () => {
         expect([...con.files]).toEqual([[real(a_r), [2, 3]]]);
     });
 
-    test('the probe entry is never an R file', () => {
-        expect(/\.(r|rmd|rmarkdown|qmd)$/i.test(probe_path('/x/y/s'))).toBe(false);
+    test('code sent right after reattach runs with the breakpoints exactly in place', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(a_r, 3), line_bp(b_r, 5)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 2);
+        detach(t1);
+
+        set_breakpoints([line_bp(a_r, 1), line_bp(a_r, 2)]);
+        attach(sock);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [1, 2] });
+    });
+
+    test('code sent to a new console waits until every file is armed', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(a_r, 1), line_bp(b_r, 2)]);
+        attach(sock);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [1], [real(b_r)]: [2] });
+    });
+
+    test('a symlinked breakpoint re-added after its real path was cleared stays armed', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([line_bp(a_r, 3)]);
+        const t1 = attach(sock);
+        await until(() => con.files.size === 1);
+        detach(t1);
+        // Reattach with none: the link clears the console's real path.
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => con.files.size === 0);
+        await settle();
+        // Re-add through the editor's (symlinked) spelling.
+        set_breakpoints([line_bp(a_r, 3)]);
+        await until(() => con.files.size === 1);
+        await settle();
+        expect([...con.files]).toEqual([[real(a_r), [3]]]);
     });
 });
 
