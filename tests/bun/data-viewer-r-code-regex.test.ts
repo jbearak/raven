@@ -26,24 +26,26 @@ async function hasR(): Promise<boolean> {
 
 const READY = await hasR();
 
-const FOLD = 'KkKSsſÅåÅßẞΘθϑϴΩωΩᾀᾈᾗᾟᾣᾫᾳᾼῃῌῳῼ';
+const FOLD = 'Kk\u212aSs\u017fÅå\u212bß\u1e9eΘθ\u03d1\u03f4Ωω\u2126\u1f80\u1f88\u1f97\u1f9f\u1fa3\u1fab\u1fb3\u1fbc\u1fc3\u1fcc\u1ff3\u1ffc';
 const STRINGS = [
     '', 'a', 'A', 'ab', 'AB', 'abc', 'xyz', 'file_10', 'File_2.csv', '9', '١', 'é', 'É', 'ﬀ', 'İ', 'ı', 'µ', 'μ', 'Μ',
-    ...Array.from(FOLD), 'kelvin', 'KELVIN', 'Kelvin', 'stress', 'STRESS', 'ſtress', 'kiss', 'Straße', 'STRAẞE',
+    ...Array.from(FOLD), 'kelvin', 'KELVIN', '\u212aelvin', 'stress', 'STRESS', '\u017ftress', 'kiss', 'Straße', 'STRA\u1e9eE',
     '😀', 'a😀b', '😀😀', '😀a', 'x😀', '𐐀', '𐐨',
-    'a\rb', 'a\nb', 'a b', 'a b', 'a\n', 'a\r\n', '\n', 'x y', 'x y', 'x　y', 'x﻿y', 'x\ty', 'x\u0085y', 'x\u000by',
+    'a\rb', 'a\nb', 'a\u2028b', 'a\u2029b', 'a\n', 'a\r\n', '\n', 'x y', 'x\u00a0y', 'x\u3000y', 'x\ufeffy', 'x\ty', 'x\u0085y', 'x\u000by',
     'a,b', ',', 'a-b', 'a]b', 'a^b', 'a$b', 'a\\b', 'foo bar', 'bar', 'FOO',
 ];
 const PATTERNS = [
     'a', 'A', 'ab', '^a', 'a$', '^a$', 'b$', '^$', 'a.b', '^a.*b$', '.*', '^.*$', '^.+$', 'a.+', '.+b', '^a.*$', 'a.*?b',
     '\\s', '\\S+', 'x\\sy', '^\\s*$', '[\\s]', '[\\s,]', '\\w+', '^\\w+$', '\\W', '\\W*', '\\d', '^\\d+$', '\\D*', '\\bk', 'k\\b', '\\Bs',
     'k', 'K', 's', 'S', '^k$', '^s$', 'kelvin', 'stress', 'kiss', 'straße', 'STRASSE', '[a-z]+', '^[a-z]+$', '^[A-Z]$', '[k]', '[^k]*',
-    '^[^k]*$', '^[^a-z]*$', '[k-m]', '[r-t]', '^[a-zA-Z]*$', '[\\w]', '^[\\w]+$', 'å', 'Å', 'θ', 'ϑ', 'Θ', 'ω', 'Ω', '[α-ω]', '^[θ-ω]$',
-    'ß', 'ẞ', 'ᾀ', 'ᾈ', 'é', 'É', 'µ', 'μ', 'ı', 'i', 'I',
+    '^[^k]*$', '^[^a-z]*$', '[k-m]', '[r-t]', '^[a-zA-Z]*$', '[\\w]', '^[\\w]+$', 'å', 'Å', 'θ', '\u03d1', 'Θ', 'ω', 'Ω', '[α-ω]', '^[θ-ω]$',
+    'ß', '\u1e9e', '\u1f80', '\u1f88', 'é', 'É', 'µ', 'μ', 'ı', 'i', 'I',
     '^.$', '^..$', 'a.b', '[^a]', '^[^a]$', '\\S', '😀', '[😀]', '^.+.+$',
     '(?:ab|k)s', 'sk*', '^(?<n>k)$', '(?<=k)s', '(?<!s)k', '(?=a)a', '(a|b)+', '(?:a.*)+', 'a{2}', 'a{1,}', 'x{', '}', ']', 'a]',
     '[\\]]', '[-a]', '[a-]', '\\.', '\\-', '\\/', 'file_\\d+', '^file_\\d+\\.csv$', 'a\\$b', '\\^', 'a\\\\b', '[$^]', '\\t', '\\n', '\\r',
     'foo|bar', '^(foo|bar)$', ',', '^[^,]*,.*$',
+    // Repeats PCRE expands into copies (R refuses a compiled pattern past 64 KiB).
+    '(?<a$b>x){0,10000}', '(?:x){0,1000}', '((x){0,200}){0,200}', 'k{0,5000}', 'x{0,60000}', '(?:ab){2,}',
 ];
 
 describe.skipIf(!READY)('regex translation agrees with the viewer in real R', () => {

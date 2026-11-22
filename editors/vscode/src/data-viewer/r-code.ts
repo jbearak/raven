@@ -403,6 +403,14 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
     const groups: boolean[] = [];
     let i = 0;
     const n = pattern.length;
+    // PCRE compiles a bounded repeat of a group as that many copies, and
+    // R's build refuses a compiled pattern past 64 KiB. `sizes` estimates
+    // the expanded size per open group (translated text length, groups
+    // multiplied by their bound); past `MAX_EXPANDED` the pattern is
+    // refused.
+    const sizes: number[] = [0];
+    let last = { size: 0, group: false };
+    const grow = (k: number) => { sizes[sizes.length - 1] += k; };
     /** Emit an atom, check the quantifier after it, and copy that. */
     const atom = (pcre: string, anyUnit: boolean): string | null => {
         const q = pattern[i];
@@ -414,6 +422,8 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             } else return nonBmp;
         }
         out += pcre;
+        grow(pcre.length);
+        last = { size: pcre.length, group: pcre.startsWith('(') };
         return null;
     };
     while (i < n) {
@@ -447,7 +457,7 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             if (err) return refuse(err);
             continue;
         }
-        if (c === '$') { out += '\\z'; i++; continue; }
+        if (c === '$') { out += '\\z'; grow(2); last = { size: 0, group: false }; i++; continue; }
         if (c === '(') {
             const named = /^\(\?<([A-Za-z_$][\w$]*)>/.exec(pattern.slice(i));
             const head = named ? named[0] : /^\((\?(:|=|!))?/.exec(pattern.slice(i))![0];
@@ -458,11 +468,15 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             out += named ? '(?:' : head;
             i += head.length;
             groups.push(false);
+            sizes.push(0);
             continue;
         }
         if (c === ')') {
             out += c;
             i++;
+            const inner = (sizes.length > 1 ? sizes.pop()! : 0) + 4;
+            grow(inner);
+            last = { size: inner, group: true };
             const plusInside = groups.pop() ?? false;
             if (plusInside && /[*+?{]/.test(pattern[i] ?? '')) return refuse(nonBmp);
             if (plusInside && groups.length > 0) groups[groups.length - 1] = true;
@@ -476,11 +490,25 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             if (bound && [bound[1], bound[2]].some(b => b !== undefined && b !== '' && Number(b) > 65535)) {
                 return refuse('the repeat count is too large for R');
             }
+            if (bound && last.group) {
+                const copies = bound[2] === undefined ? Number(bound[1])
+                    : bound[2] === '' ? Number(bound[1]) + 1 : Math.max(Number(bound[1]), Number(bound[2]));
+                grow(last.size * Math.max(copies - 1, 0));
+                if (sizes.some(z => z > MAX_EXPANDED)) return refuse('the pattern is too large for R once its repeats are expanded');
+            }
             out += c;
+            grow(1);
+            last = { size: 0, group: false };
             i++;
             continue;
         }
-        if ('*+?|^}'.includes(c)) { out += c; i++; continue; }
+        if ('*+?|^}'.includes(c)) {
+            out += c;
+            grow(1);
+            last = { size: 0, group: false };
+            i++;
+            continue;
+        }
         // A literal character.
         i++;
         const lit = c === ']' ? '\\]' : c;
@@ -490,11 +518,15 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
     return { pcre: out };
 }
 
+/** Budget for `translateRegex`'s expanded-size estimate, well under the
+ *  64 KiB compiled-pattern limit (estimates count source characters). */
+const MAX_EXPANDED = 10_000;
+
 /** JS's `\s`, as the body of a PCRE class (non-ASCII spaces as literal
  *  characters, so R compiles the pattern in UTF-8 mode). */
-const JS_SPACE = '\\t\\n\\x0b\\f\\r    -     　﻿';
+const JS_SPACE = '\\t\\n\\x0b\\f\\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
 /** JS's `.` (without the `s` flag). */
-const JS_DOT = '[^\\n\\r  ]';
+const JS_DOT = '[^\\n\\r\u2028\u2029]';
 
 /** Case-fold groups (BMP) where PCRE's caseless matching (Unicode simple
  *  case folding) joins characters that JS's non-Unicode `i` (each
@@ -503,12 +535,12 @@ const JS_DOT = '[^\\n\\r  ]';
  *  `/x/iu` with `/x/i` over the BMP; the round trip tests check it
  *  against R. */
 const FOLD_GROUPS: readonly string[] = [
-    'KkK', 'Ssſ', 'ÅåÅ', 'ßẞ', 'Θθϑϴ',
-    'ΩωΩ',
+    'Kk\u212a', 'Ss\u017f', '\u00c5\u00e5\u212b', '\u00df\u1e9e', '\u0398\u03b8\u03d1\u03f4',
+    '\u03a9\u03c9\u2126',
     ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1f80 + k, 0x1f88 + k)),
     ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1f90 + k, 0x1f98 + k)),
     ...Array.from({ length: 8 }, (_, k) => String.fromCharCode(0x1fa0 + k, 0x1fa8 + k)),
-    'ᾳᾼ', 'ῃῌ', 'ῳῼ',
+    '\u1fb3\u1fbc', '\u1fc3\u1fcc', '\u1ff3\u1ffc',
 ];
 
 function classBody(chars: string): string {

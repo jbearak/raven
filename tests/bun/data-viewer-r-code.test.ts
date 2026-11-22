@@ -140,10 +140,10 @@ describe('generateRCode', () => {
         };
         for (const p of ['abc', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\w\\W*', '[\\]]', 'a:b[x:y]', '(?:a)(?=b)(?!c)'])
             expect([p, pcre(p)]).toEqual([p, p]);
-        expect(pcre('^a.*b$')).toBe('^a[^\\n\\r  ]*b\\z');
-        expect(pcre('x\\sy')).toBe('x[\\t\\n\\x0b\\f\\r    -     　﻿]y');
+        expect(pcre('^a.*b$')).toBe('^a[^\\n\\r\u2028\u2029]*b\\z');
+        expect(pcre('x\\sy')).toBe('x[\\t\\n\\x0b\\f\\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]y');
         // Caseless `k` must not match the Kelvin sign, as in JS.
-        expect(pcre('k', false)).toBe('(?:(?!(?-i:[K]))k)');
+        expect(pcre('k', false)).toBe('(?:(?!(?-i:[\u212a]))k)');
         expect(pcre('ab', false)).toBe('ab');
         // Named groups become plain groups (JS allows `$` in names, PCRE not).
         expect(pcre('(?<a$b>x)')).toBe('(?:x)');
@@ -152,7 +152,7 @@ describe('generateRCode', () => {
             expect([p, pcre(p)]).toEqual([p, null]);
         expect(pcre('^.+$')).not.toBeNull();
         expect(pcre('^[^,]*,.*$')).not.toBeNull();
-        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', 'a{,2}', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]'])
+        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', 'a{,2}', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]', '(?<a$b>x){0,10000}', '((x){0,200}){0,200}'])
             expect([p, pcre(p)]).toEqual([p, null]);
     });
 
