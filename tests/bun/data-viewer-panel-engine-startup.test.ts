@@ -263,6 +263,9 @@ describe('engine startup in replace()', () => {
         wv.deliver({ type: 'webviewReady', adoptsTransforms: true });
         await until(() => wv.posted.some(m => m.type === 'init'));
         await flush();
+        // panel.ts caches its output channel per module; logging through
+        // this file's vscode mock would hide later suites' log lines.
+        panel.log = () => {};
         // Hold the send chain, then queue the timeout's repaint behind it.
         let releaseChain!: () => void;
         void panel.enqueue(() => new Promise<void>(r => { releaseChain = r; }));
