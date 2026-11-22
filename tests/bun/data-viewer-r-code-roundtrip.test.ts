@@ -490,3 +490,17 @@ names(df)[4:5] <- c("d", "d")`,
         { name: 'filter the first d (hours)', filters: [{ ci: 3, p: { kind: 'numCompare', op: '>=', value: 2 } }], refuse: ['dplyr'] },
         { name: 'hide the empty-named column', hide: [1], refuse: ['dplyr'] },
     ]);
+
+// Dots names (`..1`, `...`): dplyr can't read one or select() around one it
+// keeps, but an unreferenced one doesn't stop filter() or arrange().
+edgeSuite('Copy as R code round trip: dots column names (real R)',
+    'df <- setNames(data.frame(1:3, c(3L, 1L, 2L), 4:6, 7:9), c("id", "a", "..1", "..."))',
+    ['df', 'dtobj'],
+    [
+        { name: 'filter a, ..1 unreferenced', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 1 } }] },
+        { name: 'sort by a, ..1 unreferenced', sort: [{ ci: 1, dir: 'asc' }] },
+        { name: 'hide both dots columns', hide: [2, 3] },
+        { name: 'filter ..1', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>', value: 4 } }], refuse: ['dplyr'] },
+        { name: 'sort by ...', sort: [{ ci: 3, dir: 'desc' }], refuse: ['dplyr'] },
+        { name: 'hide a, keep ..1', hide: [1], refuse: ['dplyr'] },
+    ]);

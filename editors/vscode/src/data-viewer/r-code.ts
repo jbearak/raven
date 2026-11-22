@@ -32,8 +32,8 @@
  *   - **Columns** are referenced by name only when the name is unique
  *     and nonempty in the R object; otherwise by position (`dat[[3]]`),
  *     since a name would read the first column with it. dplyr can't
- *     filter or sort such a frame (nor touch `...`/`..1` names at all),
- *     so that flavor refuses it. Every `[` in the base R flavor is one
+ *     filter or sort such a frame, nor read a `...`/`..1` column or
+ *     select() around one it keeps, so that flavor refuses those views. Every `[` in the base R flavor is one
  *     `[.data.table` also reads as base R does (row indices, literal
  *     column positions), so it reproduces the view on a data.table too;
  *     the data.table flavor parenthesizes an `i` that is a lone symbol or
@@ -980,17 +980,24 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
     const ambiguous = ambiguousNames(objectNames(input, rownamesAsColumn, rownameName));
     if (flavor === 'dplyr') {
         // dplyr's data mask refuses duplicate and empty names in filter()
-        // and arrange(), and dots names (`...`, `..1`) in every verb.
-        const names = objectNames(input, rownamesAsColumn, rownameName);
-        const dots = names.filter(n => n === '...' || /^\.\.[0-9]+$/.test(n));
+        // and arrange(). A dots name (`...`, `..1`) can't be read there
+        // (`.data[["..1"]]` errors too), and select() refuses one it
+        // leaves behind; an unreferenced dots column is otherwise fine.
+        const isDots = (n: string) => n === '...' || /^\.\.[0-9]+$/.test(n);
+        const nameOf = (ci: number) => (input.columns[ci].isRowname ? rownameName : input.columns[ci].name);
+        const referenced = [...entries.map(e => e.columnIndex), ...input.sort.keys.map(k => k.columnIndex)]
+            .filter(ci => input.columns[ci] && (!input.columns[ci].isRowname || rownamesAsColumn))
+            .map(nameOf);
         const hiddenSet = new Set(input.hiddenColumns);
-        const kept = ambiguousNames(objectNames(
-            { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName));
+        const keptNames = objectNames(
+            { ...input, columns: input.columns.filter((_, ci) => !hiddenSet.has(ci)) }, rownamesAsColumn, rownameName);
+        const kept = ambiguousNames(keptNames);
         const refused = [...new Set([
             ...(entries.length > 0 || input.sort.keys.length > 0 ? ambiguous : []),
             // select() itself refuses duplicates it leaves behind.
             ...(input.hiddenColumns.length > 0 ? kept : []),
-            ...(entries.length > 0 || input.sort.keys.length > 0 || input.hiddenColumns.length > 0 ? dots : []),
+            ...referenced.filter(isDots),
+            ...(input.hiddenColumns.length > 0 ? keptNames.filter(isDots) : []),
         ])];
         if (refused.length > 0) {
             const list = refused.map(n => (n === '' ? 'an empty name' : `"${rComment(n)}"`)).join(', ');

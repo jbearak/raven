@@ -222,4 +222,14 @@ describe('generateRCode', () => {
         expect(code).toContain('y %in% -Inf');
         expect(code).not.toContain('Not translated');
     });
+
+    test('dplyr refuses a dots column only when the code reads it or select() keeps it', () => {
+        const cols = [col('a', 'Int32', { typeTag: '<int>' }), col('..1', 'Int32', { typeTag: '<int>' })];
+        const f = (columnIndex: number) => ({ entries: [{ id: 'x', columnIndex, predicate: { kind: 'numCompare' as const, op: '>' as const, value: 1 }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true });
+        const ok = gen({ columns: cols, filter: f(0) });
+        expect('code' in ok && ok.code).toContain('filter(a > 1)');
+        expect(gen({ columns: cols, filter: f(1) })).toHaveProperty('error');
+        expect(gen({ columns: cols, hiddenColumns: [0] })).toHaveProperty('error');
+        expect(gen({ columns: cols, hiddenColumns: [1] })).toHaveProperty('code');
+    });
 });
