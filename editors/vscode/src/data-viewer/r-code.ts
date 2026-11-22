@@ -39,11 +39,14 @@
  *     the data.table flavor parenthesizes an `i` that is a lone symbol or
  *     starts with `!` (calling-scope lookup, not-join).
  *
- * Text from the data (column names, values, labels, the `View()`
- * expression) is never code: in comments it goes through `rComment()`,
+ * Text from the data (column names, values, labels) is never code: in
+ * comments it goes through `rComment()`,
  * in code through `rString()` or `rName()`, which escape every line
  * terminator, control and invisible format character. A name with no
  * safe symbol spelling is read as `x[["name"]]` (or `.data[["name"]]`).
+ * The `View()` expression is the user's own R code: it is run again as
+ * the code's source (so `View(f(d))` calls `f()` again), and only its
+ * copy in the header comment goes through `rComment()`.
  *
  * A filter or sort the generator can't express faithfully is left out
  * and named in a comment, never approximated silently.
@@ -86,7 +89,7 @@ const RESERVED = new Set([
  * format characters, bidi controls included, that can make text read
  * differently from how it parses ("Trojan Source").
  */
-const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
 const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'g');
 
 /** Thrown when data-derived text has no R spelling (NUL, which R strings
@@ -375,10 +378,10 @@ function predicateCode(
  *   - JS matches UTF-16 code units, PCRE (in R's UTF-8 mode) code points,
  *     so on a character outside the BMP (an emoji) the number of
  *     characters an atom consumes differs. Atoms that can match a lone
- *     surrogate (`.`, negated classes, `\S`, `\W`, `\D`, classes spanning
- *     the surrogates) are allowed only under `*`, or under one `+` outside
- *     any quantified group, where the count can't change the outcome; a
- *     non-BMP character in the pattern is refused.
+ *     surrogate (`.`, negated classes, `\S`, `\W`, `\D`) are allowed only
+ *     under `*`, or under one `+` outside any quantified group, where the
+ *     count can't change the outcome; a non-BMP character in the pattern,
+ *     or a class range across the surrogates, is refused.
  *   - Case-insensitive matching folds a few characters in PCRE (Unicode
  *     simple case folding) that JS's `toUpperCase` canonicalization keeps
  *     apart, such as the Kelvin sign and `k` (`FOLD_GROUPS`). An atom
@@ -471,6 +474,9 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             i += head.length;
             groups.push(false);
             sizes.push(0);
+            // PCRE2's default nesting limit is 250; translation adds up
+            // to two levels around an atom.
+            if (groups.length > MAX_DEPTH) return refuse('the pattern nests groups too deeply for R');
             continue;
         }
         if (c === ')') {
@@ -485,14 +491,21 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
             continue;
         }
         if (c === '{') {
-            // `{,n}` is a quantifier in PCRE2 10.43+, a literal in JS.
-            if (pattern[i + 1] === ',') return refuse('`{,` means something else in R');
             // PCRE caps repeat counts at 65535; JS has no cap.
             const bound = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(i));
-            if (bound && [bound[1], bound[2]].some(b => b !== undefined && b !== '' && Number(b) > 65535)) {
+            if (!bound) {
+                // A literal `{` in JS; PCRE2 10.43+ reads `{,2}` and
+                // `{ 2 }` as repeats, so it is escaped.
+                out += '\\{';
+                grow(2);
+                last = { size: 2, group: false };
+                i++;
+                continue;
+            }
+            if ([bound[1], bound[2]].some(b => b !== undefined && b !== '' && Number(b) > 65535)) {
                 return refuse('the repeat count is too large for R');
             }
-            if (bound && last.group) {
+            if (last.group) {
                 const copies = bound[2] === undefined ? Number(bound[1])
                     : bound[2] === '' ? Number(bound[1]) + 1 : Math.max(Number(bound[1]), Number(bound[2]));
                 grow(last.size * Math.max(copies - 1, 0));
@@ -524,6 +537,9 @@ export function translateRegex(pattern: string, caseSensitive: boolean): { pcre:
 /** Budget for `translateRegex`'s expanded-size estimate, well under the
  *  64 KiB compiled-pattern limit (estimates count source characters). */
 const MAX_EXPANDED = 10_000;
+/** Deepest group nesting `translateRegex` accepts (PCRE2's limit is 250). */
+const MAX_DEPTH = 200;
+const NON_BMP = 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R';
 /** Extra estimated size per character class (see `MAX_EXPANDED`). */
 const CLASS_COST = 40;
 
@@ -590,7 +606,6 @@ function readClass(p: string, start: number):
     // `]` is a literal and the class runs on.
     if (p[i] === ']') return { reason: '`[]` means something else in R' };
     let body = '';
-    let spansSurrogates = false;
     let lastChar: number | null = null;
     while (i < p.length && p[i] !== ']') {
         const c = p[i];
@@ -622,7 +637,7 @@ function readClass(p: string, start: number):
                 if (e === undefined || /[dDwWsS]/.test(e)) return { reason: 'a range next to a class escape means something else in R' };
                 if (!/[bntrf.*+?()[\]{}|^$\\/\-]/.test(e)) return { reason: `the escape \\${e} in a class means something else in R` };
                 const hi = (({ n: 10, t: 9, r: 13, f: 12, b: 8 } as Record<string, number>)[e] ?? e.charCodeAt(0));
-                if (lastChar <= 0xdfff && hi >= 0xd800) spansSurrogates = true;
+                if (lastChar <= 0xdfff && hi >= 0xd800) return { reason: NON_BMP };
                 body += '-\\' + e;
                 i += 3;
             } else {
@@ -630,7 +645,7 @@ function readClass(p: string, start: number):
                 if (hi >= 0xd800 && hi <= 0xdfff) {
                     return { reason: 'matches characters outside the Basic Multilingual Plane (such as emoji) differently in R' };
                 }
-                if (lastChar <= 0xdfff && hi >= 0xd800) spansSurrogates = true;
+                if (lastChar <= 0xdfff && hi >= 0xd800) return { reason: NON_BMP };
                 body += '-' + (hiRaw === ']' ? '\\]' : hiRaw);
                 i += 2;
             }
@@ -649,7 +664,9 @@ function readClass(p: string, start: number):
         js,
         inner: jsInner,
         end: i + 1,
-        anyUnit: negated || spansSurrogates,
+        // A range across the surrogates holds both halves of every emoji
+        // in JS but no emoji in R; it is refused above.
+        anyUnit: negated,
     };
 }
 

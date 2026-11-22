@@ -147,12 +147,23 @@ describe('generateRCode', () => {
         expect(pcre('ab', false)).toBe('ab');
         // Named groups become plain groups (JS allows `$` in names, PCRE not).
         expect(pcre('(?<a$b>x)')).toBe('(?:x)');
+        // A literal `{` in JS is escaped (PCRE2 10.43+ reads `{,2}` and
+        // `{ 2 }` as repeats); a JS quantifier is kept.
+        expect(pcre('^a{ 2 }$')).toBe('^a\\{ 2 }\\z');
+        expect(pcre('a{,2}')).toBe('a\\{,2}');
+        expect(pcre('a{2}')).toBe('a{2}');
+        // PCRE2 refuses nesting deeper than 250.
+        expect(pcre('('.repeat(200) + 'a' + ')'.repeat(200))).not.toBeNull();
+        expect(pcre('('.repeat(201) + 'a' + ')'.repeat(201))).toBeNull();
+        // A range across the surrogates holds emoji halves in JS only.
+        expect(pcre(`^[${String.fromCharCode(0xd7ff)}-${String.fromCharCode(0xe000)}]*$`)).toBeNull();
+        expect(pcre('^[a-z]*$')).not.toBeNull();
         // Counts of any-character atoms differ on non-BMP text.
         for (const p of ['^.$', 'a.b', '^.+.+$', '(?:.+)+', '[^a]{2}', '\\S?', '\\D\\D', '😀', '[😀]'])
             expect([p, pcre(p)]).toEqual([p, null]);
         expect(pcre('^.+$')).not.toBeNull();
         expect(pcre('^[^,]*,.*$')).not.toBeNull();
-        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', 'a{,2}', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]', '(?<a$b>x){0,10000}', '((x){0,200}){0,200}'])
+        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\', '(?i)a', '[\\d-z]', '[\\S]', '(unclosed', '(?<=a+)b', '(?<!a)b', 'a{65536}', '[a-\\z]', '(?<a$b>x){0,10000}', '((x){0,200}){0,200}'])
             expect([p, pcre(p)]).toEqual([p, null]);
     });
 
