@@ -11977,7 +11977,10 @@ where
     /// accepts, as R's function lookup passes over a binding that isn't a
     /// function. A skipped function-frame binding continues to the enclosing
     /// frames. A skipped global binding also hides the callers' (prefix)
-    /// binding of the name: it is the same environment, overwritten.
+    /// binding of the name: it is the same environment, overwritten. In a
+    /// package `R/` file it hides the package's own `R/` contribution of the
+    /// name for the same reason (`symbol_for_past_own_binding` in
+    /// `scope/contributions.rs`).
     pub(crate) fn symbol_with_layer_skipping(
         &mut self,
         name: &str,
@@ -12015,6 +12018,7 @@ where
                 break;
             }
         }
+        let mut global_skipped = false;
         if !removed {
             let global = self.choose_global_frame();
             if let Some(sym) = global.symbols.get(name) {
@@ -12022,6 +12026,7 @@ where
                     return Some((sym.clone(), ScopeLayer::Global));
                 }
                 removed = true;
+                global_skipped = true;
             }
             if global.removed_names.contains(name) {
                 removed = true;
@@ -12038,10 +12043,13 @@ where
                 return Some((sym, ScopeLayer::Prefix));
             }
         }
-        if let Some(symbol) = self.contributions.symbol_for(
-            name,
-            ScopePhase::from_deferred(self.query_inside_function()),
-        ) {
+        let phase = ScopePhase::from_deferred(self.query_inside_function());
+        let contributed = if global_skipped {
+            self.contributions.symbol_for_past_own_binding(name, phase)
+        } else {
+            self.contributions.symbol_for(name, phase)
+        };
+        if let Some(symbol) = contributed {
             return Some((symbol, ScopeLayer::Contributions));
         }
         for (_iv, frame) in self.function_stack.iter().rev() {

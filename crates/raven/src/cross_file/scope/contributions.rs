@@ -36,6 +36,10 @@ pub(super) struct ScopeContributions<'a> {
     r6_omitted_parent_context: Option<&'a HashSet<Url>>,
     r6_graph_context_truncated: bool,
     immediate_groups: Vec<&'a BTreeSet<String>>,
+    /// The package's `R/` top-level names, when the queried file is one of
+    /// those sources: its global environment is the namespace they live in.
+    /// See [`Self::symbol_for_past_own_binding`].
+    own_namespace_names: Option<&'a BTreeSet<String>>,
     imported_names: Option<&'a BTreeMap<String, BTreeSet<String>>>,
     deferred_helper_groups: Vec<&'a BTreeSet<String>>,
     attachment_groups: Vec<&'a BTreeSet<String>>,
@@ -83,6 +87,9 @@ impl<'a> ScopeContributions<'a> {
                 && path.starts_with(root.join("tests").join("testthat")))
         {
             selected.immediate_groups.push(&NAMESPACE_RUNTIME_SYMBOLS);
+        }
+        if kind == Some(RFileKind::Source) {
+            selected.own_namespace_names = Some(contrib.r_internal_symbols.as_ref());
         }
         if kind.is_some() || package_state::is_dev_context_path(&path, root) {
             selected.r6 = Some(&contrib.r6);
@@ -185,6 +192,39 @@ impl<'a> ScopeContributions<'a> {
     pub(super) fn symbol_for(&self, name: &str, phase: ScopePhase) -> Option<ScopedSymbol> {
         self.contains(name, phase)
             .then(|| self.synthetic_symbol(Arc::from(name)))
+    }
+
+    /// [`Self::symbol_for`] for a function lookup that passed over the queried
+    /// file's own top-level binding of `name` because it isn't a function.
+    ///
+    /// In a package `R/` file that binding is the namespace's, and the
+    /// name-only `R/` contribution lists it, so the contribution would hand
+    /// back the binding just passed over. It counts here only when something
+    /// outside the namespace's own sources provides the name: a NAMESPACE
+    /// import, or another group. A second `R/` file binding the same name
+    /// can't be told apart, since the contribution carries no file; one
+    /// namespace holds one value, and the skipped binding is taken as it.
+    pub(super) fn symbol_for_past_own_binding(
+        &self,
+        name: &str,
+        phase: ScopePhase,
+    ) -> Option<ScopedSymbol> {
+        let Some(own) = self.own_namespace_names.filter(|own| own.contains(name)) else {
+            return self.symbol_for(name, phase);
+        };
+        let elsewhere = self
+            .immediate_groups
+            .iter()
+            .any(|&group| !std::ptr::eq(group, own) && group.contains(name))
+            || self
+                .imported_names
+                .is_some_and(|imports| imports.contains_key(name))
+            || (phase == ScopePhase::Deferred
+                && self
+                    .deferred_helper_groups
+                    .iter()
+                    .any(|group| group.contains(name)));
+        elsewhere.then(|| self.synthetic_symbol(Arc::from(name)))
     }
 
     /// Materialize after timeline evaluation, preserving local and sourced bindings.
