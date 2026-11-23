@@ -577,6 +577,34 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
              namedVariables = if (counts[2] > 0) jnum(counts[2]) else NULL)
     }, error = function(e) jobj(error = jstr(conditionMessage(e)))))
 
+    # `x@.Data`: the data part is the object without its slots, not an
+    # attribute. An S4-typed object keeps it (or the environment it extends)
+    # in one; a class with no data part gives NULL, as `@` does. For a basic
+    # type, methods::getDataPart() strips the slots, by the class definition.
+    # It runs only methods code, but would load the class's package to find
+    # a definition it doesn't have, so that case isn't resolved.
+    data_part <- function(x) {
+        if (typeof(x) == "S4") {
+            v <- attr(x, ".Data", exact = TRUE)
+            if (is.null(v)) v <- attr(x, ".xData", exact = TRUE)
+            if (identical(v, as.name("\001NULL\001"))) v <- NULL
+            return(list(ok = TRUE, value = v))
+        }
+        # Stripping the slots copies the vector: not one a package implements.
+        if (typeof(x) %in% c("list", "logical", "integer", "double", "complex", "character", "raw") &&
+            foreign(x)) {
+            return(list(ok = FALSE))
+        }
+        pkg <- attr(attr(x, "class", exact = TRUE), "package", exact = TRUE)
+        # (A package name with a class of its own could dispatch a user's
+        # `length()` or `match()` method here, and in methods' lookup.)
+        if (!is.null(pkg) && !(is.character(pkg) && is.null(oldClass(pkg)) && length(pkg) == 1L &&
+                               pkg %in% c(".GlobalEnv", loadedNamespaces()))) {
+            return(list(ok = FALSE))
+        }
+        v <- tryCatch(suppressMessages(methods::getDataPart(x)), error = function(err) NULL)
+        if (is.null(v)) list(ok = FALSE) else list(ok = TRUE, value = v)
+    }
     # Hover resolves only forms that run no R code (design sec. 6).
     resolve <- function(e, scope) {
         if (is.symbol(e)) {
@@ -610,9 +638,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 if (!(is.character(key) || is.numeric(key)) || length(key) != 1L) return(list(ok = FALSE))
                 if (op == "@") {
                     if (!isS4(x) || !is.character(key)) return(list(ok = FALSE))
+                    if (key == ".Data") return(data_part(x))
                     # A slot is an attribute; methods stores a NULL slot as
                     # the symbol `\001NULL\001`. No attribute (an absent
-                    # slot, or `.Data`, which isn't one) isn't resolved here.
+                    # slot) isn't resolved here.
                     v <- attr(x, key, exact = TRUE)
                     if (is.null(v)) return(list(ok = FALSE))
                     if (identical(v, as.name("\001NULL\001"))) v <- NULL
@@ -1127,8 +1156,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         # to guess between, go to the original untouched.
         line_bps <- !identical(rpc("has_bps", path), "0")
         if (!line_bps && !length(state$fbp_names)) return(plain())
-        args <- list(...)
-        enc <- if (!is.null(args$encoding)) args$encoding else "unknown"
+        # Arguments are promises base source() may never force
+        # (`prompt.echo` with echo off). Only those read here are forced,
+        # by position in `...`, and each is one base source() forces for a
+        # file anyway; forced once, it keeps its value when passed on.
+        dot <- function(name) match(name, arg_names, nomatch = 0L)
+        i_enc <- dot("encoding")
+        enc <- if (i_enc) ...elt(i_enc) else "unknown"
+        if (is.null(enc)) enc <- "unknown"
         if (length(enc) != 1L) return(plain())
         lines <- readLines(file, warn = FALSE, encoding = if (identical(enc, "unknown")) "UTF-8" else enc)
         ann <- if (line_bps) {
@@ -1144,14 +1179,19 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         # Nothing to change: base source() exactly as called.
         if (is.null(ann) && is.null(bound)) return(plain())
         if (!is.null(bound)) exprs <- bound
-        if (isTRUE(args$echo)) exprs <- tryCatch(echo_original(exprs, path, lines), error = function(e) exprs)
-        if (isTRUE(args$chdir)) {
+        i_echo <- dot("echo")
+        if (i_echo && isTRUE(...elt(i_echo))) exprs <- tryCatch(echo_original(exprs, path, lines), error = function(e) exprs)
+        i_chdir <- dot("chdir")
+        if (i_chdir && isTRUE(...elt(i_chdir))) {
             owd <- setwd(dirname(path))
             on.exit(setwd(owd), add = TRUE)
         }
-        args$chdir <- NULL
-        args$encoding <- NULL
-        do.call(orig, c(list(exprs = exprs, local = local), args))
+        # The rest go on as `..N`, still unevaluated; `chdir` and `encoding`
+        # were applied here and mean nothing with `exprs`.
+        keep <- which(!arg_names %in% c("chdir", "encoding"))
+        rest <- lapply(keep, function(i) as.name(paste0("..", i)))
+        names(rest) <- arg_names[keep]
+        eval(as.call(c(list(orig, exprs = quote(exprs), local = quote(local)), rest)))
     }
     env$set_source_hook <- function(on) internal(tryCatch({
         on <- isTRUE(as.logical(on))
