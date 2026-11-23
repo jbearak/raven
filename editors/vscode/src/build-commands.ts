@@ -206,7 +206,8 @@ async function run_install_and_restart(
         if (target.kind === 'vscode-r') {
             // Raven can't restart vscode-R's session, and can't see when
             // the install finishes, so send only the install and say what's
-            // left to do without claiming it succeeded.
+            // left to do without claiming it succeeded. Nothing is said
+            // when vscode-R reports it sent nothing (its prompt cancelled).
             if (await deliver_to_target(target, `devtools::install(${pkg_arg})`)) {
                 void vscode.window.showInformationMessage(
                     `Raven: sent devtools::install() to vscode-R. When it finishes, ${vscode_r_restart_hint()} to load the new version.`,

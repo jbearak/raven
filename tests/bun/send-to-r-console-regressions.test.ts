@@ -315,6 +315,42 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         expect(interactive).toEqual(['t <- 7']);
     });
 
+    // vscode-R's `r.runCommand` hides whether anything was sent; Raven asks
+    // through `r.runSelection`, which reports it.
+    test("cancelling vscode-R's own prompt sends nothing and says so to the caller", async () => {
+        install_vscode_r();
+        const theirs = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        prompt_cancelled = true;
+
+        // False: the caller leaves the cursor where it is.
+        expect(await send.send_to_r_console('v <- 8')).toBe(false);
+        expect(theirs.typed).toEqual([]);
+        // The user cancelled; that is no error to report.
+        expect(fake.errors).toEqual([]);
+
+        prompt_cancelled = false;
+        expect(await send.send_to_r_console('v <- 8')).toBe(true);
+        expect(theirs.typed).toEqual(['v <- 8']);
+    });
+
+    test('vscode-R before 3.2 still gets the code through r.runCommand, which waits for the send', async () => {
+        install_vscode_r('2.8.8');
+        const theirs = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        expect(await send.send_to_r_console('y <- 9')).toBe(true);
+        expect(theirs.typed).toEqual(['y <- 9']);
+        expect(unawaited_sends).toBe(0);
+    });
+
+    test("empty code never makes vscode-R run the editor's selection", async () => {
+        install_vscode_r();
+        fake.window.createTerminal({ name: 'R Interactive' });
+        fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+        expect(await send.send_to_r_console('')).toBe(true);
+        expect(ran_selection).toBe(0);
+    });
+
     describe('Install and Restart says what to restart', () => {
         const install = async () => {
             build.register_build_commands(context as never);
@@ -357,6 +393,16 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
             expect(fake.infos).toEqual([
                 'Raven: sent devtools::install() to vscode-R. When it finishes, restart R where vscode-R ran it (its R terminal, or "R: Restart Interactive Session") to load the new version.',
             ]);
+        });
+
+        test("nothing, when vscode-R's prompt was cancelled", async () => {
+            install_vscode_r();
+            fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+            fake.set_setting('r.interactive.executionTarget', 'global', 'interactive');
+            prompt_cancelled = true;
+            await install();
+            expect(interactive).toEqual([]);
+            expect(fake.infos).toEqual([]);
         });
     });
 
