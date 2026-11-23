@@ -4,7 +4,7 @@
 // same frame. The `id` column (1..n) identifies rows, so each case compares
 // R's row order with the viewer's permutation. Skipped when R, arrow,
 // dplyr, data.table, stringr or haven is missing.
-import { beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { spawn } from 'bun';
 import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -174,6 +174,10 @@ async function runR(rCode: string, extraEnv: Record<string, string> = {}): Promi
 }
 
 describe.skipIf(!READY)('Copy as R code round trip (real R)', () => {
+    // A reader left open is closed by the garbage collector later, and bun
+    // reports that as an error in whichever test is running then.
+    afterAll(async () => { await reader?.close(); });
+
     beforeAll(async () => {
         const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-rcode-rds-'));
         rdsPath = join(tmp, 'df.rds');
