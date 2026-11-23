@@ -2359,6 +2359,97 @@ fn user_output_that_looks_like_a_probe_announcement_is_shown() {
     );
 }
 
+/// True once the console shows `line` as a whole output line.
+fn shows_line(c: &Console, line: &str) -> bool {
+    c.text().lines().any(|l| l.trim_end() == line)
+}
+
+#[test]
+fn lookalike_output_is_shown_before_readline_asks() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    // Upper-cased by the program, so the echoed code can't match.
+    c.send(
+        "{ cat(\"debug at <raven-probe>#1\\n\"); cat(toupper(\"choose a number\\n\")); flush.console(); ans <- readline(); cat(toupper(\"got\"), ans, \"\\n\") }",
+        None,
+    );
+    // Instructions printed before readline() are on screen while it waits.
+    c.expect("CHOOSE A NUMBER");
+    assert!(shows_line(&c, "debug at <raven-probe>#1"), "{}", c.text());
+    c.type_line("7");
+    c.expect("GOT 7");
+    // A prompt label that is the start of an announcement, with no newline.
+    c.send(
+        "{ cat(\"Called \"); ans <- readline(); cat(toupper(\"then\"), ans, \"\\n\") }",
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !c.text().lines().any(|l| l.starts_with("Called ")) {
+        assert!(
+            Instant::now() < deadline,
+            "the label is held back while readline() waits: {}",
+            c.text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    c.type_line("8");
+    c.expect("THEN 8");
+}
+
+#[test]
+fn lookalike_output_is_shown_before_r_quits() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    c.send(
+        "cat(\"debug at <raven-probe>#1\\n\"); cat(toupper(\"last words\\n\")); q(\"no\")",
+        None,
+    );
+    c.expect("LAST WORDS");
+    assert!(shows_line(&c, "debug at <raven-probe>#1"), "{}", c.text());
+}
+
+#[test]
+fn lookalike_output_is_shown_at_a_browser_prompt() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let file = c.write_file(
+        "look.R",
+        "g <- function() {\n  cat(\"debug at <raven-probe>#1\\n\")\n  cat(toupper(\"kept before the stop\\n\"))\n  z <- 1\n  z\n}\n",
+    );
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": file}, "breakpoints": [{"line": 4}]}),
+    );
+    d.req("configurationDone", json!({}));
+    let m = d.mark();
+    c.send(&std::fs::read_to_string(&file).unwrap(), Some(&file));
+    d.event("breakpoint", m);
+    // Printed by the program just before a breakpoint stops it: only R's
+    // own announcement of the debugger's step is hidden.
+    let m = d.mark();
+    c.send("g()", None);
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "breakpoint");
+    c.expect("KEPT BEFORE THE STOP");
+    assert!(shows_line(&c, "debug at <raven-probe>#1"), "{}", c.text());
+    // Typed at Browse>: R announces nothing before the prompt returns.
+    c.type_line("cat(\"debug at <raven-probe>#2\\n\"); cat(toupper(\"typed while stopped\\n\"))");
+    c.expect("TYPED WHILE STOPPED");
+    assert!(shows_line(&c, "debug at <raven-probe>#2"), "{}", c.text());
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    let text = c.text();
+    assert!(!text.contains("base::identical("), "{text}");
+    assert!(!text.contains("Called from:"), "{text}");
+}
+
 #[test]
 fn ascii_sends_still_bind_breakpoints_outside_a_utf8_locale() {
     if !r_available() {
