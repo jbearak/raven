@@ -1434,7 +1434,11 @@ fn reported_packages_to_warm(
     // [`prefetch_reported_packages`] records.
     let max_depth = state.cross_file_config.max_chain_depth;
     let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-    for path in targets {
+    // Most workspaces call `data(..., package =)` nowhere: skip the walks.
+    let any_data_package = state
+        .workspace_index
+        .any_entry(|entry| !entry.data_packages.is_empty());
+    for path in targets.iter().filter(|_| any_data_package) {
         let Ok(uri) = Url::from_file_path(path) else {
             continue;
         };
