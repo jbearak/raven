@@ -43,6 +43,8 @@ const FLAVORS: CodeFlavor[] = ['dplyr', 'base', 'data.table'];
 const HOSTILE = [
     'a\nb', 'x\npwn()\n#', 'x\rpwn()', 'x\r\npwn()', 'x\u2028pwn()', 'x\u2029pwn()', 'x\u0085pwn()',
     'x\u000bpwn()', 'x\u000cpwn()', '`', '\\', '\\`pwn()`', '"', "'", 'a"b\\', 'é😀', '\u202epwn()', '\u206apwn()',
+    // Tag characters: an invisible copy of ASCII outside the BMP.
+    'x\u{e0070}\u{e0077}\u{e006e}',
     '...', '..1', 'if', '_x', '#pwn()', '"); pwn(); ("', '`); pwn(); (`', 'dup\npwn()', 'dup\npwn()',
 ];
 
@@ -112,7 +114,7 @@ describe('rComment', () => {
     test('keeps comment text on one line with nothing invisible', () => {
         for (const s of HOSTILE) {
             const c = rComment(s);
-            expect(c).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2060-\u206f]/);
+            expect(c).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2060-\u206f\u{e0000}-\u{e007f}]/u);
         }
         expect(rComment('a\nb\rc\u2028')).toBe('a\\nb\\rc\\u2028');
     });
@@ -138,7 +140,7 @@ describe('generateRCode never emits data as code', () => {
     });
 
     test('no control, separator or invisible format character reaches the code raw', () => {
-        const unsafe = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+        const unsafe = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\u{e0000}-\u{e007f}]/u;
         const names = [...new Set(HOSTILE)].filter(n => n !== '...' && n !== '..1');
         for (const flavor of FLAVORS) {
             const r = generateRCode(view(names, [...HOSTILE, 'x'], 'd'), flavor);

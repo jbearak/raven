@@ -10,7 +10,7 @@
  * means touching all three; the round-trip test in
  * tests/bun/data-viewer-filter-popover-seed.test.ts guards that.
  */
-import type { FilterPredicate } from '../messages';
+import type { FilterPredicate, NumBound } from '../messages';
 
 // ── Value-editor state shapes ───────────────────────────────────────────────
 
@@ -79,21 +79,22 @@ export function predicateToKindValue(p: FilterPredicate): string {
 }
 
 /** Recover the initial editor state from a persisted FilterPredicate. The
- *  matching sub-state is filled; all others keep their blank defaults. */
-export function seedFromEntry(p: FilterPredicate): FormState {
+ *  matching sub-state is filled; all others keep their blank defaults.
+ *  `int64` says the column is Int64 / Uint64, as in {@link buildPredicate}. */
+export function seedFromEntry(p: FilterPredicate, int64 = false): FormState {
     const base = defaultFormState();
     switch (p.kind) {
         case 'numCompare':
-            base.numCompare = { op: p.op, value: String(p.value) };
+            base.numCompare = { op: p.op, value: boundText(p.value, int64) };
             break;
         case 'numBetween':
             base.numBetween = {
-                lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive,
+                lo: boundText(p.lo, int64), hi: boundText(p.hi, int64), inclusive: p.inclusive,
                 ...(p.upperInclusive !== undefined ? { upperInclusive: p.upperInclusive } : {}),
             };
             break;
         case 'numNotBetween':
-            base.numBetween = { lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive };
+            base.numBetween = { lo: boundText(p.lo, int64), hi: boundText(p.hi, int64), inclusive: p.inclusive };
             break;
         case 'setIn':
         case 'setNotIn':
@@ -125,6 +126,27 @@ export function seedFromEntry(p: FilterPredicate): FormState {
     return base;
 }
 
+/** The text a bound shows in its input. On an Int64 / Uint64 column an
+ *  integer-valued double is spelled out digit for digit: `String` gives the
+ *  shortest spelling that reads back as the same double
+ *  (`1000000000000000100` for 1000000000000000128), which {@link parseBound}
+ *  would then take for a different exact integer. */
+function boundText(b: NumBound, int64: boolean): string {
+    return int64 && typeof b === 'number' && Number.isInteger(b) ? BigInt(b).toString() : String(b);
+}
+
+/** The between-range form state after a histogram thumb moved, the thumbs
+ *  now at `lo` / `hi`. A field whose text already reads as its thumb's
+ *  position is the one that didn't move and keeps its text, so a bound
+ *  typed past 2^53 isn't replaced by the double the thumb sits at. */
+export function brushNumBetween(s: NumBetweenState, lo: number, hi: number, int64 = false): NumBetweenState {
+    return {
+        lo: parseFloat(s.lo) === lo ? s.lo : boundText(lo, int64),
+        hi: parseFloat(s.hi) === hi ? s.hi : boundText(hi, int64),
+        inclusive: s.inclusive,
+    };
+}
+
 /** Resolve set-membership values. Checklist columns (labelled-numeric, shipped
  *  dictionary) carry the selected codes/labels directly — preserving numeric
  *  types; free-text columns parse the comma/newline list into strings. */
@@ -138,35 +160,51 @@ function effectiveSetValues(s: FormState, setUsesChecklist: boolean): (string | 
         .filter(Boolean);
 }
 
+/** A typed numeric bound, or null when it isn't a number. On an Int64 /
+ *  Uint64 column, an integer a double can't hold exactly stays decimal
+ *  text, so the filter compares the integer that was typed
+ *  (`9007199254740993`, not the 2^53 it would round to). */
+export function parseBound(text: string, int64 = false): NumBound | null {
+    const t = text.trim();
+    if (int64 && /^[+-]?[0-9]+$/.test(t)) {
+        const exact = BigInt(t);
+        const n = Number(t);
+        if (!Number.isFinite(n) || BigInt(n) !== exact) return exact.toString();
+    }
+    const v = parseFloat(text);
+    return isNaN(v) ? null : v;
+}
+
 /** Build the FilterPredicate from the form state, or null when the input is
  *  incomplete (empty value, unparseable number, regex error). `kind` is the
- *  kind-select option value; `setUsesChecklist` reflects the column kind. */
+ *  kind-select option value; `setUsesChecklist` reflects the column kind,
+ *  and `int64` says the column is Int64 / Uint64 (see {@link parseBound}). */
 export function buildPredicate(
     kind: string,
     s: FormState,
-    opts: { setUsesChecklist: boolean },
+    opts: { setUsesChecklist: boolean; int64?: boolean },
 ): FilterPredicate | null {
     switch (kind) {
         case 'isEmpty': return { kind: 'isEmpty' };
         case 'isNotEmpty': return { kind: 'isNotEmpty' };
         case 'numCompare': {
-            const v = parseFloat(s.numCompare.value);
-            if (isNaN(v)) return null;
+            const v = parseBound(s.numCompare.value, opts.int64);
+            if (v === null) return null;
             return { kind: 'numCompare', op: s.numCompare.op, value: v };
         }
         case 'numBetween': {
-            const lo = parseFloat(s.numBetween.lo);
-            const hi = parseFloat(s.numBetween.hi);
-            if (isNaN(lo) || isNaN(hi)) return null;
+            const lo = parseBound(s.numBetween.lo, opts.int64);
+            const hi = parseBound(s.numBetween.hi, opts.int64);
+            if (lo === null || hi === null) return null;
             return {
                 kind: 'numBetween', lo, hi, inclusive: s.numBetween.inclusive,
                 ...(s.numBetween.upperInclusive !== undefined ? { upperInclusive: s.numBetween.upperInclusive } : {}),
             };
         }
         case 'numNotBetween': {
-            const lo = parseFloat(s.numBetween.lo);
-            const hi = parseFloat(s.numBetween.hi);
-            if (isNaN(lo) || isNaN(hi)) return null;
+            const lo = parseBound(s.numBetween.lo, opts.int64);
+            const hi = parseBound(s.numBetween.hi, opts.int64);
+            if (lo === null || hi === null) return null;
             return { kind: 'numNotBetween', lo, hi, inclusive: s.numBetween.inclusive };
         }
         case 'setIn': {

@@ -14,8 +14,8 @@ const SET_TRUNC_AT = 4;
 
 /** A bin edge for a chip: 6 significant digits (the filter keeps the
  *  exact edge). */
-function short(x: number): string {
-    return String(Number(x.toPrecision(6)));
+function short(x: number | string): string {
+    return typeof x === 'string' ? x : String(Number(x.toPrecision(6)));
 }
 
 export function summarizePredicate(p: FilterPredicate, col: ColumnSchema): string {

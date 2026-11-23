@@ -179,7 +179,7 @@ describe('generateRCode', () => {
         expect('code' in r && r.code).not.toContain('filter(');
     });
 
-    test('integer64: set values compare exactly, comparisons in the doubles the viewer compares', () => {
+    test('integer64: set values and comparisons compare exactly, as integer64', () => {
         const cols = [
             col('big', 'Int64', { typeTag: '<integer64>' }),
             col('lab', 'Int64', { typeTag: '<integer64>', valueLabels: { '9007199254740993': 'odd' } }),
@@ -202,8 +202,11 @@ describe('generateRCode', () => {
             expect(code).toContain("bit64::`%in%`(big, bit64::as.integer64(c(\"9007199254740993\", \"3\")))");
             // No unclass(): it would turn an integer64 into raw doubles.
             expect(code).toContain("bit64::`%in%`(lab, bit64::as.integer64(\"9007199254740993\"))");
-            expect(code).toContain("bit64::as.double.integer64(big) >= 2.5");
-            expect(code).toContain("bit64::as.double.integer64(big) >= 1 & bit64::as.double.integer64(big) <= Inf");
+            // `>= 2.5` is `>= 3` for an integer; no integer64 exceeds Inf.
+            expect(code).toContain('big >= bit64::as.integer64("3")');
+            expect(code).toContain('big >= bit64::as.integer64("1")');
+            expect(code).not.toContain('as.double');
+            expect(code).not.toContain('Inf');
             expect(code).not.toContain('9007199254740992');
         }
     });
@@ -245,7 +248,7 @@ describe('generateRCode', () => {
         }, 'data.table');
         const code = 'code' in r ? r.code : r.error;
         expect(code).toContain('# Requires data.table, bit64');
-        expect(code).toContain('bit64::as.double.integer64(big) < 3');
+        expect(code).toContain('big <= bit64::as.integer64("2")');
     });
 
     test('a non-number bound (an Inf saved as null) matches nothing, missing rows by includeMissing', () => {

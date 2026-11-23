@@ -35,6 +35,7 @@ import type { ArrowSliceReader } from './arrow-reader';
 import type { HistogramBin } from './messages';
 import { iterateBatches } from './batch-iter';
 import { throwIfAborted } from './abort';
+import { isInt64Type } from './filter';
 
 export const BIN_COUNT = 50;
 
@@ -49,16 +50,44 @@ export function binEdges(min: number, max: number, n: number): Float64Array {
 }
 
 /** The bin of finite `x` in `[edges[0], edges[n]]`: `edges[i] <= x <
- *  edges[i + 1]`, or the last bin for `x == edges[n]`. */
-export function binIndex(x: number, edges: Float64Array): number {
+ *  edges[i + 1]`, or the last bin for `x == edges[n]`.
+ *
+ *  For an Int64 / Uint64 value pass the integer itself as `exact` (and
+ *  its double as `x`): the edges are then compared with the integer, as
+ *  the filter compares them (`filter.ts` `int64Intervals`), not with a
+ *  double that may have rounded across an edge. JavaScript compares a
+ *  `bigint` with a number by value. */
+export function binIndex(x: number, edges: Float64Array, exact: number | bigint = x): number {
     const n = edges.length - 1;
     const min = edges[0];
     let idx = Math.floor(((x - min) / (edges[n] - min)) * n);
     if (idx >= n) idx = n - 1;
     if (idx < 0) idx = 0;
-    while (idx > 0 && x < edges[idx]) idx--;
-    while (idx < n - 1 && x >= edges[idx + 1]) idx++;
+    while (idx > 0 && exact < edges[idx]) idx--;
+    while (idx < n - 1 && exact >= edges[idx + 1]) idx++;
     return idx;
+}
+
+const F64 = new Float64Array(1);
+const U64 = new BigUint64Array(F64.buffer);
+
+/** The next double above finite `x`. */
+function nextUp(x: number): number {
+    if (x === 0) return Number.MIN_VALUE;
+    F64[0] = x;
+    U64[0] += x > 0 ? 1n : -1n;
+    return F64[0];
+}
+
+/** The tightest doubles around the integers `min..max`: the largest
+ *  double `<= min` and the smallest `>= max`. Histogram edges for an
+ *  Int64 / Uint64 column start from these, so the first and last bins
+ *  cover the extremes even when those round inward as doubles. */
+export function coveringDoubles(min: bigint, max: bigint): [number, number] {
+    let lo = Number(min), hi = Number(max);
+    if (lo > min) lo = -nextUp(-lo);
+    if (hi < max) hi = nextUp(hi);
+    return [lo, hi];
 }
 
 /** Bins from edges and counts. */
@@ -107,6 +136,9 @@ export async function computeHistogramForColumn(
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
+    // Int64 / Uint64: bin on the exact integers (see `binIndex`).
+    const exact = isInt64Type(reader.schema.columns[columnIndex]?.arrowType ?? '');
+    let bmin: bigint | undefined, bmax: bigint | undefined;
 
     for await (const { batch, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
@@ -117,12 +149,17 @@ export async function computeHistogramForColumn(
             if (!Number.isFinite(x)) continue;
             if (x < min) min = x;
             if (x > max) max = x;
+            if (exact && typeof v === 'bigint') {
+                if (bmin === undefined || v < bmin) bmin = v;
+                if (bmax === undefined || v > bmax) bmax = v;
+            }
             count++;
         }
     }
 
     throwIfAborted(signal);
     if (count === 0) return [];
+    if (bmin !== undefined && bmax !== undefined) [min, max] = coveringDoubles(bmin, bmax);
     if (min === max) {
         return [{ lo: min, hi: max, count }];
     }
@@ -137,7 +174,7 @@ export async function computeHistogramForColumn(
             if (v === null || v === undefined) continue;
             const x = typeof v === 'bigint' ? Number(v) : (v as number);
             if (!Number.isFinite(x)) continue;
-            counts[binIndex(x, edges)]++;
+            counts[binIndex(x, edges, exact && typeof v === 'bigint' ? v : x)]++;
         }
     }
     const bins = binsFrom(edges, counts);

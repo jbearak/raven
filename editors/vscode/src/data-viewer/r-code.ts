@@ -15,7 +15,9 @@
  *     (negations). Set filters on factors and value-labelled character
  *     columns use labels when Labels was on at filter time and codes or
  *     values when it was off; labelled numeric columns always use codes.
- *     `numBetween` honors `upperInclusive`.
+ *     `numBetween` honors `upperInclusive`. On an integer64 column the
+ *     numeric predicates compare integer64 with integer64 (`int64Code`),
+ *     as the engine compares the exact integers.
  *   - **Sorts** (`sort.ts`): stable, NA last in both directions, NaN just
  *     before NA. dplyr and base R put NaN and NA together in original
  *     order, so a double key gains an `is.na(x) & !is.nan(x)` tie-break
@@ -54,7 +56,7 @@
 import type { ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState, SortState, StringOrder } from './messages';
 import { keyKind } from './sort';
-import { int64SetKey, isNumberLike } from './filter';
+import { int64Intervals, int64SetKey, isInt64Type, isNumberLike, numBoundValue, type IntInterval } from './filter';
 
 export type CodeFlavor = 'dplyr' | 'base' | 'data.table';
 
@@ -88,18 +90,21 @@ const RESERVED = new Set([
  * controls and DEL; the line and paragraph separators (U+2028/9, which
  * editors may turn into line breaks) and NEL (U+0085); and invisible
  * format characters, bidi controls included, that can make text read
- * differently from how it parses ("Trojan Source").
+ * differently from how it parses ("Trojan Source"). The tag characters
+ * (U+E0000-U+E007F, an invisible copy of ASCII) lie outside the BMP, so
+ * the class matches code points (`u`) and callers test whole characters.
  */
-const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
-const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'g');
+const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\u{e0000}-\u{e007f}]/u;
+const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'gu');
 
 /** Thrown when data-derived text has no R spelling (NUL, which R strings
  *  can't hold); the caller leaves the piece out with a "Not translated"
  *  comment, or refuses the whole export. */
 class Unrepresentable extends Error {}
 
-function hex4(c: number): string {
-    return c.toString(16).padStart(4, '0');
+/** A code point as an R escape: `\uNNNN`, or `\UNNNNNNNN` past the BMP. */
+function uEscape(c: number): string {
+    return c > 0xffff ? '\\U' + c.toString(16).padStart(8, '0') : '\\u' + c.toString(16).padStart(4, '0');
 }
 
 /**
@@ -113,7 +118,7 @@ export function rComment(s: string): string {
         if (ch === '\n') return '\\n';
         if (ch === '\r') return '\\r';
         if (ch === '\t') return '\\t';
-        return '\\u' + hex4(ch.charCodeAt(0));
+        return uEscape(ch.codePointAt(0)!);
     });
 }
 
@@ -124,7 +129,7 @@ export function rComment(s: string): string {
 export function rNameRepresentable(name: string): boolean {
     if (name === '...' || /^\.\.[0-9]+$/.test(name)) return false;
     for (const ch of name) {
-        const c = ch.charCodeAt(0);
+        const c = ch.codePointAt(0)!;
         if (c === 0) return false;
         if (c >= 0x80 && UNSAFE_CHAR.test(ch)) return false;
     }
@@ -150,7 +155,7 @@ export function rName(name: string): string {
 
 /** A double-quoted R string literal. Non-ASCII text stays literal (R
  *  reads UTF-8 source); control, separator and invisible format
- *  characters are escaped (as `\uNNNN`). Throws `Unrepresentable` on NUL. */
+ *  characters are escaped (as `\uNNNN` or `\UNNNNNNNN`). Throws `Unrepresentable` on NUL. */
 export function rString(s: string): string {
     let out = '"';
     for (const ch of s) {
@@ -163,7 +168,7 @@ export function rString(s: string): string {
         else if (ch === '\t') out += '\\t';
         // `\u` for every other escape: R refuses a literal mixing `\x`
         // and `\u` escapes.
-        else if (UNSAFE_CHAR.test(ch)) out += '\\u' + hex4(c);
+        else if (UNSAFE_CHAR.test(ch)) out += uEscape(c);
         else out += ch;
     }
     return out + '"';
@@ -276,7 +281,7 @@ function valueRef(ctx: Ctx, ci: number): string {
 
 /** An Int64/UInt64 column: a `bit64::integer64` in R. */
 function isInt64(col: ColumnSchema): boolean {
-    return /^U?[Ii]nt64$/.test(col.arrowType);
+    return isInt64Type(col.arrowType);
 }
 
 function isFactor(col: ColumnSchema): boolean {
@@ -306,40 +311,29 @@ function predicateCode(
     const col = ctx.input.columns[entry.columnIndex];
     const x = valueRef(ctx, entry.columnIndex);
     const p: FilterPredicate = entry.predicate;
-    // The viewer compares an integer64 column as doubles (each value
-    // rounded to the nearest one); bit64 would instead truncate a
-    // fractional bound and turn an infinite one into NA. The method is
-    // called by name: plain as.double() reads the raw bits unless bit64
-    // happens to be loaded.
-    const num = isInt64(col) ? `bit64::as.double.integer64(${x})` : x;
-    if (isInt64(col) && /^num/.test(p.kind)) ctx.needs.add('bit64');
     const str = isFactor(col) ? `as.character(${x})` : x;
-    // A bound that isn't a number (an Inf saved as null) matches nothing
-    // in the viewer.
-    if ((p.kind === 'numCompare' && typeof p.value !== 'number')
-        || ((p.kind === 'numBetween' || p.kind === 'numNotBetween')
-            && (typeof p.lo !== 'number' || typeof p.hi !== 'number'))) {
-        return { code: 'FALSE', trueOnNA: false };
+    if (p.kind === 'numCompare' || p.kind === 'numBetween' || p.kind === 'numNotBetween') {
+        if (isInt64(col)) return { code: int64Code(ctx, entry.columnIndex, x, p), trueOnNA: false };
+        // A bound that isn't a number (an Inf saved as null) matches
+        // nothing in the viewer.
+        const bounds = p.kind === 'numCompare'
+            ? [numBoundValue(p.value)]
+            : [numBoundValue(p.lo), numBoundValue(p.hi)];
+        if (bounds.some(v => v === undefined)) return { code: 'FALSE', trueOnNA: false };
+        const [b0, b1] = bounds.map(v => rNumber(v!));
+        if (p.kind === 'numCompare') {
+            return { code: `${x} ${p.op === '=' ? '==' : p.op} ${b0}`, trueOnNA: false };
+        }
+        if (p.kind === 'numBetween') {
+            const hiIncl = p.upperInclusive ?? p.inclusive;
+            return { code: `${x} ${p.inclusive ? '>=' : '>'} ${b0} & ${x} ${hiIncl ? '<=' : '<'} ${b1}`, trueOnNA: false };
+        }
+        return { code: `(${x} ${p.inclusive ? '<' : '<='} ${b0} | ${x} ${p.inclusive ? '>' : '>='} ${b1})`, trueOnNA: false };
     }
     switch (p.kind) {
         case 'isEmpty': return { code: naCode(ctx, entry.columnIndex, x), trueOnNA: true };
         case 'isNotEmpty': return { code: `!${naCode(ctx, entry.columnIndex, x)}`, trueOnNA: false };
         case 'bool': return { code: p.value ? x : `!${x}`, trueOnNA: false };
-        case 'numCompare': {
-            const op = p.op === '=' ? '==' : p.op;
-            return { code: `${num} ${op} ${rNumber(p.value)}`, trueOnNA: false };
-        }
-        case 'numBetween': {
-            const hiIncl = p.upperInclusive ?? p.inclusive;
-            const lo = `${num} ${p.inclusive ? '>=' : '>'} ${rNumber(p.lo)}`;
-            const hi = `${num} ${hiIncl ? '<=' : '<'} ${rNumber(p.hi)}`;
-            return { code: `${lo} & ${hi}`, trueOnNA: false };
-        }
-        case 'numNotBetween': {
-            const lo = `${num} ${p.inclusive ? '<' : '<='} ${rNumber(p.lo)}`;
-            const hi = `${num} ${p.inclusive ? '>' : '>='} ${rNumber(p.hi)}`;
-            return { code: `(${lo} | ${hi})`, trueOnNA: false };
-        }
         case 'strCompare': {
             const op = p.op === '=' ? '==' : '!=';
             return p.caseSensitive
@@ -385,6 +379,55 @@ function predicateCode(
                 : { code: `!${set}`, trueOnNA: true };
         }
     }
+}
+
+/** bit64's largest magnitude: -2^63 is its NA, and `as.integer64()` turns
+ *  anything further out into NA. */
+const R_INT64_MAX = (1n << 63n) - 1n;
+
+/**
+ * A numeric predicate on an integer64 column, exact as the viewer
+ * evaluates it (`int64Intervals`): each bound becomes an integer64
+ * literal, so no side is rounded to double. A plain `x >= 2.5` would not
+ * do: bit64 truncates a fractional bound and turns an infinite one into
+ * NA, and a double literal can't hold every 64-bit integer. So the bound
+ * is moved to the integer that keeps the comparison's meaning
+ * (`x >= 2.5` ⇔ `x >= 3`), and a bound no integer64 can reach folds to
+ * "every non-missing row" or `FALSE`.
+ *
+ * The comparison operators dispatch to bit64 because evaluating the
+ * `bit64::as.integer64()` operand loads it first; bit64 doesn't export
+ * the methods to call by name.
+ */
+function int64Code(
+    ctx: Ctx, ci: number, x: string,
+    p: Extract<FilterPredicate, { kind: 'numCompare' | 'numBetween' | 'numNotBetween' }>,
+): string {
+    ctx.needs.add('bit64');
+    const lit = (v: bigint): string => `bit64::as.integer64(${rString(v.toString())})`;
+    const all = `!${naCode(ctx, ci, x)}`;
+    // Clamp to the values an integer64 can hold.
+    const parts: IntInterval[] = [];
+    for (const iv of int64Intervals(p)) {
+        if ((iv.lo !== undefined && iv.lo > R_INT64_MAX) || (iv.hi !== undefined && iv.hi < -R_INT64_MAX)) continue;
+        const lo = iv.lo !== undefined && iv.lo > -R_INT64_MAX ? iv.lo : undefined;
+        const hi = iv.hi !== undefined && iv.hi < R_INT64_MAX ? iv.hi : undefined;
+        if (lo === undefined && hi === undefined) return all;
+        parts.push({ lo, hi });
+    }
+    if (parts.length === 0) return 'FALSE';
+    // `x != v` reads better than the two rays around `v`.
+    if (parts.length === 2 && parts[0].lo === undefined && parts[1].hi === undefined
+        && parts[0].hi !== undefined && parts[1].lo !== undefined && parts[1].lo - parts[0].hi === 2n) {
+        return `${x} != ${lit(parts[0].hi + 1n)}`;
+    }
+    const one = ({ lo, hi }: IntInterval): string => {
+        if (lo !== undefined && hi !== undefined) {
+            return lo === hi ? `${x} == ${lit(lo)}` : `${x} >= ${lit(lo)} & ${x} <= ${lit(hi)}`;
+        }
+        return lo !== undefined ? `${x} >= ${lit(lo)}` : `${x} <= ${lit(hi!)}`;
+    };
+    return parts.length === 1 ? one(parts[0]) : `(${parts.map(one).join(' | ')})`;
 }
 
 /**

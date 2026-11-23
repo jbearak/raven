@@ -71,23 +71,30 @@ export const EMPTY_SORT: SortState = {
     labelsOnWhenSorted: true,
 };
 
+/** A numeric filter bound: a double, or decimal integer text for an
+ *  integer a double can't hold exactly (an Int64 / Uint64 column past
+ *  2^53). The filter popover writes text only for such a column and such
+ *  a value; `filter.ts` compares those columns exactly (`int64Intervals`)
+ *  and reads the text as a double anywhere else (`numBoundValue`). */
+export type NumBound = number | string;
+
 /** A single filter predicate. Discriminated by `kind`. Predicate value
  *  storage is in JS-native types — wire serialization is whatever
- *  `JSON.stringify` does, which is fine for everything except `BigInt`
- *  (currently unused since Int64 / Uint64 columns are filtered as
- *  numeric or set predicates, both of which use Number or string keys). */
+ *  `JSON.stringify` does, so nothing here is a `BigInt`: Int64 / Uint64
+ *  values past 2^53 travel as decimal text ({@link NumBound}, and the
+ *  string keys of the set predicates). */
 export type FilterPredicate =
     | { kind: 'isEmpty' }
     | { kind: 'isNotEmpty' }
-    | { kind: 'numCompare'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: number }
+    | { kind: 'numCompare'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: NumBound }
     | {
-        kind: 'numBetween'; lo: number; hi: number; inclusive: boolean;
+        kind: 'numBetween'; lo: NumBound; hi: NumBound; inclusive: boolean;
         /** Overrides `inclusive` for the upper bound only, so a histogram
          *  bin `[lo, hi)` (or the closed last bin) filters to exactly the
          *  rows it counts. Absent ⇔ the upper bound follows `inclusive`. */
         upperInclusive?: boolean;
     }
-    | { kind: 'numNotBetween'; lo: number; hi: number; inclusive: boolean }
+    | { kind: 'numNotBetween'; lo: NumBound; hi: NumBound; inclusive: boolean }
     | { kind: 'setIn'; values: (string | number)[] }
     | { kind: 'setNotIn'; values: (string | number)[] }
     | { kind: 'strCompare'; op: '=' | '!='; value: string; caseSensitive: boolean }

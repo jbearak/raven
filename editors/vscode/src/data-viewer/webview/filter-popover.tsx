@@ -30,6 +30,7 @@ import { useDismiss } from './use-dismiss';
 import { FilterHistogram } from './filter-histogram';
 import { colKind, kindOptions, labelledNumericChoices } from './filter-column-kind';
 import {
+    brushNumBetween,
     buildPredicate,
     defaultFormState,
     predicateToKindValue,
@@ -80,7 +81,8 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     // Per-kind value state (we keep all sub-states alive so switching kind and
     // switching back doesn't lose values the user typed). When editing an
     // existing entry, the matching sub-state is seeded from its predicate.
-    const seed = initial ? seedFromEntry(initial.predicate) : defaultFormState();
+    const int64 = /^U?[Ii]nt64$/.test(column.arrowType);
+    const seed = initial ? seedFromEntry(initial.predicate, int64) : defaultFormState();
 
     const [numCompare, setNumCompare] = useState<NumCompareState>(seed.numCompare);
     const [numBetween, setNumBetween] = useState<NumBetweenState>(seed.numBetween);
@@ -158,7 +160,7 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     const predicate = buildPredicate(
         selectedKind,
         { numCompare, numBetween, set: setSelected, str, strRegex, dateCompare, dateBetween, bool: boolVal, freeText },
-        { setUsesChecklist },
+        { setUsesChecklist, int64 },
     );
     const canApply = predicate !== null && !(selectedKind === 'strRegex' && strRegex.regexError);
 
@@ -274,7 +276,7 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
                                 bins={histogram}
                                 lo={histoValid ? histoLo : histoDMin}
                                 hi={histoValid ? histoHi : histoDMax}
-                                onChange={(lo, hi) => setNumBetween(s => ({ lo: String(lo), hi: String(hi), inclusive: s.inclusive }))}
+                                onChange={(lo, hi) => setNumBetween(s => brushNumBetween(s, lo, hi, int64))}
                             />
                         )}
                     </>
