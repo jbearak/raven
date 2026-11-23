@@ -596,7 +596,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             return(list(ok = FALSE))
         }
         pkg <- attr(attr(x, "class", exact = TRUE), "package", exact = TRUE)
-        if (!is.null(pkg) && !(is.character(pkg) && length(pkg) == 1L &&
+        # (A package name with a class of its own could dispatch a user's
+        # `length()` or `match()` method here, and in methods' lookup.)
+        if (!is.null(pkg) && !(is.character(pkg) && is.null(oldClass(pkg)) && length(pkg) == 1L &&
                                pkg %in% c(".GlobalEnv", loadedNamespaces()))) {
             return(list(ok = FALSE))
         }

@@ -2283,6 +2283,11 @@ fn hover_runs_no_user_methods_and_reads_s4_slots() {
          bag <- new(\"Bag\", list(1, \"a\"))\n\
          setClass(\"Scope\", contains = \"environment\")\n\
          scope <- new(\"Scope\")\n\
+         registerS3method(\"length\", \"pkgtag\", counted)\n\
+         tagged <- new(\"WrappedNumbers\", 5, tag = \"t\")\n\
+         tcls <- attr(tagged, \"class\"); attr(tcls, \"package\") <- structure(\".GlobalEnv\", class = \"pkgtag\")\n\
+         attr(tagged, \"class\") <- tcls\n\
+         hits <- 0\n\
          hv <- function() { browser(); 1 }",
         None,
     );
@@ -2324,6 +2329,9 @@ fn hover_runs_no_user_methods_and_reads_s4_slots() {
     assert_eq!(data["body"]["result"], "list [2]", "{data}");
     let data = hover(&mut d, "scope@.Data");
     assert_eq!(data["body"]["type"], "environment", "{data}");
+    // Class metadata with a class of its own could dispatch: not read.
+    let data = hover(&mut d, "tagged@.Data");
+    assert_eq!(data["success"], false, "{data}");
     // A class with no data part: NULL, as in R.
     let data = hover(&mut d, "obj@.Data");
     assert_eq!(data["body"]["result"], "NULL", "{data}");
