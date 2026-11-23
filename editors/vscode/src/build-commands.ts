@@ -9,7 +9,7 @@ import {
     terminal_program_of,
 } from './send-to-r';
 import type { TerminalProgram } from './send-to-r/console-choice';
-import { deliver_to_target, send_to_r_console, with_send_queue } from './send-to-r/console-send';
+import { deliver_to_target, send_to_r_console, vscode_r_restart_hint, with_send_queue } from './send-to-r/console-send';
 import { resolve_send_target } from './send-to-r/r-terminal-manager';
 
 /**
@@ -204,12 +204,13 @@ async function run_install_and_restart(
         if (!target) return;
         const pkg_arg = get_package_path_arg();
         if (target.kind === 'vscode-r') {
-            // Raven can't restart vscode-R's session, and the terminal API
-            // can't see when the install finishes, so send only the install
-            // and say what's left to do without claiming it succeeded.
+            // Raven can't restart vscode-R's session, and can't see when
+            // the install finishes, so send only the install and say what's
+            // left to do without claiming it succeeded. Nothing is said
+            // when vscode-R reports it sent nothing (its prompt cancelled).
             if (await deliver_to_target(target, `devtools::install(${pkg_arg})`)) {
                 void vscode.window.showInformationMessage(
-                    "Raven: sent devtools::install() to vscode-R's terminal. When it finishes, restart R there to load the new version.",
+                    `Raven: sent devtools::install() to vscode-R. When it finishes, ${vscode_r_restart_hint()} to load the new version.`,
                 );
             }
             return;

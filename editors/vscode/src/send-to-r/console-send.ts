@@ -58,14 +58,43 @@ function make_active(terminal: vscode.Terminal): Promise<void> {
  * guard still applies there.
  */
 function vscode_r_targets_interactive(extension: vscode.Extension<unknown>): boolean {
+    return vscode_r_execution_target(extension) === 'interactive';
+}
+
+/** Whether this vscode-R has the Interactive session (3.2 and later),
+ *  told by the `r.interactive.executionTarget` setting it declares. */
+function vscode_r_declares_interactive(extension: vscode.Extension<unknown>): boolean {
     const json = extension.packageJSON as { contributes?: { configuration?: unknown } } | undefined;
     const sections = json?.contributes?.configuration;
-    const declared = (Array.isArray(sections) ? sections : [sections]).some((section) =>
+    return (Array.isArray(sections) ? sections : [sections]).some((section) =>
         typeof section === 'object' && section !== null
         && 'r.interactive.executionTarget' in ((section as { properties?: object }).properties ?? {}));
-    if (!declared) return false;
+}
+
+/**
+ * Where vscode-R's `r.interactive.executionTarget` sends code, read for the
+ * active editor's document as vscode-R reads it: `terminal` for a release
+ * that doesn't declare the setting (before 3.2), which only has terminals.
+ */
+function vscode_r_execution_target(extension: vscode.Extension<unknown>): 'auto' | 'terminal' | 'interactive' {
+    if (!vscode_r_declares_interactive(extension)) return 'terminal';
     const document = vscode.window.activeTextEditor?.document.uri;
-    return vscode.workspace.getConfiguration('r', document).get<string>('interactive.executionTarget', 'auto') === 'interactive';
+    const target = vscode.workspace.getConfiguration('r', document).get<string>('interactive.executionTarget', 'auto');
+    return target === 'interactive' || target === 'terminal' ? target : 'auto';
+}
+
+/**
+ * What to tell the user to restart after code that needs a fresh R went to
+ * vscode-R, which Raven can't restart: the Interactive session when that
+ * is where vscode-R runs code, the R terminal when it only uses terminals,
+ * and both when its `auto` target decides per send.
+ */
+export function vscode_r_restart_hint(): string {
+    const extension = vscode.extensions.getExtension(REDITORSUPPORT_EXTENSION_ID);
+    const target = extension ? vscode_r_execution_target(extension) : 'terminal';
+    if (target === 'interactive') return 'run "R: Restart Interactive Session"';
+    if (target === 'terminal') return "restart R in vscode-R's terminal";
+    return 'restart R where vscode-R ran it (its R terminal, or "R: Restart Interactive Session")';
 }
 
 /**
@@ -97,17 +126,44 @@ async function clear_way_for_vscode_r(): Promise<boolean> {
 }
 
 /**
- * Sends `code` to vscode-R's R terminal through its `r.runCommand` command,
- * which passes the text to `runTextInTerm` unchanged. vscode-R registers its
- * commands on activation, so activate it first. Returns false (after telling
- * the user) when vscode-R isn't available, or when its selector would pick a
- * Raven terminal (see `clear_way_for_vscode_r`; skipped when vscode-R sends
- * to its Interactive session, see `vscode_r_targets_interactive`).
+ * Hands `code` to vscode-R and says whether vscode-R sent it.
  *
- * True means vscode-R took the code, not that it ran: `r.runCommand`'s
- * handler discards whether it sent anything (vscode-R 3.4: `async (t) =>
- * { await runTextInTerm(t) }`), so cancelling vscode-R's own execution-target
- * prompt still returns here as a send, and callers move the cursor.
+ * `r.runCommand` runs `runTextInTerm(code)` and discards its result. From
+ * vscode-R 3.2, `r.runSelection` called with a code argument returns it
+ * (`src/extension.ts`: `(code?: string) => code ?
+ * rTerminal.runTextInTerm(code) : rTerminal.runSelection()`; Quarto's R
+ * cell runner calls it this way), and `runTextInTerm` resolves to `false`
+ * when nothing was sent: the user dismissed the "Run R code" target prompt,
+ * or no terminal could be used (`src/rTerminal.ts`, checked at v3.2.2 and
+ * v3.4.0).
+ *
+ * Releases before 3.2 keep `r.runCommand`: they have no such prompt, and
+ * their `r.runSelection` neither returns the result nor waits for the send
+ * (v2.8.8: `code ? void runTextInTerm(code) : void runSelection()`). 3.2 is
+ * recognised by the `r.interactive.executionTarget` setting it added.
+ *
+ * An empty string is falsy to the handler, which would then run the
+ * editor's selection instead, so it also goes through `r.runCommand`.
+ */
+async function run_in_vscode_r(extension: vscode.Extension<unknown>, code: string): Promise<boolean> {
+    if (code === '' || !vscode_r_declares_interactive(extension)) {
+        await vscode.commands.executeCommand('r.runCommand', code);
+        return true;
+    }
+    return (await vscode.commands.executeCommand<unknown>('r.runSelection', code)) !== false;
+}
+
+/**
+ * Sends `code` to vscode-R (see `run_in_vscode_r`). vscode-R registers its
+ * commands on activation, so activate it first. Returns false, after
+ * telling the user, when vscode-R isn't available or when its selector
+ * would pick a Raven terminal (see `clear_way_for_vscode_r`; skipped when
+ * vscode-R sends to its Interactive session, see
+ * `vscode_r_targets_interactive`).
+ *
+ * Also returns false, silently, when vscode-R reports that it sent nothing
+ * (the user cancelled its own prompt), so callers don't move the cursor.
+ * vscode-R before 3.2 has no such prompt and gives no report.
  */
 export async function send_to_vscode_r(code: string): Promise<boolean> {
     const extension = vscode.extensions.getExtension(REDITORSUPPORT_EXTENSION_ID);
@@ -117,8 +173,7 @@ export async function send_to_vscode_r(code: string): Promise<boolean> {
         if (!vscode_r_targets_interactive(extension) && !(await clear_way_for_vscode_r())) {
             throw new Error("it would have gone to Raven's own R terminal; click vscode-R's terminal, then send again");
         }
-        await vscode.commands.executeCommand('r.runCommand', code);
-        return true;
+        return await run_in_vscode_r(extension, code);
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const CHOOSE = 'Choose R Console';
