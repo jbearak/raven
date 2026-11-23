@@ -10458,14 +10458,21 @@ fn collect_undefined_variables_from_snapshot(
                         .cloned(),
                 );
 
+                // A package exports a name without backticks, so `` `%>%` ``
+                // and `` `filter` `` are looked up as `%>%` and `filter`.
+                let export_name = unquoted_usage_name.as_deref().unwrap_or(&name);
                 if is_package_export(
-                    &name,
+                    export_name,
                     &position_aware_packages_buf,
                     &snapshot.package_library,
                 ) {
                     continue;
                 }
-                if attached_outside_active_renv_exports(snapshot, &name, &scope.attached_packages) {
+                if attached_outside_active_renv_exports(
+                    snapshot,
+                    export_name,
+                    &scope.attached_packages,
+                ) {
                     continue;
                 }
 
@@ -32392,6 +32399,25 @@ mod tests {
                     .map(str::to_string)
             })
             .collect()
+    }
+
+    /// A package export written in backticks is the same export: an operator
+    /// called by name, `` `:=`(x, 1) ``, an operator passed as a value, and
+    /// an ordinary function. A backticked name no attached package exports
+    /// is still reported, and so is an export used above its `library()`.
+    #[tokio::test]
+    async fn backticked_package_export_is_defined() {
+        let code = r#"`read_dta`("early.dta")
+library(dtaparser)
+library(datakit)
+x <- 1
+`:=`(x, 1)
+Reduce(`:=`, list(1, 2))
+d <- `read_dta`("s.dta")
+`missing_fn`(1)
+"#;
+        let flagged = datakit_undefined_names(None, code).await;
+        assert_eq!(flagged, vec!["`read_dta`", "`missing_fn`"]);
     }
 
     /// The motivating script: the `:=` lines' columns are silent, while the
