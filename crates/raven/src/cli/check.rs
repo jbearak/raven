@@ -1229,8 +1229,9 @@ pub(crate) async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldS
 /// bare calls to an installed-but-uncached package attached only inside a chunk,
 /// under-reporting relative to the editor.
 ///
-/// Also covers NAMESPACE whole-package `import(pkg)` directives in package
-/// mode (`scope_contribution.full_imports`) and packages attached by testthat
+/// Also covers the packages a NAMESPACE names in package mode, in a
+/// whole-package `import(pkg)` (`scope_contribution.full_imports`) or an
+/// `importFrom(pkg, name)` (`scope_contribution.imported_symbols`), and packages attached by testthat
 /// preamble files in package and script mode
 /// (`scope_contribution.test_helper_attached_packages`, issue #432). For both, the undefined-variable
 /// check resolves call- and value-position uses of the package's exports via
@@ -1244,7 +1245,10 @@ pub(crate) async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldS
 /// Cross-file *inherited* packages (attached in a `source()`d file) and
 /// packages of non-chunk targets the scan did not index are not prefetched
 /// here, so calls relying on those stay conservatively suppressed — a narrower
-/// gap than before, noted in `docs/cli.md`. No-op when the library isn't ready
+/// gap than before, noted in `docs/cli.md`. The exception is a `data(...,
+/// package = "pkg")` package of a file a target sources or is sourced by:
+/// nothing is suppressed while that one is uncached, so the dataset names
+/// would be reported as undefined. No-op when the library isn't ready
 /// (e.g. R absent with no configured library paths).
 pub(crate) async fn prefetch_reported_packages(
     state: &crate::state::WorldState,
@@ -1283,6 +1287,19 @@ fn reported_packages_to_warm(
             .scope_contribution()
             .full_imports
             .iter()
+            .cloned(),
+    );
+    // `importFrom(pkg, name)` brings in one name, but what Raven knows about
+    // it (that `pkg` exports it, and `pkg`'s own NSE and `[[operator]]`
+    // declarations) is read from `pkg`'s cache entry all the same. The
+    // packages are the map's values; its keys are the imported names.
+    packages.extend(
+        state
+            .package_state
+            .scope_contribution()
+            .imported_symbols
+            .values()
+            .flatten()
             .cloned(),
     );
     packages.extend(
@@ -1404,6 +1421,29 @@ fn reported_packages_to_warm(
                         .filter_map(crate::import_pkg::ImportCall::package_name)
                         .map(str::to_string),
                 );
+            }
+        }
+    }
+
+    // Issue #429 across files: a `data(x, package = "pkg")` call in a file a
+    // target sources defines names the target reads, and expanding them needs
+    // `pkg`'s `data/` listing cached. The walk is the one cross-file
+    // collection uses, so it reaches every file whose `data()` calls a target
+    // can see. Only `data_packages` is taken: packages those files *attach*
+    // stay unwarmed here, as the doc comment on
+    // [`prefetch_reported_packages`] records.
+    let max_depth = state.cross_file_config.max_chain_depth;
+    let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+    for path in targets {
+        let Ok(uri) = Url::from_file_path(path) else {
+            continue;
+        };
+        for member in state
+            .cross_file_graph
+            .revalidation_consistent_set_over_ordinary_source(&uri, max_depth, max_visited)
+        {
+            if let Some(entry) = state.workspace_index.get(&member) {
+                packages.extend(entry.data_packages.iter().cloned());
             }
         }
     }
@@ -5038,6 +5078,152 @@ infixContinuationStyle = "indented"
             EXIT_OK,
             "value-position references to a NAMESPACE full import must resolve \
              once its exports are prefetched"
+        );
+    }
+
+    /// Runs `raven check` on a package workspace whose `R/f.R` uses a
+    /// `:=` that only a fake installed `datakit` declares (through its
+    /// `raven/nse.toml`), with `namespace` as the workspace's NAMESPACE.
+    fn check_package_using_declared_operator(namespace: &str) -> i32 {
+        let workspace = TempDir::new().unwrap();
+        let libdir = TempDir::new().unwrap();
+        let pkgdir = libdir.path().join("datakit");
+        fs::create_dir_all(pkgdir.join("raven")).unwrap();
+        fs::write(
+            pkgdir.join("DESCRIPTION"),
+            "Package: datakit\nVersion: 1.0\n",
+        )
+        .unwrap();
+        fs::write(
+            pkgdir.join("NAMESPACE"),
+            "export(\":=\")\nexport(other_fn)\n",
+        )
+        .unwrap();
+        fs::write(
+            pkgdir.join("raven").join("nse.toml"),
+            "schema = 1\n[[operator]]\nname = \":=\"\nform = \"subset-assign\"\n\
+             masked_arguments = [\"by\"]\n",
+        )
+        .unwrap();
+
+        fs::write(
+            workspace.path().join("DESCRIPTION"),
+            "Package: usesdk\nVersion: 1.0\nImports: datakit\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("NAMESPACE"), namespace).unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(
+            workspace.path().join("R").join("f.R"),
+            "f <- function(d) {\n  d[age >= 40, older] := 1\n  d\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            format!(
+                "[packages]\nadditionalLibraryPaths = [\"{}\"]\n",
+                libdir.path().display()
+            ),
+        )
+        .unwrap();
+
+        run_blocking(CheckArgs {
+            paths: Vec::new(),
+            workspace: Some(workspace.path().to_path_buf()),
+            config_path: None,
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Info,
+            quiet: true,
+            color: ColorChoice::Never,
+            report_uninstalled: false,
+        })
+    }
+
+    #[test]
+    fn namespace_import_from_operator_reaches_the_package_declaration() {
+        // A package's `[[operator]]` declaration is read from the package
+        // cache, so the packages a NAMESPACE names in `importFrom` must be
+        // warmed like the ones it names in `import`. Without that the
+        // operator's data-masked columns are reported as undefined.
+        //
+        // R-free: a fake installed package made `Ready` via
+        // `additionalLibraryPaths`. The two controls show the fixture runs
+        // the check: `import()` was already warmed, and an `importFrom` of
+        // another name doesn't bring the operator in.
+        assert_eq!(
+            check_package_using_declared_operator("import(datakit)\nexport(f)\n"),
+            EXIT_OK,
+            "import(datakit)"
+        );
+        assert_eq!(
+            check_package_using_declared_operator("importFrom(datakit, other_fn)\nexport(f)\n"),
+            EXIT_LINT_FAILED,
+            "importFrom of another name"
+        );
+        assert_eq!(
+            check_package_using_declared_operator("importFrom(datakit, \":=\")\nexport(f)\n"),
+            EXIT_OK,
+            "importFrom(datakit, \":=\")"
+        );
+    }
+
+    #[test]
+    fn warming_includes_namespace_import_from_packages() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: usesdk\nVersion: 1.0\nImports: syntheticImportFromPackage\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("NAMESPACE"),
+            "importFrom(syntheticImportFromPackage, value)\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("R").join("f.R"), "f <- function() value\n").unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("syntheticImportFromPackage"),
+            "a NAMESPACE importFrom package must be in the CLI warm set: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn targeted_warming_includes_data_package_of_sourced_file() {
+        // `raven check main.R` resolves a `data()` alias defined in a file
+        // main.R sources, so that file's `data(..., package =)` package must
+        // be warmed even though the file isn't a named target.
+        let temp = TempDir::new().unwrap();
+        let main = temp.path().join("main.R");
+        fs::write(&main, "source(\"child.R\")\nprint(api)\n").unwrap();
+        fs::write(temp.path().join("child.R"), "source(\"grandchild.R\")\n").unwrap();
+        fs::write(
+            temp.path().join("grandchild.R"),
+            "data(api, package = \"syntheticDataPackage\")\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("unrelated.R"),
+            "data(api, package = \"syntheticUnrelatedPackage\")\n",
+        )
+        .unwrap();
+
+        let canonical_root = std::fs::canonicalize(temp.path()).unwrap();
+        let workspace_url = Url::from_file_path(&canonical_root).unwrap();
+        let state =
+            build_indexed_state(&canonical_root, &workspace_url, true, None, &canonical_root)
+                .unwrap();
+        let targets = vec![std::fs::canonicalize(main).unwrap()];
+        let warm = reported_packages_to_warm(&state, &targets);
+        assert!(
+            warm.contains("syntheticDataPackage"),
+            "a data() package of a file the target sources must warm: {warm:?}"
+        );
+        assert!(
+            !warm.contains("syntheticUnrelatedPackage"),
+            "a file the target doesn't reach must not contribute: {warm:?}"
         );
     }
 
