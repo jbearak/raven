@@ -9959,11 +9959,20 @@ fn infix_sites_from_snapshot(
                 // package's own sources, whose declaration is the self
                 // package's.
                 Some((symbol, ScopeLayer::Global)) if symbol.source_uri == *uri => {
-                    attached_at(stream, snapshot, analysis)
+                    attached_at(stream, snapshot, analysis, None)
                 }
-                Some((_, ScopeLayer::Contributions)) => attached_at(stream, snapshot, analysis),
+                // A contributed name is also what the package's NAMESPACE
+                // imports by name: `importFrom(pkg, ":=")` puts `pkg`'s
+                // operator in reach of the package's files without
+                // attaching `pkg`.
+                Some((_, ScopeLayer::Contributions)) => attached_at(
+                    stream,
+                    snapshot,
+                    analysis,
+                    snapshot.scope_contribution.imported_symbols.get(op),
+                ),
                 Some(_) => InfixSite::Shadowed,
-                None => attached_at(stream, snapshot, analysis),
+                None => attached_at(stream, snapshot, analysis, None),
             };
             sites.insert(operator.start_byte(), site);
         }
@@ -9971,12 +9980,14 @@ fn infix_sites_from_snapshot(
     })
 }
 
-/// [`InfixSite::Packages`] at the stream's cursor: the attached packages in
-/// the file-wide in-play order, then any others, sorted.
+/// [`InfixSite::Packages`] at the stream's cursor: the attached packages,
+/// with `importers` (the packages a NAMESPACE `importFrom` takes the operator
+/// from, if any), in the file-wide in-play order, then any others, sorted.
 fn attached_at(
     stream: &mut SnapshotScopeStream<'_>,
     snapshot: &DiagnosticsSnapshot,
     analysis: &NseAnalysis,
+    importers: Option<&std::collections::BTreeSet<String>>,
 ) -> InfixSite {
     let scope = stream.package_snapshot();
     let attached: HashSet<&String> = scope
@@ -9984,6 +9995,7 @@ fn attached_at(
         .iter()
         .chain(scope.loaded_packages.iter())
         .chain(snapshot.scope_contribution.full_imports.iter())
+        .chain(importers.into_iter().flatten())
         .collect();
     let mut packages: Vec<String> = analysis
         .in_play_packages
@@ -32594,6 +32606,80 @@ d[n > 1, older] := 1
 "#;
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
         assert_eq!(flagged, vec!["missing_amount", "read_dta"]);
+    }
+
+    /// A package that imports the operator by name, `importFrom(datakit,
+    /// ":=")`, reaches datakit's operator in its own sources, as one that
+    /// imports the whole package does. An `importFrom` of another of the
+    /// package's names doesn't bring the operator in.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_applies_through_a_namespace_import_from() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        let code = "f <- function(d) {\n  d[age >= 40, older] := 1\n  d\n}\n";
+        let mut flagged_by_namespace = Vec::new();
+        for namespace in [
+            "importFrom(datakit, \":=\")\nexport(f)\n",
+            "importFrom(datakit,`:=`)\nexport(f)\n",
+            "import(datakit)\nexport(f)\n",
+            "importFrom(datakit, other_fn)\nexport(f)\n",
+        ] {
+            let (_root, lib) = library_with_declaring_package(
+                "datakit",
+                &["\":=\"", "other_fn"],
+                Some(DATAKIT_OPERATOR_SIDECAR),
+            )
+            .await;
+            let mut state = WorldState::new();
+            state.workspace_folders = vec![Url::parse("file:///work/pkg").unwrap()];
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = true;
+            state.package_library = Arc::new(lib);
+            state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+            state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+            state.package_inputs.description = Some(DescriptionInput {
+                text: "Package: usesdk\nImports: datakit\n".into(),
+            });
+            state.package_inputs.namespace = Some(NamespaceInput {
+                text: namespace.into(),
+            });
+            let r_text: std::sync::Arc<str> = code.into();
+            state.package_inputs.r_files.insert(
+                std::path::PathBuf::from("/work/pkg/R/f.R"),
+                RFileInput {
+                    kind: RFileKind::Source,
+                    text: r_text.clone(),
+                    content_digest: ContentDigest::of(&r_text),
+                },
+            );
+            state.apply_package_event(&PackageInputDelta::Initial);
+            let uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+            state.open_document(uri.clone(), code, Some(1));
+            let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+            let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("diagnostics");
+            let flagged: Vec<String> = diagnostics
+                .iter()
+                .filter_map(|d| {
+                    d.message
+                        .strip_suffix(" is not defined")
+                        .map(str::to_string)
+                })
+                .collect();
+            flagged_by_namespace.push(flagged);
+        }
+        let none: Vec<String> = Vec::new();
+        assert_eq!(flagged_by_namespace[0], none, "importFrom with a string");
+        assert_eq!(flagged_by_namespace[1], none, "importFrom with backticks");
+        assert_eq!(flagged_by_namespace[2], none, "import()");
+        assert_eq!(
+            flagged_by_namespace[3],
+            vec!["age", "older"],
+            "importFrom of another name"
+        );
     }
 
     /// With `undefinedVariableInBracketIndices` off, no index of the

@@ -25186,6 +25186,18 @@ fn collect_open_document_packages(
                 .revalidation_consistent_set_over_ordinary_source(&root, max_depth, max_visited),
         );
     }
+    // Issue #429 across files: a `data(x, package = "pkg")` call in a closed
+    // file of that neighborhood defines names an open document reads, and
+    // expanding them needs `pkg`'s `data/` listing cached. Open members are
+    // covered by the loop above.
+    for member in &warm_roots {
+        if state.documents.contains_key(member) {
+            continue;
+        }
+        if let Some(entry) = state.workspace_index.get(member) {
+            doc_pkgs.extend(entry.data_packages.iter().cloned());
+        }
+    }
     for module_uri in state.cross_file_graph.selective_module_closure(warm_roots) {
         let Some(meta) = state.get_enriched_metadata(&module_uri) else {
             continue;
@@ -25276,7 +25288,9 @@ fn open_docs_referencing_packages(
 /// plus inherited packages from parent `source()` chains, plus — in package
 /// mode — NAMESPACE whole-package `import(pkg)` directives from
 /// `scope_contribution.full_imports`, whose exports the undefined-variable
-/// check resolves via `is_package_export` in both call and value position)
+/// check resolves via `is_package_export` in both call and value position,
+/// and `importFrom(pkg, name)` packages from
+/// `scope_contribution.imported_symbols`, whose declarations it reads)
 /// and prefetch their exports into `pkg_lib`. Snapshots state under the read
 /// lock, releases it before running scope resolution (per AGENTS.md lock-hold
 /// invariant).
@@ -25333,6 +25347,18 @@ async fn prefetch_packages_for_open_documents_into(
     // with `raven check`'s `prefetch_reported_packages`). `full_imports` is
     // empty outside package mode, making this a no-op there.
     all_pkgs.extend(probe.scope_contribution.full_imports.iter().cloned());
+    // `importFrom(pkg, name)` packages too: what Raven knows about the
+    // imported name (that `pkg` exports it, and `pkg`'s NSE and `[[operator]]`
+    // declarations) is read from `pkg`'s cache entry. The packages are the
+    // map's values; its keys are the imported names.
+    all_pkgs.extend(
+        probe
+            .scope_contribution
+            .imported_symbols
+            .values()
+            .flatten()
+            .cloned(),
+    );
     let empty_base_exports = std::collections::HashSet::new();
     let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
     let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
@@ -34898,6 +34924,47 @@ mod refresh_packages_tests {
         );
     }
 
+    /// A `data(x, package = "pkg")` call in a closed file an open document
+    /// sources defines names the open document reads, so `pkg` warms with it
+    /// (issue #429 across files).
+    #[test]
+    fn open_document_warm_set_includes_data_package_of_closed_sourced_file() {
+        use crate::state::{Document, WorldState};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let importer_path = temp.path().join("main.R");
+        let helper_path = temp.path().join("helper.R");
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        let importer_code = "source('helper.R')\nprint(api)\n";
+        let helper_code = "data(api, package = \"syntheticDataPackage\")\n";
+        std::fs::write(&importer_path, importer_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root.clone());
+        state.insert_workspace_document_for_test(helper_uri, Document::new(helper_code, None));
+        let importer_metadata = crate::cross_file::extract_metadata(importer_code);
+        state.open_document_with_language_id_and_metadata(
+            importer_uri.clone(),
+            importer_code,
+            Some(1),
+            Some("r"),
+            Arc::new(importer_metadata.clone()),
+            None,
+        );
+        state
+            .cross_file_graph
+            .update_file(&importer_uri, &importer_metadata, Some(&root), |_| None);
+
+        let (packages, _) = collect_open_document_packages(&state);
+        assert!(
+            packages.contains("syntheticDataPackage"),
+            "a data() package of a closed sourced file must warm: {packages:?}"
+        );
+    }
+
     #[test]
     fn open_document_warm_set_traverses_indexed_selective_modules() {
         use crate::state::{Document, WorldState};
@@ -35531,6 +35598,63 @@ mod refresh_packages_tests {
         assert!(
             pkg_lib.is_cached("fakepkg").await,
             "NAMESPACE import(fakepkg) must be prefetched for open documents"
+        );
+    }
+
+    /// A NAMESPACE `importFrom(pkg, name)` package is prefetched like a
+    /// whole-package import. Its `[[operator]]` declaration and exports are
+    /// read from the package cache, which nothing else warms for a package
+    /// the NAMESPACE imports by name only.
+    #[tokio::test]
+    async fn prefetch_covers_namespace_import_from_packages() {
+        use crate::package_state::{DescriptionInput, NamespaceInput, PackageInputDelta};
+        use crate::state::{Document, WorldState};
+        use tokio::sync::RwLock;
+
+        let libdir = tempfile::tempdir().unwrap();
+        let pkgdir = libdir.path().join("fakepkg");
+        std::fs::create_dir_all(&pkgdir).unwrap();
+        std::fs::write(
+            pkgdir.join("DESCRIPTION"),
+            "Package: fakepkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(pkgdir.join("NAMESPACE"), "export(real_export)\n").unwrap();
+
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![libdir.path().to_path_buf()]);
+        let pkg_lib = Arc::new(lib);
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let uri = Url::from_file_path(root_path.join("R").join("uses.R")).unwrap();
+        let mut world = WorldState::new();
+        world.package_library = pkg_lib.clone();
+        world.package_library_ready = true;
+        world.documents.insert(
+            uri.clone(),
+            Document::new("f <- function(x) identical(x, real_export)\n", Some(1)),
+        );
+        world.package_inputs.workspace_root = Some(root_path);
+        world.package_inputs.description = Some(DescriptionInput {
+            text: "Package: testpkg\nVersion: 1.0\nImports: fakepkg\n".into(),
+        });
+        world.package_inputs.namespace = Some(NamespaceInput {
+            text: "importFrom(fakepkg, real_export)\n".into(),
+        });
+        world.apply_package_event(&PackageInputDelta::Initial);
+        let contribution = world.package_state.scope_contribution();
+        assert!(
+            !contribution.full_imports.contains("fakepkg")
+                && contribution.imported_symbols.contains_key("real_export"),
+            "fixture must derive fakepkg as an importFrom only"
+        );
+        let state = Arc::new(RwLock::new(world));
+
+        prefetch_packages_for_open_documents(&state, &pkg_lib).await;
+        assert!(
+            pkg_lib.is_cached("fakepkg").await,
+            "NAMESPACE importFrom(fakepkg, ...) must be prefetched for open documents"
         );
     }
 
