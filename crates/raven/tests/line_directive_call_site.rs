@@ -172,3 +172,45 @@ fn missing_directive_target_is_reported_once() {
         assert_eq!(found[0].0, "unresolved-source-path", "call: {call:?}");
     }
 }
+
+/// Under `# raven: cd`, the directive and the call resolve from the same
+/// directory, so they still agree on which file each names: a same-file call
+/// is superseded, another file's call is kept, and a missing file is reported
+/// once.
+#[test]
+fn working_directory_applies_to_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: cd sub\n# raven: source b.R line=3\nsource(\"./b.R\")\nprint(from_b)\n",
+    );
+    write(dir.path(), "sub/b.R", "from_b <- 1\n");
+    assert_eq!(diagnostics(dir.path()), []);
+    let (edges, dropped) = graph(dir.path());
+    assert_eq!(edges, [pair("sub/b.R", "directive")]);
+    assert_eq!(dropped, [pair("sub/b.R", "superseded")]);
+
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: cd sub\n# raven: source b.R line=3\nsource(\"c.R\")\nprint(from_b)\nprint(from_c)\n",
+    );
+    write(dir.path(), "sub/c.R", "from_c <- 1\n");
+    assert_eq!(diagnostics(dir.path()), []);
+    let (edges, dropped) = graph(dir.path());
+    assert_eq!(
+        edges,
+        [pair("sub/b.R", "directive"), pair("sub/c.R", "call")]
+    );
+    assert_eq!(dropped, []);
+
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: cd sub\n# raven: source gone.R line=3\nsource(\"./gone.R\")\n",
+    );
+    let found = diagnostics(dir.path());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, "unresolved-source-path");
+}
