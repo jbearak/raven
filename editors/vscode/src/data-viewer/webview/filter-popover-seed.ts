@@ -79,21 +79,22 @@ export function predicateToKindValue(p: FilterPredicate): string {
 }
 
 /** Recover the initial editor state from a persisted FilterPredicate. The
- *  matching sub-state is filled; all others keep their blank defaults. */
-export function seedFromEntry(p: FilterPredicate): FormState {
+ *  matching sub-state is filled; all others keep their blank defaults.
+ *  `int64` says the column is Int64 / Uint64, as in {@link buildPredicate}. */
+export function seedFromEntry(p: FilterPredicate, int64 = false): FormState {
     const base = defaultFormState();
     switch (p.kind) {
         case 'numCompare':
-            base.numCompare = { op: p.op, value: String(p.value) };
+            base.numCompare = { op: p.op, value: boundText(p.value, int64) };
             break;
         case 'numBetween':
             base.numBetween = {
-                lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive,
+                lo: boundText(p.lo, int64), hi: boundText(p.hi, int64), inclusive: p.inclusive,
                 ...(p.upperInclusive !== undefined ? { upperInclusive: p.upperInclusive } : {}),
             };
             break;
         case 'numNotBetween':
-            base.numBetween = { lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive };
+            base.numBetween = { lo: boundText(p.lo, int64), hi: boundText(p.hi, int64), inclusive: p.inclusive };
             break;
         case 'setIn':
         case 'setNotIn':
@@ -123,6 +124,27 @@ export function seedFromEntry(p: FilterPredicate): FormState {
             break;
     }
     return base;
+}
+
+/** The text a bound shows in its input. On an Int64 / Uint64 column an
+ *  integer-valued double is spelled out digit for digit: `String` gives the
+ *  shortest spelling that reads back as the same double
+ *  (`1000000000000000100` for 1000000000000000128), which {@link parseBound}
+ *  would then take for a different exact integer. */
+function boundText(b: NumBound, int64: boolean): string {
+    return int64 && typeof b === 'number' && Number.isInteger(b) ? BigInt(b).toString() : String(b);
+}
+
+/** The between-range form state after a histogram thumb moved, the thumbs
+ *  now at `lo` / `hi`. A field whose text already reads as its thumb's
+ *  position is the one that didn't move and keeps its text, so a bound
+ *  typed past 2^53 isn't replaced by the double the thumb sits at. */
+export function brushNumBetween(s: NumBetweenState, lo: number, hi: number, int64 = false): NumBetweenState {
+    return {
+        lo: parseFloat(s.lo) === lo ? s.lo : boundText(lo, int64),
+        hi: parseFloat(s.hi) === hi ? s.hi : boundText(hi, int64),
+        inclusive: s.inclusive,
+    };
 }
 
 /** Resolve set-membership values. Checklist columns (labelled-numeric, shipped

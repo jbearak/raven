@@ -18,7 +18,7 @@ import { brushedTotal, brushPredicate } from '../../editors/vscode/src/data-view
 import { generateRCode } from '../../editors/vscode/src/data-viewer/r-code';
 import { EMPTY_SORT, type FilterPredicate } from '../../editors/vscode/src/data-viewer/messages';
 import {
-    buildPredicate, defaultFormState, predicateToKindValue, seedFromEntry,
+    brushNumBetween, buildPredicate, defaultFormState, predicateToKindValue, seedFromEntry,
 } from '../../editors/vscode/src/data-viewer/webview/filter-popover-seed';
 import { summarizePredicate } from '../../editors/vscode/src/data-viewer/webview/predicate-summary';
 
@@ -147,6 +147,45 @@ describe('the filter popover keeps an integer64 bound exact', () => {
         const col: ColumnSchema = { name: 'big', arrowType: 'Int64', dictionaryShipped: false, isInteger: true };
         expect(summarizePredicate(p, col)).toBe('big 9007199254740993–9007199254740995');
         expect(summarizePredicate({ ...p, upperInclusive: false }, col)).toBe('big ∈ [9007199254740993, 9007199254740995)');
+    });
+});
+
+describe('reopening the popover keeps a numeric integer64 bound exact', () => {
+    const opts = { setUsesChecklist: false, int64: true };
+    const reapply = (p: FilterPredicate) => buildPredicate(predicateToKindValue(p), seedFromEntry(p, true), opts);
+
+    test('a bound a double holds exactly, whose shortest spelling is another integer, re-applies unchanged', () => {
+        // String(1000000000000000128) is "1000000000000000100".
+        const p = buildPredicate('numCompare', { ...defaultFormState(), numCompare: { op: '=', value: '1000000000000000128' } }, opts)!;
+        expect(p).toEqual({ kind: 'numCompare', op: '=', value: 1000000000000000128 });
+        expect(seedFromEntry(p, true).numCompare.value).toBe('1000000000000000128');
+        expect(reapply(p)).toEqual(p);
+        const between: FilterPredicate = { kind: 'numBetween', lo: -1000000000000000128, hi: 1e21, inclusive: true };
+        expect(seedFromEntry(between, true).numBetween).toEqual({ lo: '-1000000000000000128', hi: '1000000000000000000000', inclusive: true });
+        expect(reapply(between)).toEqual(between);
+        expect(reapply({ ...between, kind: 'numNotBetween' })).toEqual({ ...between, kind: 'numNotBetween' });
+    });
+
+    test('other columns and fractional bounds keep the short spelling', () => {
+        const p: FilterPredicate = { kind: 'numCompare', op: '=', value: 1e21 };
+        expect(seedFromEntry(p).numCompare.value).toBe('1e+21');
+        expect(seedFromEntry({ ...p, value: 2.5 }, true).numCompare.value).toBe('2.5');
+    });
+});
+
+describe('a histogram thumb rewrites only the bound it moved', () => {
+    const typed = { lo: '9007199254740993', hi: '9007199254740995', inclusive: true };
+    // The thumbs sit at the doubles the two fields parse to.
+    const atLo = parseFloat(typed.lo), atHi = parseFloat(typed.hi);
+
+    test('the untouched bound keeps its exact text', () => {
+        expect(brushNumBetween(typed, 3, atHi, true)).toEqual({ lo: '3', hi: '9007199254740995', inclusive: true });
+        expect(brushNumBetween(typed, atLo, 1000000000000000128, true))
+            .toEqual({ lo: '9007199254740993', hi: '1000000000000000128', inclusive: true });
+    });
+
+    test('an empty or unparseable field takes the thumb position', () => {
+        expect(brushNumBetween({ lo: '', hi: '', inclusive: false }, 0, 10, true)).toEqual({ lo: '0', hi: '10', inclusive: false });
     });
 });
 
