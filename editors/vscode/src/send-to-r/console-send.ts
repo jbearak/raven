@@ -58,14 +58,43 @@ function make_active(terminal: vscode.Terminal): Promise<void> {
  * guard still applies there.
  */
 function vscode_r_targets_interactive(extension: vscode.Extension<unknown>): boolean {
+    return vscode_r_execution_target(extension) === 'interactive';
+}
+
+/** Whether this vscode-R has the Interactive session (3.2 and later),
+ *  told by the `r.interactive.executionTarget` setting it declares. */
+function vscode_r_declares_interactive(extension: vscode.Extension<unknown>): boolean {
     const json = extension.packageJSON as { contributes?: { configuration?: unknown } } | undefined;
     const sections = json?.contributes?.configuration;
-    const declared = (Array.isArray(sections) ? sections : [sections]).some((section) =>
+    return (Array.isArray(sections) ? sections : [sections]).some((section) =>
         typeof section === 'object' && section !== null
         && 'r.interactive.executionTarget' in ((section as { properties?: object }).properties ?? {}));
-    if (!declared) return false;
+}
+
+/**
+ * Where vscode-R's `r.interactive.executionTarget` sends code, read for the
+ * active editor's document as vscode-R reads it: `terminal` for a release
+ * that doesn't declare the setting (before 3.2), which only has terminals.
+ */
+function vscode_r_execution_target(extension: vscode.Extension<unknown>): 'auto' | 'terminal' | 'interactive' {
+    if (!vscode_r_declares_interactive(extension)) return 'terminal';
     const document = vscode.window.activeTextEditor?.document.uri;
-    return vscode.workspace.getConfiguration('r', document).get<string>('interactive.executionTarget', 'auto') === 'interactive';
+    const target = vscode.workspace.getConfiguration('r', document).get<string>('interactive.executionTarget', 'auto');
+    return target === 'interactive' || target === 'terminal' ? target : 'auto';
+}
+
+/**
+ * What to tell the user to restart after code that needs a fresh R went to
+ * vscode-R, which Raven can't restart: the Interactive session when that
+ * is where vscode-R runs code, the R terminal when it only uses terminals,
+ * and both when its `auto` target decides per send.
+ */
+export function vscode_r_restart_hint(): string {
+    const extension = vscode.extensions.getExtension(REDITORSUPPORT_EXTENSION_ID);
+    const target = extension ? vscode_r_execution_target(extension) : 'terminal';
+    if (target === 'interactive') return 'run "R: Restart Interactive Session"';
+    if (target === 'terminal') return "restart R in vscode-R's terminal";
+    return 'restart R where vscode-R ran it (its R terminal, or "R: Restart Interactive Session")';
 }
 
 /**

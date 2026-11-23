@@ -163,14 +163,25 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
     /** Code vscode-R ran in its Interactive session. */
     let interactive: string[] = [];
 
-    function install_vscode_r() {
+    /** The user dismisses vscode-R's own "Run R code" prompt. */
+    let prompt_cancelled = false;
+    /** Times vscode-R ran the editor's selection instead of given code. */
+    let ran_selection = 0;
+    /** Sends a 2.x `r.runSelection` started without waiting for them. */
+    let unawaited_sends = 0;
+
+    function install_vscode_r(version = '3.4.0') {
         const created: FakeTerminal[] = [];
         interactive = [];
+        prompt_cancelled = false;
+        ran_selection = 0;
+        unawaited_sends = 0;
         fake.state.extensions.set('REditorSupport.r', {
             activate: async () => undefined,
             packageJSON: {
-                version: '3.4.0',
-                contributes: { configuration: { properties: { 'r.interactive.executionTarget': { default: 'auto' } } } },
+                version,
+                // 3.2 added the Interactive session and its setting.
+                contributes: { configuration: { properties: version.startsWith('2.') ? {} : { 'r.interactive.executionTarget': { default: 'auto' } } } },
             },
         });
         fake.commands.set('r.createRTerm', async () => {
@@ -178,20 +189,38 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
             created.push(t);
             t.show();
         });
-        // `r.runCommand` discards whether it ran, as in vscode-R 3.4.0.
-        fake.commands.set('r.runCommand', async (code: unknown) => {
-            // vscode-R 3.4.0 offers the code to its Interactive router first;
-            // with the target set to `interactive` it never picks a terminal.
+        // vscode-R 3.4.0's `runTextInTerm`: true when the code was sent.
+        const run_text = async (code: string): Promise<boolean> => {
+            // The user dismissed vscode-R's "Run R code" prompt.
+            if (prompt_cancelled) return false;
+            // The code is offered to the Interactive router first; with the
+            // target set to `interactive` it never picks a terminal.
             if (fake.module.workspace.getConfiguration('r').get('interactive.executionTarget') === 'interactive') {
-                interactive.push(String(code));
-                return;
+                interactive.push(code);
+                return true;
             }
             let t = vscode_r_selector();
             if (!t) {
                 await fake.module.commands.executeCommand('r.createRTerm');
                 t = vscode_r_selector();
             }
-            t?.sendText(String(code));
+            if (!t) return false;
+            t.sendText(code);
+            return true;
+        };
+        // `r.runCommand` discards whether it ran; `r.runSelection` with a
+        // code argument returns it (3.2.2 and 3.4.0), and before 3.2
+        // returned nothing.
+        fake.commands.set('r.runCommand', async (code: unknown) => { await run_text(String(code)); });
+        fake.commands.set('r.runSelection', async (code: unknown) => {
+            if (!code) { ran_selection += 1; return undefined; }
+            if (version.startsWith('2.')) {
+                // 2.8.8 neither waits for the send nor returns its result.
+                unawaited_sends += 1;
+                void run_text(String(code));
+                return undefined;
+            }
+            return run_text(String(code));
         });
         return created;
     }
@@ -284,6 +313,51 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         expect(await send.send_to_r_console('t <- 7')).toBe(true);
         expect(fake.errors).toEqual([]);
         expect(interactive).toEqual(['t <- 7']);
+    });
+
+    describe('Install and Restart says what to restart', () => {
+        const install = async () => {
+            build.register_build_commands(context as never);
+            await fake.module.commands.executeCommand('raven.build.installAndRestart');
+        };
+
+        test("vscode-R's Interactive session", async () => {
+            install_vscode_r();
+            fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+            fake.set_setting('r.interactive.executionTarget', 'global', 'interactive');
+            await install();
+            expect(interactive).toEqual(['devtools::install(".")']);
+            expect(fake.infos).toEqual([
+                'Raven: sent devtools::install() to vscode-R. When it finishes, run "R: Restart Interactive Session" to load the new version.',
+            ]);
+        });
+
+        test("vscode-R's terminal, when it only uses terminals", async () => {
+            for (const setup of [
+                () => { install_vscode_r(); fake.set_setting('r.interactive.executionTarget', 'global', 'terminal'); },
+                () => { install_vscode_r('2.8.8'); },
+            ]) {
+                fake.infos.splice(0);
+                setup();
+                const theirs = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
+                fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+                await install();
+                expect(theirs.typed).toEqual(['devtools::install(".")']);
+                expect(fake.infos).toEqual([
+                    "Raven: sent devtools::install() to vscode-R. When it finishes, restart R in vscode-R's terminal to load the new version.",
+                ]);
+            }
+        });
+
+        test('either, when vscode-R decides per send (auto)', async () => {
+            install_vscode_r();
+            fake.window.createTerminal({ name: 'R Interactive' });
+            fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
+            await install();
+            expect(fake.infos).toEqual([
+                'Raven: sent devtools::install() to vscode-R. When it finishes, restart R where vscode-R ran it (its R terminal, or "R: Restart Interactive Session") to load the new version.',
+            ]);
+        });
     });
 
     test('leaves vscode-R alone when no Raven terminal is in its way', async () => {

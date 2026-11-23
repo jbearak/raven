@@ -275,7 +275,7 @@ Each command passes the first workspace folder's absolute path, so a stray `setw
 
 If the install fails, the wrapper prints the error with `message()` before R exits, and the output stays in the closed terminal's scrollback so you can read it.
 
-With vscode-R as your console, Raven can't restart vscode-R's R session. It sends only `devtools::install()` to vscode-R's terminal and tells you to restart R there when the install finishes.
+With vscode-R as your console, Raven can't restart vscode-R's R session. It sends only `devtools::install()` to vscode-R and tells you what to restart when the install finishes: vscode-R's R terminal, or its Interactive session (**R: Restart Interactive Session**) when `r.interactive.executionTarget` sends code there.
 
 ## testthat problem matcher
 
