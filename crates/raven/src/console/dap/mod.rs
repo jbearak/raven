@@ -171,6 +171,10 @@ enum Job {
 #[derive(Default)]
 struct Shared {
     files: BTreeMap<String, Vec<LineBp>>,
+    /// The newest request applied to each file's breakpoints (see
+    /// [`breakpoint_ticket`]). An entry outlives the file's breakpoints:
+    /// it is what stops an older request arming them again.
+    file_tickets: HashMap<String, u64>,
     next_id: u64,
     filters: Vec<String>,
     configured: bool,
@@ -582,7 +586,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                         .collect()
                 })
                 .unwrap_or_default();
-            let result = set_file_breakpoints(&path, wanted);
+            let result = set_file_breakpoints(&path, wanted, breakpoint_ticket());
             out.respond(&msg, json!({"breakpoints": result}));
         }
         "setFunctionBreakpoints" => {
@@ -875,15 +879,39 @@ fn statement_lines(path: &str, from: u32, to: u32) -> Vec<u32> {
     out
 }
 
+/// The order in which breakpoint requests arrived, taken once per request
+/// as soon as it is read (a mirror naming several files uses one ticket for
+/// all of them). [`set_file_breakpoints`] reads the file before it applies,
+/// and that read can block for as long as the filesystem does, so requests
+/// can finish out of order.
+pub fn breakpoint_ticket() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
 /// Replace the breakpoints for `path` (from DAP `setBreakpoints`, or the
 /// extension's mirror over IPC). Breakpoints that already existed at the
 /// same line keep their id, state and hit count.
-pub fn set_file_breakpoints(path: &str, wanted: Vec<(u32, String, String, String)>) -> Vec<Value> {
+///
+/// `ticket` is the request's [`breakpoint_ticket`]. A request older than
+/// the last one applied to this file changes nothing: it was stuck reading
+/// while a newer one (say, the editor deleting the breakpoints after a
+/// reattach) was applied, and applying it now would undo that. Deleting
+/// doesn't read the file's text, which it has no use for.
+pub fn set_file_breakpoints(
+    path: &str,
+    wanted: Vec<(u32, String, String, String)>,
+    ticket: u64,
+) -> Vec<Value> {
     let Some(h) = handle() else { return Vec::new() };
     let key = canonical(path);
-    let text = std::fs::read_to_string(&key)
-        .ok()
-        .map(|t| annotate::r_code_of(&key, &t).into_owned());
+    let text = if wanted.is_empty() {
+        None
+    } else {
+        std::fs::read_to_string(&key)
+            .ok()
+            .map(|t| annotate::r_code_of(&key, &t).into_owned())
+    };
     let plan = text.as_deref().map(|t| {
         let reqs: Vec<BpRequest> = wanted
             .iter()
@@ -895,6 +923,18 @@ pub fn set_file_breakpoints(path: &str, wanted: Vec<(u32, String, String, String
         annotate::plan(t, 1, &reqs)
     });
     let mut s = lock(h);
+    if s.file_tickets.get(&key).is_some_and(|t| *t > ticket) {
+        let current = s
+            .files
+            .get(&key)
+            .map(|bps| bps.iter().map(|b| b.to_dap(&key)).collect())
+            .unwrap_or_default();
+        drop(s);
+        // The mirror's sender waits for a summary after every request.
+        push_breakpoint_summary();
+        return current;
+    }
+    s.file_tickets.insert(key.clone(), ticket);
     let old = s.files.remove(&key).unwrap_or_default();
     let mut new = Vec::new();
     for (line, condition, hit_condition, log_message) in wanted {
