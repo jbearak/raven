@@ -190,7 +190,7 @@ describe('DataViewerPanel persistence round-trip', () => {
             schemaHash: hash,
             layout: { columnWidths: {}, hiddenColumns: [0] },
         });
-        await until(async () => (await layoutStore.load('tiny', hash)) !== undefined);
+        await until(async () => (await layoutStore.load('tiny', hash))?.hiddenColumns.length === 1);
 
         const stored = await layoutStore.load('tiny', hash);
         expect(stored).toEqual({ columnWidths: {}, hiddenColumns: [0] });
@@ -241,7 +241,7 @@ describe('DataViewerPanel persistence round-trip', () => {
             schemaHash: hash,
             toolbar: { labelsOn: false, formatOn: false, digits: 5 },
         });
-        await until(async () => (await toolbarStore.load('tiny', hash)) !== undefined);
+        await until(async () => (await toolbarStore.load('tiny', hash))?.digits === 5);
 
         const stored = await toolbarStore.load('tiny', hash);
         expect(stored).toEqual({ labelsOn: false, formatOn: false, digits: 5 });
@@ -297,7 +297,7 @@ describe('DataViewerPanel persistence round-trip', () => {
             schemaHash: hash,
             layout: { columnWidths: { 1: 200 }, hiddenColumns: [2] },
         });
-        await until(async () => (await layoutStore.load('tiny', hash)) !== undefined);
+        await until(async () => (await layoutStore.load('tiny', hash))?.hiddenColumns.length === 1);
 
         const stored = await layoutStore.load('tiny', hash);
         expect(stored).toEqual({ columnWidths: { 1: 200 }, hiddenColumns: [2] });
