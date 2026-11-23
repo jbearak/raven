@@ -218,18 +218,12 @@ pub fn extract_metadata_with_tree(
     if let Some(tree) = tree {
         let detected = source_detect::detect_source_calls(tree, content);
 
-        // Merge detected source() calls with directive sources
-        // Directive sources take precedence (Requirement 6.8)
-        for source in detected {
-            // Check if there's already a directive at the same line
-            let has_directive = meta
-                .sources
-                .iter()
-                .any(|s| s.is_directive && s.line == source.line);
-            if !has_directive {
-                meta.sources.push(source);
-            }
-        }
+        // Keep every detected source() call beside the directive sources. A
+        // forward directive stands in for a call only when both resolve to the
+        // same file, and that needs a path context this function doesn't
+        // have, so the decision belongs to the edge plan
+        // (`dependency::plan::plan_file_edges`, issue #814).
+        meta.sources.extend(detected);
 
         // Sort by line number for consistent ordering
         meta.sources.sort_by_key(|s| (s.line, s.column));

@@ -397,7 +397,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 - `excluded`: the target matches `[workspace].exclude` or `.gitignore`.
 - `unresolvable`: the path couldn't be normalized.
 - `system_file_unresolved`: a `system.file()` call that didn't resolve. A package that isn't installed and a run without R look the same.
-- `superseded`: a forward directive stands in for the call. For example, a plain `# raven: source` directive followed by a `line=eof` directive for the same file covers a later call to that file.
+- `superseded`: a forward directive stands in for the call. A `line=N` directive covers a call to the same file on line N; a call to another file on that line keeps its own edge. A plain `# raven: source` directive followed by a `line=eof` directive for the same file covers a later call to that file.
 - `duplicate`: merged with an identical edge, such as a repeated directive.
 - `no_path_context`: Raven couldn't resolve any path in the file. It shouldn't happen for files on disk.
 
@@ -407,7 +407,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 - **Detected calls only.** A call Raven doesn't detect, such as a path built with `paste0()` or a call lost to a syntax error, is absent. `syntax_errors` flags files where that can happen.
 - **The workspace graph only.** Links that `raven check FILE.Rmd` adds for a named report aren't shown, and `.Rmd` and `.qmd` files appear only as endpoints.
 - **Implicit scope isn't an edge**: a package's `R/` namespace, testthat helpers, and `.Rprofile`.
-- **Losses before the graph sees a call aren't listed.** Batch expansion drops excluded members, and a failed `list.files()` batch contributes no members; `warnings` names each failed batch and why. Raven also drops a `source()` call on the same line as a `line=N` forward directive's call site, whatever its target, so only the directive's edge appears.
+- **Losses before the graph sees a call aren't listed.** Batch expansion drops excluded members, and a failed `list.files()` batch contributes no members; `warnings` names each failed batch and why.
 - **Files indexed from outside the root contribute no edges of their own.**
 
 ## `raven parse`

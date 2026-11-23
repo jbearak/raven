@@ -6943,6 +6943,21 @@ async fn collect_missing_file_diagnostics_standalone(
     let mut paths_to_check = Vec::new();
     let finding = |site, problem| source_path_diagnostic(site, problem, missing_file_severity);
 
+    let resolve_forward = |source: &crate::cross_file::types::ForwardSource| {
+        forward_ctx
+            .as_ref()
+            .map(|ctx| crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, ctx))
+    };
+    // What each `line=N` forward directive resolves to. A call on that line to
+    // the same file is the directive's own call site, which the dependency
+    // graph drops as superseded; the directive's finding stands for both.
+    let line_directive_targets: Vec<_> = meta
+        .sources
+        .iter()
+        .filter(|source| source.is_directive && source.explicit_line)
+        .filter_map(|directive| Some((directive, resolve_forward(directive)?.path?)))
+        .collect();
+
     for source in &meta.sources {
         // Resolved or inert-unresolved system.file() sources carry no literal
         // path to diagnose — see the predicate's doc comment for the matrix.
@@ -6962,9 +6977,18 @@ async fn collect_missing_file_diagnostics_standalone(
                 path: &source.path,
             }
         };
-        let outcome = forward_ctx.as_ref().map(|ctx| {
-            crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, ctx)
-        });
+        let outcome = resolve_forward(source);
+        if outcome
+            .as_ref()
+            .and_then(|outcome| outcome.path.as_ref())
+            .is_some_and(|path| {
+                line_directive_targets.iter().any(|(directive, target)| {
+                    directive.is_line_directive_at_call(source) && target == path
+                })
+            })
+        {
+            continue;
+        }
         if source.guarded_by_file_exists
             && outcome.as_ref().and_then(|outcome| outcome.case_mismatch)
                 == Some(crate::cross_file::path_resolve::CaseMismatchRegime::CaseSensitiveFs)
