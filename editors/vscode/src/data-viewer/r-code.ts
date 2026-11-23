@@ -90,18 +90,21 @@ const RESERVED = new Set([
  * controls and DEL; the line and paragraph separators (U+2028/9, which
  * editors may turn into line breaks) and NEL (U+0085); and invisible
  * format characters, bidi controls included, that can make text read
- * differently from how it parses ("Trojan Source").
+ * differently from how it parses ("Trojan Source"). The tag characters
+ * (U+E0000-U+E007F, an invisible copy of ASCII) lie outside the BMP, so
+ * the class matches code points (`u`) and callers test whole characters.
  */
-const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
-const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'g');
+const UNSAFE_CHAR = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\u{e0000}-\u{e007f}]/u;
+const UNSAFE_CHARS = new RegExp(UNSAFE_CHAR.source, 'gu');
 
 /** Thrown when data-derived text has no R spelling (NUL, which R strings
  *  can't hold); the caller leaves the piece out with a "Not translated"
  *  comment, or refuses the whole export. */
 class Unrepresentable extends Error {}
 
-function hex4(c: number): string {
-    return c.toString(16).padStart(4, '0');
+/** A code point as an R escape: `\uNNNN`, or `\UNNNNNNNN` past the BMP. */
+function uEscape(c: number): string {
+    return c > 0xffff ? '\\U' + c.toString(16).padStart(8, '0') : '\\u' + c.toString(16).padStart(4, '0');
 }
 
 /**
@@ -115,7 +118,7 @@ export function rComment(s: string): string {
         if (ch === '\n') return '\\n';
         if (ch === '\r') return '\\r';
         if (ch === '\t') return '\\t';
-        return '\\u' + hex4(ch.charCodeAt(0));
+        return uEscape(ch.codePointAt(0)!);
     });
 }
 
@@ -126,7 +129,7 @@ export function rComment(s: string): string {
 export function rNameRepresentable(name: string): boolean {
     if (name === '...' || /^\.\.[0-9]+$/.test(name)) return false;
     for (const ch of name) {
-        const c = ch.charCodeAt(0);
+        const c = ch.codePointAt(0)!;
         if (c === 0) return false;
         if (c >= 0x80 && UNSAFE_CHAR.test(ch)) return false;
     }
@@ -152,7 +155,7 @@ export function rName(name: string): string {
 
 /** A double-quoted R string literal. Non-ASCII text stays literal (R
  *  reads UTF-8 source); control, separator and invisible format
- *  characters are escaped (as `\uNNNN`). Throws `Unrepresentable` on NUL. */
+ *  characters are escaped (as `\uNNNN` or `\UNNNNNNNN`). Throws `Unrepresentable` on NUL. */
 export function rString(s: string): string {
     let out = '"';
     for (const ch of s) {
@@ -165,7 +168,7 @@ export function rString(s: string): string {
         else if (ch === '\t') out += '\\t';
         // `\u` for every other escape: R refuses a literal mixing `\x`
         // and `\u` escapes.
-        else if (UNSAFE_CHAR.test(ch)) out += '\\u' + hex4(c);
+        else if (UNSAFE_CHAR.test(ch)) out += uEscape(c);
         else out += ch;
     }
     return out + '"';
