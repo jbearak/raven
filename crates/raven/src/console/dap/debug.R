@@ -590,6 +590,11 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             if (identical(v, as.name("\001NULL\001"))) v <- NULL
             return(list(ok = TRUE, value = v))
         }
+        # Stripping the slots copies the vector: not one a package implements.
+        if (typeof(x) %in% c("list", "logical", "integer", "double", "complex", "character", "raw") &&
+            foreign(x)) {
+            return(list(ok = FALSE))
+        }
         pkg <- attr(attr(x, "class", exact = TRUE), "package", exact = TRUE)
         if (!is.null(pkg) && !(is.character(pkg) && length(pkg) == 1L &&
                                pkg %in% c(".GlobalEnv", loadedNamespaces()))) {

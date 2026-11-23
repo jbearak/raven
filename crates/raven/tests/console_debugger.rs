@@ -1535,7 +1535,7 @@ fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
     d.req("configurationDone", json!({}));
     c.send(
         &format!(
-            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  fy <- structure(1:2, levels = .Call('spy_make'), class = 'factor')\n  dd <- data.frame(a = 1:3); attr(dd, 'row.names') <- .Call('spy_make')\n  xl <- .Call('spy_list')\n  n0 <- .Call('spy_calls')\n  browser()\n  x\n}}",
+            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  fy <- structure(1:2, levels = .Call('spy_make'), class = 'factor')\n  dd <- data.frame(a = 1:3); attr(dd, 'row.names') <- .Call('spy_make')\n  xl <- .Call('spy_list')\n  setClass('Spy', contains = 'integer')\n  sx <- .Call('spy_make'); attr(sx, 'class') <- structure('Spy', package = '.GlobalEnv'); sx <- asS4(sx)\n  n0 <- .Call('spy_calls')\n  browser()\n  x\n}}",
             so.display()
         ),
         None,
@@ -1561,7 +1561,7 @@ fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
     // The factor (levels) and data frame (row names) whose attributes are
     // such vectors: shown without reading them either.
     let _ = d.locals();
-    for e in ["fy", "dd", "xl", "xl[[1]]"] {
+    for e in ["fy", "dd", "xl", "xl[[1]]", "sx", "sx@.Data"] {
         d.req(
             "evaluate",
             json!({"expression": e, "frameId": frame, "context": "hover"}),
