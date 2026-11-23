@@ -441,7 +441,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 - `0`: every requested file has a parsed document. A file with syntax errors still gets a full document.
 - `3`: at least one file couldn't be read or decoded. Its error document is printed in its place, and every other document is still printed.
 - `1`: a usage error, such as an unknown flag or a `--format` other than `json`.
-- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk, is an operator error too, reported on stderr, after whatever documents were written. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
+- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
 
 <!-- example: parse-unreadable -->
 ```console
@@ -707,7 +707,13 @@ Raven resolves a name with the scope `raven check` uses for its undefined-variab
 4. The packages R attaches at startup: base, stats, graphics, grDevices, utils, datasets, and methods. So `filter()` is stats' until `library(dplyr)` and dplyr's after it.
 5. R's builtin functions and `T` and `F`, which Raven knows without any package data.
 
-A call skips a binding whose value is a literal, as R skips a binding that isn't a function when it looks up a function. So `mean(1:3)` after `mean <- 7` is base's `mean`. That holds only when every assignment to the name in the same function body, or at the top level, is a literal. A binding whose value Raven doesn't know, such as a parameter or `k <- foo()`, is still what the call resolves to.
+A call skips a binding whose value is a literal, as R skips a binding that isn't a function when it looks up a function. So `mean(1:3)` after `mean <- 7` is base's `mean`. That holds only when every assignment to the name in the same function body, or at the top level, is a literal. A binding whose value Raven doesn't know, such as a parameter or `k <- foo()`, is still what the call resolves to. Three details:
+
+- `assign("mean", 7)` counts as `mean <- 7` does.
+- The body of `local({...})` is a frame of its own, so an assignment there doesn't compete with one outside it.
+- An assignment inside `quote()` or `expression()` doesn't run, so it doesn't count.
+
+Past such a literal, a call in a function body finds what a caller binds after its `source()` call, because the function runs later. With `mean <- 7` and `f <- function() mean(1:3)` in a file, and `mean <- function(x) 99` after the `source()` call in its caller, the call in `f` resolves to the caller's `mean`.
 
 Every loader `raven check` reads counts as an attach; see [Package awareness](cross-file.md#package-awareness). A namespace access such as `dplyr::filter()` is the package as written, whatever is attached.
 
@@ -734,6 +740,8 @@ A caller is a file that sources this one, through a `source()` call or a directi
 - **Only the exports Raven has data for.** A name that a package without data might export resolves as if the package didn't, so check `package_data` and the `no_package_data` reason.
 - **Data columns.** In a data-masking argument such as `filter(d, x > 1)`, a name may be a column of the data. A resolved name there, such as `T`, is what R finds when the data has no column of that name.
 - **Sourced files' packages.** A package attached by a file that a sourced file sources ranks as attached before this file's own packages.
+- **Quoted code that runs later.** After `mean <- 7`, `q <- quote(mean <- function(x) 0)`, and `eval(q)`, R calls the quoted function. Raven follows `eval()` only when the `quote()` is its argument, so here `mean()` resolves to base's.
+- **`source(local = TRUE)` in a function.** Raven doesn't read a caller that sources the file this way, so a name that caller's global environment defines resolves as if the file had no such caller.
 
 ### Package data
 

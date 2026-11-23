@@ -184,7 +184,27 @@ pub async fn run(args: ParseArgs) -> i32 {
         let line = serde_json::to_string(&document).expect("parse document serializes");
         (line, document.is_error())
     });
-    print_documents(std::io::stdout().lock(), documents)
+    print_documents(stdout_writer(), documents)
+}
+
+/// Where the documents go: stdout, through a handle whose write errors all
+/// come back. `std::io::Stdout` reports a write to a descriptor that isn't
+/// open for writing (`raven parse 1</dev/null`, `EBADF`) as a success, on
+/// purpose, so on Unix the documents are written through a duplicate of the
+/// descriptor as a plain file. Nothing else writes to stdout during a run.
+///
+/// A stdout closed before the run (`1>&-`) can't be told from `>/dev/null`:
+/// Rust's runtime reopens a closed standard descriptor on `/dev/null` before
+/// `main`.
+fn stdout_writer() -> Box<dyn std::io::Write> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        if let Ok(fd) = std::io::stdout().as_fd().try_clone_to_owned() {
+            return Box::new(std::fs::File::from(fd));
+        }
+    }
+    Box::new(std::io::stdout().lock())
 }
 
 /// Writes each document's JSON line, with whether it is an error document,

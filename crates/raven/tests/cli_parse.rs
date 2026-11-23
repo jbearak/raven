@@ -692,6 +692,197 @@ fn a_literal_overwrite_read_late_hides_earlier_caller_bindings() {
     assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
 }
 
+/// A function body runs after its file was sourced, so past the file's own
+/// literal it finds what an ordinary caller binds after its `source()` call
+/// (R returns 99 for `f()` in `late.R`). At the file's top level, or when the
+/// caller's function binding came first or its later binding is a literal
+/// too, the literal still leaves base's `mean`.
+#[test]
+fn a_function_body_past_its_literal_reads_the_callers_later_rebinding() {
+    let (_tmp, ws) = package_workspace();
+    let child = b"mean <- 7\nf <- function() mean(1:3)\nmean(1:3)\n";
+    write(&ws, "late/child.R", child);
+    write(
+        &ws,
+        "late/late.R",
+        b"source(\"child.R\")\nmean <- function(x) 99\nf()\n",
+    );
+    write(&ws, "early/child.R", child);
+    write(
+        &ws,
+        "early/early.R",
+        b"mean <- function(x) 99\nsource(\"child.R\")\nf()\n",
+    );
+    write(&ws, "literal/child.R", child);
+    write(
+        &ws,
+        "literal/literal.R",
+        b"source(\"child.R\")\nmean <- 8\nf()\n",
+    );
+    write(&ws, "two/child.R", child);
+    write(
+        &ws,
+        "two/a.R",
+        b"source(\"child.R\")\nmean <- function(x) 99\nf()\n",
+    );
+    write(&ws, "two/b.R", b"source(\"child.R\")\nf()\n");
+    let docs = parse_isolated(
+        &ws,
+        &[
+            "late/child.R",
+            "early/child.R",
+            "literal/child.R",
+            "two/child.R",
+        ],
+        None,
+    );
+    let rebinding = |path: &str| {
+        serde_json::json!({"kind": "workspace", "path": path,
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}})
+    };
+    let late = by_path(&docs, "late/child.R");
+    assert_eq!(*resolution_of(late, "mean", 1), rebinding("late/late.R"));
+    assert_eq!(*resolution_of(late, "mean", 2), package("base"));
+    for path in ["early/child.R", "literal/child.R"] {
+        let doc = by_path(&docs, path);
+        assert_eq!(*resolution_of(doc, "mean", 1), package("base"), "{path}");
+        assert_eq!(*resolution_of(doc, "mean", 2), package("base"), "{path}");
+    }
+    let two = by_path(&docs, "two/child.R");
+    assert_eq!(
+        *resolution_of(two, "mean", 1),
+        serde_json::json!({"kind": "ambiguous", "candidates": [
+            {"path": "two/a.R", "resolution": rebinding("two/a.R")},
+            {"path": "two/b.R", "resolution": package("base")}]})
+    );
+    assert_eq!(*resolution_of(two, "mean", 2), package("base"));
+}
+
+/// Code that `quote()` or `expression()` captures doesn't run, so an
+/// assignment in it is no competing binding: R returns 2.5 (base's `mean`)
+/// for the first two calls. A `quote()` passed straight to `eval()` does
+/// run, and so does the operand of `bquote()`'s `.()`.
+#[test]
+fn quoted_assignments_are_not_competing_bindings() {
+    let (_tmp, ws) = workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "mean <- 7\n",
+            "q <- quote(mean <- function(x) 0)\n",
+            "mean(1:4)\n",
+            "sum <- 7\n",
+            "e <- base::expression(sum <- function(x) 0)\n",
+            "sum(1:4)\n",
+            "min <- 7\n",
+            "eval(quote(min <- function(x) 0))\n",
+            "min(1:4)\n",
+        )
+        .as_bytes(),
+    );
+    write(
+        &ws,
+        "bquote.R",
+        b"max <- 7\nb <- bquote(.(max <- function(x) 0))\nmax(1:4)\n",
+    );
+    let output = parse_in(&ws, &["main.R", "bquote.R"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let docs = documents(&output);
+    assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
+    assert_eq!(*resolution_of(&docs[0], "sum", 5), package("base"));
+    // Not base's: the name's latest binding, as before.
+    assert_eq!(
+        *resolution_of(&docs[0], "min", 8),
+        serde_json::json!({"kind": "workspace", "path": "main.R",
+            "range": {"start": {"line": 6, "character": 0}, "end": {"line": 6, "character": 3}}})
+    );
+    assert_eq!(
+        *resolution_of(&docs[1], "max", 2),
+        serde_json::json!({"kind": "workspace", "path": "bquote.R",
+            "range": {"start": {"line": 1, "character": 14}, "end": {"line": 1, "character": 17}}})
+    );
+}
+
+/// An immediate `local({...})` body is a frame of its own: its assignments
+/// don't compete with the enclosing frame's, nor the enclosing frame's with
+/// its own. R returns 2.5, 0, and 2.5 for the three calls.
+#[test]
+fn a_local_body_is_its_own_frame_for_literal_bindings() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "mean <- 7\n",
+            "local({ mean <- function(x) 0 })\n",
+            "mean(1:4)\n",
+            "sum <- function(x) 0\n",
+            "local({ sum <- 7; sum(1:4) })\n",
+            "local({ max <- 7; max <- function(x) 0 })\n",
+            "max <- 7\n",
+            "max(1:4)\n",
+        )
+        .as_bytes(),
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mean", 2), package("base"));
+    assert_eq!(
+        *resolution_of(&docs[0], "sum", 4),
+        serde_json::json!({"kind": "workspace", "path": "main.R",
+            "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 3}}})
+    );
+    assert_eq!(*resolution_of(&docs[0], "max", 7), package("base"));
+}
+
+/// `assign("name", value)` binds as `name <- value` does: a literal value is
+/// passed over (R returns 2.5 for `mean(1:4)`), and any other value competes
+/// with the name's literal assignments (either may be what R finds for
+/// `sum`).
+#[test]
+fn assign_calls_count_as_bindings_for_literal_values() {
+    let (_tmp, ws) = package_workspace();
+    write(
+        &ws,
+        "main.R",
+        concat!(
+            "assign(\"mean\", 7)\n",
+            "mean(1:4)\n",
+            "if (TRUE) assign(\"sum\", function(x) 0)\n",
+            "sum <- 7\n",
+            "sum(1:4)\n",
+        )
+        .as_bytes(),
+    );
+    let docs = parse_isolated(&ws, &["main.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "mean", 1), package("base"));
+    assert_eq!(
+        *resolution_of(&docs[0], "sum", 4),
+        serde_json::json!({"kind": "workspace", "path": "main.R",
+            "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 3}}})
+    );
+}
+
+/// A stdout that can't be written at all (a descriptor open for reading
+/// only) loses every document: an operator error, not a silent exit 0.
+#[cfg(unix)]
+#[test]
+fn read_only_stdout_is_an_operator_error() {
+    let (_tmp, ws) = workspace();
+    write(&ws, "ok.R", b"x <- 1\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+        .args(["parse", "--workspace", ws.to_str().unwrap(), "ok.R"])
+        .stdout(std::fs::File::open("/dev/null").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("raven parse: cannot write output"),
+        "{stderr}"
+    );
+}
+
 /// The `target` range of top-level statement `index`'s assignment.
 fn target_range(doc: &Value, index: usize) -> &Value {
     &doc["statements"][index]["expression"]["target"]["range"]
