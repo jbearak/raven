@@ -1,7 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 import { githubDark } from '../../editors/vscode/src/knit/github-colors';
 import type { ThemePaletteArgs } from '../../editors/vscode/src/knit/vscode-theme-palette';
 import {
+    __resetQuartoThemeStateForTests,
     QUARTO_THEME_PREFERENCE_KEY,
     QuartoThemeController,
     type QuartoThemeControllerDeps,
@@ -91,6 +92,11 @@ function harness(overrides: Partial<QuartoThemeControllerDeps> = {}) {
 }
 
 describe('QuartoThemeController', () => {
+    // The last toggle is module state shared by every controller; without
+    // this a test sees the state an earlier one left, in whatever order
+    // they ran.
+    beforeEach(() => { __resetQuartoThemeStateForTests(); });
+
     test('builds the payload from injected palette and font resolvers', async () => {
         let args: ThemePaletteArgs | undefined;
         const h = harness({

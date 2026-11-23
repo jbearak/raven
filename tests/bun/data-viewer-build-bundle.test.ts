@@ -3,34 +3,38 @@ import { spawn } from 'bun';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 
+const vscode_dir = join(__dirname, '..', '..', 'editors', 'vscode');
+const have_node_modules = existsSync(join(vscode_dir, 'node_modules'));
+
+// One build for the whole file, at file scope: both suites below read
+// dist/, and a `beforeAll` inside one of them would leave the other
+// depending on the order the suites run in (a fresh checkout has no
+// dist/, and `bun test --randomize` can run the other suite first).
+beforeAll(async () => {
+    if (!have_node_modules) {
+        console.warn(
+            '[data-viewer-build-bundle] skipping build: editors/vscode/node_modules missing. ' +
+            'Run `bun install` in editors/vscode to enable this check.',
+        );
+        return;
+    }
+
+    const proc = spawn({
+        cmd: ['bun', 'scripts/build.js'],
+        cwd: vscode_dir,
+        stdout: 'pipe',
+        stderr: 'pipe',
+    });
+    const code = await proc.exited;
+    if (code !== 0) {
+        const out = await new Response(proc.stdout).text();
+        const err = await new Response(proc.stderr).text();
+        throw new Error(`bundle build failed (exit ${code})\nstdout:\n${out}\nstderr:\n${err}`);
+    }
+}, 120_000);
+
 describe('data viewer build bundle', () => {
-    const vscode_dir = join(__dirname, '..', '..', 'editors', 'vscode');
-    const node_modules = join(vscode_dir, 'node_modules');
     const data_viewer_bundle = join(vscode_dir, 'dist', 'webviews', 'data-viewer', 'index.js');
-    const have_node_modules = existsSync(node_modules);
-
-    beforeAll(async () => {
-        if (!have_node_modules) {
-            console.warn(
-                '[data-viewer-build-bundle] skipping build: editors/vscode/node_modules missing. ' +
-                'Run `bun install` in editors/vscode to enable this check.',
-            );
-            return;
-        }
-
-        const proc = spawn({
-            cmd: ['bun', 'scripts/build.js'],
-            cwd: vscode_dir,
-            stdout: 'pipe',
-            stderr: 'pipe',
-        });
-        const code = await proc.exited;
-        if (code !== 0) {
-            const out = await new Response(proc.stdout).text();
-            const err = await new Response(proc.stderr).text();
-            throw new Error(`bundle build failed (exit ${code})\nstdout:\n${out}\nstderr:\n${err}`);
-        }
-    }, 120_000);
 
     test.skipIf(!have_node_modules)(
         'uses production React and stays below the data-viewer size budget',
@@ -50,8 +54,6 @@ describe('data viewer build bundle', () => {
 });
 
 describe('data viewer worker threads in dist', () => {
-    const vscode_dir = join(__dirname, '..', '..', 'editors', 'vscode');
-    const have_node_modules = existsSync(join(vscode_dir, 'node_modules'));
     const dist = join(vscode_dir, 'dist');
     const threads = ['data-viewer-reader.js', 'data-viewer-worker.js'];
 

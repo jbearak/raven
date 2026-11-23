@@ -72,6 +72,14 @@ let preferenceWriteTail: Promise<void> = Promise.resolve();
 let lastKnownThemeEnabled: boolean | undefined;
 const CSS_COLOR = new RegExp(QUARTO_CSS_COLOR_PATTERN_SOURCE, 'i');
 
+/** Forgets the enabled state shared between controllers, so a test starts
+ *  from the stored preference whatever ran before it. */
+export function __resetQuartoThemeStateForTests(): void {
+    controllers.clear();
+    preferenceWriteTail = Promise.resolve();
+    lastKnownThemeEnabled = undefined;
+}
+
 const THEME_CONFIGURATION_KEYS = [
     'workbench.colorTheme',
     'workbench.preferredLightColorTheme',

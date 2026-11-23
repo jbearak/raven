@@ -9,7 +9,7 @@
  * not survive a subsequent View(x) call.
  */
 
-import { describe, test, expect, mock } from 'bun:test';
+import { afterEach, describe, test, expect, mock } from 'bun:test';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { copyFileSync, mkdtempSync } from 'node:fs';
@@ -110,6 +110,35 @@ async function loadPanel() {
     return { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod };
 }
 
+/**
+ * Wait for `pred` instead of a fixed number of timer ticks. What a panel
+ * posts depends on file reads, and the first panel in a process pays for
+ * cold modules too, so "one tick later" holds only for some test orders.
+ */
+async function until(pred: () => boolean | Promise<boolean>): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (!(await pred())) {
+        if (Date.now() > deadline) throw new Error('until: condition not met within 5 s');
+        await new Promise(r => setTimeout(r, 1));
+    }
+}
+
+/** The webview boots: send `webviewReady` and wait for the first paint. */
+async function ready(webview: FakeWebview): Promise<void> {
+    webview.deliverFromWebview({ type: 'webviewReady' });
+    await until(() => webview.posted.some(m => m.type === 'init'));
+}
+
+// Close what a test opened even when an assertion fails first: a reader
+// left open is closed by the garbage collector later, and bun reports
+// that as an error in whichever test is running then.
+const cleanups: (() => unknown)[] = [];
+afterEach(async () => {
+    for (const c of cleanups.reverse()) { try { await c(); } catch { /* best effort */ } }
+    cleanups.length = 0;
+    mock.restore();
+});
+
 const TEST_SETTINGS = {
     missingValueStyle: 'foreground' as const,
     defaultDigits: 3,
@@ -141,12 +170,11 @@ describe('DataViewerPanel persistence round-trip', () => {
             () => {},
         );
         const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        cleanups.push(() => fakePanel.dispose());
         const fakeWebview = fakePanel.webview;
 
         // Webview boots → init lands.
-        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
-        // postMessage is async-resolved; flush the microtask.
-        await new Promise(r => setTimeout(r, 0));
+        await ready(fakeWebview);
 
         const init = fakeWebview.posted.find(m => m.type === 'init') as any;
         expect(init).toBeDefined();
@@ -162,8 +190,7 @@ describe('DataViewerPanel persistence round-trip', () => {
             schemaHash: hash,
             layout: { columnWidths: {}, hiddenColumns: [0] },
         });
-        // Drain promises so store.save resolves.
-        await new Promise(r => setTimeout(r, 0));
+        await until(async () => (await layoutStore.load('tiny', hash)) !== undefined);
 
         const stored = await layoutStore.load('tiny', hash);
         expect(stored).toEqual({ columnWidths: {}, hiddenColumns: [0] });
@@ -171,16 +198,14 @@ describe('DataViewerPanel persistence round-trip', () => {
         // Trigger a replace with the same fixture (same schemaHash).
         const path2 = tempCopyOf('tiny.arrow');
         const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        cleanups.push(() => reader2.close().catch(() => undefined));
         await panel.replace(reader2, path2);
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => fakeWebview.posted.some(m => m.type === 'replace'));
 
         const replace = fakeWebview.posted.find(m => m.type === 'replace') as any;
         expect(replace).toBeDefined();
         expect(replace.layout).toEqual({ columnWidths: {}, hiddenColumns: [0] });
 
-        await reader2.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('saveToolbar from webview → next replace carries persisted toolbar', async () => {
@@ -201,10 +226,10 @@ describe('DataViewerPanel persistence round-trip', () => {
             () => {},
         );
         const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        cleanups.push(() => fakePanel.dispose());
         const fakeWebview = fakePanel.webview;
 
-        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
-        await new Promise(r => setTimeout(r, 0));
+        await ready(fakeWebview);
 
         const init = fakeWebview.posted.find(m => m.type === 'init') as any;
         expect(init.toolbar).toEqual({ labelsOn: true, formatOn: true, digits: 3 });
@@ -216,22 +241,20 @@ describe('DataViewerPanel persistence round-trip', () => {
             schemaHash: hash,
             toolbar: { labelsOn: false, formatOn: false, digits: 5 },
         });
-        await new Promise(r => setTimeout(r, 0));
+        await until(async () => (await toolbarStore.load('tiny', hash)) !== undefined);
 
         const stored = await toolbarStore.load('tiny', hash);
         expect(stored).toEqual({ labelsOn: false, formatOn: false, digits: 5 });
 
         const path2 = tempCopyOf('tiny.arrow');
         const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        cleanups.push(() => reader2.close().catch(() => undefined));
         await panel.replace(reader2, path2);
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => fakeWebview.posted.some(m => m.type === 'replace'));
 
         const replace = fakeWebview.posted.find(m => m.type === 'replace') as any;
         expect(replace.toolbar).toEqual({ labelsOn: false, formatOn: false, digits: 5 });
 
-        await reader2.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('saveLayout from a stale generation still persists (no race-drop)', async () => {
@@ -252,18 +275,19 @@ describe('DataViewerPanel persistence round-trip', () => {
             () => {},
         );
         const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        cleanups.push(() => fakePanel.dispose());
         const fakeWebview = fakePanel.webview;
 
-        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
-        await new Promise(r => setTimeout(r, 0));
+        await ready(fakeWebview);
         const init = fakeWebview.posted.find(m => m.type === 'init') as any;
         const hash = init.schemaHash as string;
 
         // Bump generation as if a replace happened first.
         const path2 = tempCopyOf('tiny.arrow');
         const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        cleanups.push(() => reader2.close().catch(() => undefined));
         await panel.replace(reader2, path2);
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => fakeWebview.posted.some(m => m.type === 'replace'));
 
         // Now an "old" saveLayout from the previous generation arrives.
         // It must still be honored because schemaHash is unchanged.
@@ -273,14 +297,11 @@ describe('DataViewerPanel persistence round-trip', () => {
             schemaHash: hash,
             layout: { columnWidths: { 1: 200 }, hiddenColumns: [2] },
         });
-        await new Promise(r => setTimeout(r, 0));
+        await until(async () => (await layoutStore.load('tiny', hash)) !== undefined);
 
         const stored = await layoutStore.load('tiny', hash);
         expect(stored).toEqual({ columnWidths: { 1: 200 }, hiddenColumns: [2] });
 
-        await reader2.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('stale copy request gets copyDone so the webview clears Copying status', async () => {
@@ -301,17 +322,18 @@ describe('DataViewerPanel persistence round-trip', () => {
             () => {},
         );
         const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        cleanups.push(() => fakePanel.dispose());
         const fakeWebview = fakePanel.webview;
 
-        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
-        await new Promise(r => setTimeout(r, 0));
+        await ready(fakeWebview);
         const init = fakeWebview.posted.find(m => m.type === 'init') as any;
         expect(init).toBeDefined();
 
         const path2 = tempCopyOf('tiny.arrow');
         const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        cleanups.push(() => reader2.close().catch(() => undefined));
         await panel.replace(reader2, path2);
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => fakeWebview.posted.some(m => m.type === 'replace'));
 
         const beforeCopy = fakeWebview.posted.length;
         fakeWebview.deliverFromWebview({
@@ -324,7 +346,7 @@ describe('DataViewerPanel persistence round-trip', () => {
             digits: 3,
             includeHeader: false,
         });
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => fakeWebview.posted.slice(beforeCopy).some(m => m.type === 'copyDone'));
 
         const copyDone = fakeWebview.posted.slice(beforeCopy)
             .find(m => m.type === 'copyDone') as any;
@@ -336,9 +358,6 @@ describe('DataViewerPanel persistence round-trip', () => {
             error: 'Data changed before copy completed',
         });
 
-        await reader2.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('copy that becomes stale during row read still gets copyDone', async () => {
@@ -367,10 +386,10 @@ describe('DataViewerPanel persistence round-trip', () => {
             () => {},
         );
         const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        cleanups.push(() => fakePanel.dispose());
         const fakeWebview = fakePanel.webview;
 
-        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
-        await new Promise(r => setTimeout(r, 0));
+        await ready(fakeWebview);
         const init = fakeWebview.posted.find(m => m.type === 'init') as any;
         expect(init).toBeDefined();
 
@@ -385,16 +404,19 @@ describe('DataViewerPanel persistence round-trip', () => {
             digits: 3,
             includeHeader: false,
         });
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => rowsRequested);
         expect(rowsRequested).toBe(true);
 
         const path2 = tempCopyOf('tiny.arrow');
         const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        cleanups.push(() => reader2.close().catch(() => undefined));
+        // Release the rows only once the replace has made the copy stale.
+        const generation = (panel as any).generation;
         const replacePromise = panel.replace(reader2, path2);
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => (panel as any).generation !== generation);
         releaseRows();
         await replacePromise;
-        await new Promise(r => setTimeout(r, 0));
+        await until(() => fakeWebview.posted.slice(beforeCopy).some(m => m.type === 'copyDone'));
 
         const copyDone = fakeWebview.posted.slice(beforeCopy)
             .find(m => m.type === 'copyDone') as any;
@@ -406,8 +428,5 @@ describe('DataViewerPanel persistence round-trip', () => {
             error: 'Data changed before copy completed',
         });
 
-        await reader2.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 });
