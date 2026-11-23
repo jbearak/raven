@@ -924,11 +924,15 @@ pub fn set_file_breakpoints(
     });
     let mut s = lock(h);
     if s.file_tickets.get(&key).is_some_and(|t| *t > ticket) {
-        return s
+        let current = s
             .files
             .get(&key)
             .map(|bps| bps.iter().map(|b| b.to_dap(&key)).collect())
             .unwrap_or_default();
+        drop(s);
+        // The mirror's sender waits for a summary after every request.
+        push_breakpoint_summary();
+        return current;
     }
     s.file_tickets.insert(key.clone(), ticket);
     let old = s.files.remove(&key).unwrap_or_default();

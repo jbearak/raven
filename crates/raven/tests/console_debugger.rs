@@ -1079,13 +1079,32 @@ fn a_stalled_breakpoint_request_cannot_undo_a_later_one() {
         writeln!(w, "{msg}").unwrap();
         s
     };
-    std::thread::sleep(Duration::from_millis(500));
+    // The FIFO opens for writing only once the console is blocked reading
+    // it, which is after the request took its place in line.
+    let mut writer = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(f) => break f,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "the request never read: {e}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    };
     // ... a newer one deletes the target's breakpoints ...
     let clear = json!({"v": 1, "id": 3, "op": "breakpoints", "files": {&target: []}});
     assert_eq!(ipc_request(&c, &clear), "ok");
     assert!(armed_files(&c).is_empty());
     // ... and then the stall ends, and the older request finishes.
-    std::fs::write(&fifo, "z <- 1\n").unwrap();
+    writer.write_all(b"z <- 1\n").unwrap();
+    drop(writer);
     let mut line = String::new();
     BufReader::new(stalled).read_line(&mut line).unwrap();
     assert!(line.contains("\"ok\""), "{line}");
