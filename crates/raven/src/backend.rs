@@ -13423,7 +13423,18 @@ enum WatchedResyncBatchMode {
 
 #[derive(Clone)]
 enum WatchedResyncCompletion {
-    Detached,
+    /// No handler waits for the batch.
+    Detached {
+        /// The backend whose open-child refresh queue
+        /// (`WorldState::open_wd_refresh_queue`) a delayed retry of this
+        /// batch drains when it finishes (issue #885). The handler that
+        /// started the batch drains the queue when its own run returns. A
+        /// retry commits after that, so without a drain of its own the open
+        /// children it queues would keep their old directory until the next
+        /// editor event. `None` only in tests that drive a batch without a
+        /// handler. Boxed for the same reason as `post_commit`.
+        open_wd_refresh: Option<Box<Backend>>,
+    },
     InvocationOwned {
         /// Boxed: it carries a whole `Backend` by value, and the enum is
         /// moved through several batch structs alongside a dataless variant.
@@ -13431,6 +13442,18 @@ enum WatchedResyncCompletion {
         receipt: OpenSourceBatchCompletionReceipt,
         boundary_waiter: bool,
     },
+}
+
+impl WatchedResyncCompletion {
+    /// [`Self::Detached`]'s `open_wd_refresh`. An invocation-owned batch has
+    /// none: its handler waits on the receipt, through every retry, and
+    /// drains the queue after that.
+    fn detached_open_wd_refresh(&self) -> Option<Box<Backend>> {
+        match self {
+            Self::Detached { open_wd_refresh } => open_wd_refresh.clone(),
+            Self::InvocationOwned { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -14833,6 +14856,7 @@ fn spawn_watched_undecodable_retry(
     routing_tasks: RoutingTaskOwner,
     admission: WatchedTaskAdmission,
     item: WatchedResyncItem,
+    open_wd_refresh: Option<Box<Backend>>,
 ) {
     // This delayed retry is a separately spawned invocation. The
     // invocation-scoped final-handoff test seam deliberately ends at the
@@ -14882,7 +14906,9 @@ fn spawn_watched_undecodable_retry(
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: open_wd_refresh.clone(),
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 #[cfg(test)]
@@ -14890,8 +14916,20 @@ fn spawn_watched_undecodable_retry(
             },
         )
         .await;
+        refresh_open_children_after_detached_retry(open_wd_refresh).await;
     }) {
         log::debug!("Shutdown rejected delayed undecodable watched retry");
+    }
+}
+
+/// Drain the open-child refresh queue once a detached retry's batch has run
+/// (see [`WatchedResyncCompletion::Detached`]). Called outside every state and
+/// publish guard, after the batch returns and not between its commits. The
+/// batch may have handed its work to a further retry and committed nothing;
+/// that retry drains again when it finishes.
+async fn refresh_open_children_after_detached_retry(open_wd_refresh: Option<Box<Backend>>) {
+    if let Some(backend) = open_wd_refresh {
+        backend.refresh_open_children_after_parent_change().await;
     }
 }
 
@@ -15007,8 +15045,9 @@ fn spawn_watched_package_retry(
     token: tokio_util::sync::CancellationToken,
 ) -> bool {
     batch.attempts_remaining = 2;
+    let open_wd_refresh = batch.completion.detached_open_wd_refresh();
     let completion_receipt = match &mut batch.completion {
-        WatchedResyncCompletion::Detached => None,
+        WatchedResyncCompletion::Detached { .. } => None,
         WatchedResyncCompletion::InvocationOwned {
             receipt,
             boundary_waiter,
@@ -15024,32 +15063,35 @@ fn spawn_watched_package_retry(
     let completion_lifecycle = retry_lifecycle.clone();
     let worker_receipt = completion_receipt.clone();
     let admitted = admission.spawn(&routing_tasks, async move {
-        let mut completion_guard = OpenSourceBatchCompletionGuard::new(worker_receipt);
-        let _retry_owner = LibraryRoutingRetryOwner {
-            lifecycle: retry_lifecycle,
-            generation,
-        };
-        tokio::select! {
-            () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
-            () = token.cancelled() => return,
-            () = shutdown.cancelled() => return,
+        {
+            let mut completion_guard = OpenSourceBatchCompletionGuard::new(worker_receipt);
+            let _retry_owner = LibraryRoutingRetryOwner {
+                lifecycle: retry_lifecycle,
+                generation,
+            };
+            tokio::select! {
+                () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
+                () = token.cancelled() => return,
+                () = shutdown.cancelled() => return,
+            }
+            if state_arc.read().await.routing_is_shutdown() {
+                return;
+            }
+            // The nested runner installs its guard before its first suspension
+            // point. Transfer responsibility as we enter it so every admitted
+            // successor has exactly one fail-closed owner.
+            completion_guard.disarm();
+            run_watched_resync_batch_owned(
+                state_arc.clone(),
+                client,
+                traversal_truncation,
+                child_tasks,
+                WatchedTaskAdmission::TrackedParent,
+                batch,
+            )
+            .await;
         }
-        if state_arc.read().await.routing_is_shutdown() {
-            return;
-        }
-        // The nested runner installs its guard before its first suspension
-        // point. Transfer responsibility as we enter it so every admitted
-        // successor has exactly one fail-closed owner.
-        completion_guard.disarm();
-        run_watched_resync_batch_owned(
-            state_arc.clone(),
-            client,
-            traversal_truncation,
-            child_tasks,
-            WatchedTaskAdmission::TrackedParent,
-            batch,
-        )
-        .await;
+        refresh_open_children_after_detached_retry(open_wd_refresh).await;
     });
     if !admitted {
         refusal_token.cancel();
@@ -15469,7 +15511,7 @@ async fn run_watched_resync_batch_owned(
         final_handoff_test_capture,
     } = batch;
     let (post_commit_source_refresh, completion_receipt, boundary_waiter) = match &completion {
-        WatchedResyncCompletion::Detached => (None, None, false),
+        WatchedResyncCompletion::Detached { .. } => (None, None, false),
         WatchedResyncCompletion::InvocationOwned {
             post_commit,
             receipt,
@@ -15563,6 +15605,7 @@ async fn run_watched_resync_batch_owned(
                         routing_tasks.clone(),
                         admission,
                         item.clone(),
+                        completion.detached_open_wd_refresh(),
                     );
                 }
             }
@@ -16244,6 +16287,7 @@ async fn run_watched_resync_batch_owned(
                             routing_tasks.clone(),
                             admission,
                             item.clone(),
+                            completion.detached_open_wd_refresh(),
                         );
                     }
                     ResyncOutcome::Prepared { .. } => {
@@ -20686,7 +20730,9 @@ impl LanguageServer for Backend {
                         deletions: deleted_uris,
                         reserved_tickets: Vec::new(),
                         transfer_handles: Vec::new(),
-                        completion: WatchedResyncCompletion::Detached,
+                        completion: WatchedResyncCompletion::Detached {
+                            open_wd_refresh: Some(Box::new(backend.clone())),
+                        },
                         mode: WatchedResyncBatchMode::Immediate,
                         attempts_remaining: 2,
                         #[cfg(test)]
@@ -20722,7 +20768,9 @@ impl LanguageServer for Backend {
                     deletions: deleted_uris,
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
-                    completion: WatchedResyncCompletion::Detached,
+                    completion: WatchedResyncCompletion::Detached {
+                        open_wd_refresh: Some(Box::new(self.clone())),
+                    },
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 2,
                     #[cfg(test)]
@@ -28126,7 +28174,9 @@ mod tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: super::WatchedResyncCompletion::Detached,
+                completion: super::WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: super::WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -28170,6 +28220,7 @@ mod tests {
                 generation,
                 package_input_only: false,
             },
+            None,
         );
         tokio::task::yield_now().await;
         tokio::time::timeout(std::time::Duration::from_secs(1), backend.shutdown())
@@ -39944,6 +39995,163 @@ mod project_config_initialize_tests {
         assert_eq!(fixture.inherited().await, None);
     }
 
+    /// A closed `main.R` (`# raven: cd w`) sources the open `mods/child.R`.
+    /// Returns the service, the workspace, `main.R`'s path and URI, and the
+    /// child's URI, once the child has taken `w/` as its directory.
+    async fn open_child_of_closed_cd_parent() -> (
+        tower_lsp::LspService<Backend>,
+        TempDir,
+        std::path::PathBuf,
+        Url,
+        Url,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["w", "b", "mods"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let main_path = base.join("main.R");
+        fs::write(&main_path, "# raven: cd w\nsource(\"../mods/child.R\")\n").unwrap();
+        let child_text = "source(\"util.R\")\n";
+        fs::write(base.join("mods/child.R"), child_text).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+        let svc = service_in_workspace_with_options_at(
+            &base,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await;
+        let backend = svc.inner();
+        backend.state.write().await.workspace_scan_complete = true;
+        let install = resync_file_from_disk(
+            &backend.state,
+            &main_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
+        assert!(matches!(install, ResyncOutcome::Updated { .. }));
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+        assert_eq!(
+            inherited_directory(&*backend.state.read().await, &child_uri),
+            Some(base.join("w"))
+        );
+        (svc, tmp, main_path, main_uri, child_uri)
+    }
+
+    fn inherited_directory(state: &WorldState, uri: &Url) -> Option<std::path::PathBuf> {
+        state
+            .get_enriched_metadata(uri)
+            .and_then(|metadata| metadata.inherited_working_directory.clone())
+            .map(std::path::PathBuf::from)
+    }
+
+    /// Wait for the open child to take `expected` as its directory with the
+    /// refresh queue drained, without any further editor event.
+    async fn child_follows_the_retry(
+        backend: &Backend,
+        child_uri: &Url,
+        expected: Option<std::path::PathBuf>,
+    ) -> bool {
+        wait_for_state(backend, 5_000, |state| {
+            inherited_directory(state, child_uri) == expected
+                && state.open_wd_refresh_queue.is_empty()
+        })
+        .await
+    }
+
+    /// A watched change whose bytes do not decode is committed by a delayed
+    /// retry, after the handler drained the open-child refresh queue (issue
+    /// #885). When the bytes stay invalid the retry removes the closed
+    /// parent, and the open child it ran in `w/` loses that directory then,
+    /// not at its next edit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_retry_that_removes_a_closed_parent_refreshes_its_open_child() {
+        let (svc, _tmp, main_path, main_uri, child_uri) = open_child_of_closed_cd_parent().await;
+        let backend = svc.inner();
+
+        fs::write(&main_path, [0x78u8, 0x80, 0x79]).unwrap();
+        send_watched_change(backend, &main_uri).await;
+
+        assert!(
+            child_follows_the_retry(backend, &child_uri, None).await,
+            "the retry's removal must reach the open child"
+        );
+        assert!(
+            !backend
+                .state
+                .read()
+                .await
+                .workspace_index
+                .contains(&main_uri)
+        );
+    }
+
+    /// As above, with the write finishing before the retry reads: the retry
+    /// commits the recovered parent, whose `cd` now names `b/`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_retry_that_recovers_a_closed_parent_refreshes_its_open_child() {
+        let (svc, tmp, main_path, main_uri, child_uri) = open_child_of_closed_cd_parent().await;
+        let backend = svc.inner();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+
+        fs::write(&main_path, [0x78u8, 0x80, 0x79]).unwrap();
+        send_watched_change(backend, &main_uri).await;
+        // Let the immediate pass observe the invalid bytes and schedule its
+        // retry, then finish the non-atomic write.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            inherited_directory(&*backend.state.read().await, &child_uri),
+            Some(base.join("w"))
+        );
+        fs::write(&main_path, "# raven: cd b\nsource(\"../mods/child.R\")\n").unwrap();
+
+        assert!(
+            child_follows_the_retry(backend, &child_uri, Some(base.join("b"))).await,
+            "the retry's recovered commit must reach the open child"
+        );
+    }
+
+    /// A watched batch that exhausts its inline commit attempts hands the
+    /// commit to a delayed package retry, which also lands after the
+    /// handler's drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_package_retry_refreshes_the_open_child_it_queues() {
+        let (svc, tmp, main_path, main_uri, child_uri) = open_child_of_closed_cd_parent().await;
+        let backend = svc.inner();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+
+        fs::write(&main_path, "# raven: cd b\nsource(\"../mods/child.R\")\n").unwrap();
+        let attempts = {
+            let mut state = backend.state.write().await;
+            // Every inline attempt of the batch is rejected.
+            state.watched_batch_test_reject_remaining = 3;
+            state.watched_batch_test_commit_attempts
+        };
+        send_watched_change(backend, &main_uri).await;
+
+        assert!(
+            child_follows_the_retry(backend, &child_uri, Some(base.join("b"))).await,
+            "the package retry's commit must reach the open child"
+        );
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .watched_batch_test_commit_attempts
+                - attempts,
+            4,
+            "three rejected inline attempts, then the retry's commit"
+        );
+    }
+
     /// A `didSave` of an open child races the refresh of its inherited
     /// directory (issue #885). The save computes its diagnostics before the
     /// refresh commits and takes the publish lock after it, while the
@@ -41789,7 +41997,9 @@ mod project_config_initialize_tests {
                 deletions: collected.deletions,
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53118,7 +53328,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53177,7 +53389,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53232,7 +53446,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53293,7 +53509,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53371,7 +53589,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -63940,7 +64160,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64023,7 +64245,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64078,7 +64302,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64146,7 +64372,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64209,7 +64437,9 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64331,7 +64561,9 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64813,7 +65045,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64877,7 +65111,9 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64950,7 +65186,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -65002,7 +65240,9 @@ infixContinuationStyle = "aligned"
                     deletions: Vec::new(),
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
-                    completion: WatchedResyncCompletion::Detached,
+                    completion: WatchedResyncCompletion::Detached {
+                        open_wd_refresh: None,
+                    },
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 0,
                     final_handoff_test_capture: None,
@@ -65059,7 +65299,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -65094,7 +65336,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -65181,7 +65425,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: vec![transfer.handle],
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -65270,7 +65516,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: vec![old_ticket],
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
