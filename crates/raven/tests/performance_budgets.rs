@@ -789,3 +789,36 @@ fn derive_package_state_500_file_keystroke_budget() {
     assert_within_budget("derive_package_state_500_file_keystroke_median", median, 50);
     assert_within_budget("derive_package_state_500_file_keystroke_max", max, 200);
 }
+
+// ---------------------------------------------------------------------------
+// Deep nesting budget (issue #882)
+// ---------------------------------------------------------------------------
+
+/// Diagnostics for a 2000-term sum, a tree 2000 levels deep. Each identifier's
+/// checks climb its ancestors. Written as repeated `Node::parent` calls, that
+/// climb was quadratic in depth and this took over a minute; with one root
+/// descent per climb (`parser_pool::ancestors`) it takes about a second.
+#[test]
+fn budget_diagnostics_2000_term_chain() {
+    let terms: Vec<String> = (0..2000).map(|i| format!("term{i}")).collect();
+    let code = format!("z <- {}\n", terms.join(" + "));
+    // A tree this deep needs the analysis stack; a test thread has 2 MiB.
+    let elapsed = std::thread::Builder::new()
+        .stack_size(raven::analysis_stack::stack_size())
+        .spawn(move || {
+            let mut state = WorldState::new();
+            let uri = Url::parse("file:///chain.R").unwrap();
+            state.open_document(uri.clone(), &code, None);
+            // Undefined-variable diagnostics wait for the workspace scan.
+            state.workspace_scan_complete = true;
+            let start = Instant::now();
+            let found = diagnostics(&state, &uri, &DiagCancelToken::never());
+            let elapsed = start.elapsed();
+            assert_eq!(found.len(), 2000, "one undefined-variable per term");
+            elapsed
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_within_budget("diagnostics_2000_term_chain", elapsed, 5000);
+}

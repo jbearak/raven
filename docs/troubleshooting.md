@@ -43,6 +43,7 @@ If the CLI shows the same problem, the cause is in the analysis, and the command
 | Raven's R console, plot viewer, or data viewer is missing | They step aside in Positron. See [Why Raven's console stepped aside](coexistence.md#why-ravens-console-stepped-aside). If `raven.rConsole.activation` is `"disabled"`, set it to `"auto"` or `"enabled"`. |
 | A file has no diagnostics | In VS Code, diagnostics are shown for files open in a tab. JAGS and Stan diagnostics are off by default. See [Diagnostics](diagnostics.md). |
 | The server doesn't start in Neovim, Zed, Helix, or Emacs | The editor can't find `raven`. Put it on your `PATH` or use the full path, then use the editor's check in [Editor setup](editor-integrations.md). |
+| Raven stops with `has overflowed its stack` | One expression is nested more than about 20,000 levels deep, such as a generated formula with that many terms. Split the expression. See [Limitations](limitations.md#language-server). |
 | `raven check` reports packages as missing in CI | CI usually has no R. Run `raven packages update` first, or commit a package list. See [Raven in CI](ci.md). |
 
 ## 5. File an issue

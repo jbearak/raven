@@ -2467,17 +2467,13 @@ fn scope_chain_any(use_node: Node, relevant: impl Fn(Option<LexicalScope>) -> bo
 }
 
 fn lexical_scope(node: Node) -> Option<LexicalScope> {
-    let mut current = Some(node);
-    while let Some(node) = current {
-        if node.kind() == "function_definition" {
-            return Some(LexicalScope {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-            });
-        }
-        current = node.parent();
-    }
-    None
+    std::iter::once(node)
+        .chain(crate::parser_pool::ancestors(node))
+        .find(|node| node.kind() == "function_definition")
+        .map(|node| LexicalScope {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        })
 }
 
 fn bare_helper_is_trusted<T>(map: &HashMap<String, Binding<T>>, name: &str) -> bool {
