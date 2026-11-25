@@ -138,8 +138,11 @@ fi
 
 echo "Bumping version to $VERSION ($CHANNEL)..."
 
-# Update workspace Cargo.toml
-sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
+# Update workspace Cargo.toml. `sed -i.bak` (suffix attached) is the in-place
+# form both Apple sed and GNU sed accept; GNU sed reads the '' in `-i ''` as the
+# script.
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
+rm "$REPO_ROOT/Cargo.toml.bak"
 
 # Update Cargo.lock to reflect the new version
 cargo update -p raven --manifest-path "$REPO_ROOT/Cargo.toml"
@@ -152,11 +155,12 @@ cd "$REPO_ROOT"
 # docs/cli.md shows real `raven --version` / `raven check --help` output and
 # `raven parse` documents carrying `"raven_version"`, and the docs examples
 # tests check it against the current version.
-sed -i '' \
+sed -i.bak \
     -e "s/^raven $CURRENT_VERSION\$/raven $VERSION/" \
     -e "s/^raven check $CURRENT_VERSION /raven check $VERSION /" \
     -e "s/\"raven_version\":\"$CURRENT_VERSION\"/\"raven_version\":\"$VERSION\"/g" \
     "$REPO_ROOT/docs/cli.md"
+rm "$REPO_ROOT/docs/cli.md.bak"
 
 echo "Updated Cargo.toml, Cargo.lock, editors/vscode/package.json, and docs/cli.md"
 

@@ -40,22 +40,25 @@ jobs:
             exit 1
           fi
 
-      # Same classification release-build.yml used when it packaged the VSIX.
-      - name: Determine release channel
-        id: channel
-        run: |
-          channel=$(./scripts/release-channel.sh "$TAG")
-          echo "Release channel for $TAG: $channel"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-        env:
-          TAG: ${{ inputs.tag }}
-
       - name: Validate tag exists
         run: |
           if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
             echo "ERROR: Tag '${{ inputs.tag }}' does not exist. Push the tag first."
             exit 1
           fi
+
+      # Same check and classification release-build.yml ran before it built
+      # anything. The checkout is the dispatch branch, whose Cargo.toml can be
+      # ahead of the tag, so read the manifest from the tagged commit.
+      - name: Check the tag against the workspace version and determine the release channel
+        id: channel
+        run: |
+          set -euo pipefail
+          channel=$(git show "refs/tags/${TAG}^{commit}:Cargo.toml" | ./scripts/check-release-tag.sh "$TAG")
+          echo "Release channel for $TAG: $channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ inputs.tag }}
 
       - name: Get tag commit SHA
         id: tag_sha
