@@ -397,6 +397,23 @@ describe('non-finite filter values over the JSON transport', () => {
         expect(decodeNonFinite(st).filter.entries[0].predicate.values).toEqual([Infinity, -Infinity]);
     });
 
+    test('pure: a counted date outside JavaScript\'s Date range shows <out of range> and builds no filter', () => {
+        const col = { name: 'd', arrowType: 'Date<DAY>', dictionaryShipped: false, isInteger: false } as any;
+        const show = (v: number) => formatCell(entryCell(col, 'date', v), col, undefined,
+            { labelsOn: true, formatOn: true, digits: 3, alignPad: false } as any).text;
+        // as.Date(100000001, origin = "1970-01-01"): past ±1e8 days.
+        expect(show(100_000_001)).toBe('<out of range>');
+        expect(show(-100_000_001)).toBe('<out of range>');
+        expect(show(19_000)).toBe('2022-01-08');
+        expect(show(2_932_897)).toBe('10000-01-01');
+        const pick = (v: number) => setFilterFor(col, 'date', [{ value: v, count: 1, error: 0 }] as any, true);
+        expect(pick(100_000_001)).toBeUndefined();
+        expect(pick(19_000)).toEqual({ kind: 'dateCompare', op: '=', value: '2022-01-08' });
+        // A five-digit year keeps its day (the filter reads it with Date.parse).
+        const far = pick(2_932_897) as any;
+        expect(Date.parse(far.value)).toBe(2_932_897 * 86_400_000);
+    });
+
     test('pure: a labelled column\'s Inf pick builds a filter with Inf', () => {
         const col = { name: 'x', arrowType: 'Float64', dictionaryShipped: false, isInteger: false, valueLabels: { 5: 'five' } };
         const p = setFilterFor(col as any, 'labelled', [{ value: Infinity, count: 1, error: 0 }] as any, true);
