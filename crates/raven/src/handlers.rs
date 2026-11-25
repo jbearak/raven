@@ -10102,7 +10102,7 @@ fn attached_at(
             &mut HashSet::new(),
             &mut first_attached,
         );
-        let mut ordered: Vec<(&String, &Vec<(u32, u32)>)> = first_attached
+        let mut ordered: Vec<_> = first_attached
             .iter()
             .filter(|(package, _)| {
                 scope.attached_packages.contains(*package)
@@ -10151,27 +10151,30 @@ fn attached_at(
 /// When each package the top level of `meta`'s file (at `uri`) attaches is
 /// first attached, before `before` (all of them when `None`): the path of
 /// call positions to its first top-level attaching `library()`, through the
-/// `source()` calls of the files it sources, which run whole. Paths compare
-/// in execution order. `prefix` is the path to this file; `visited` stops a
-/// cycle, and a file reached again attaches nothing new.
+/// top-level `source()` calls of the files it sources, which run whole. A
+/// position is (line, column, order): the files one `tar_source()` call
+/// expands to share its position and run in batch-ordinal order, and the
+/// packages one call attaches in the order it lists them. Paths
+/// compare in execution order. `prefix` is the path to this file; `visited`
+/// stops a cycle, and a file reached again attaches nothing new.
 fn attach_order(
     snapshot: &DiagnosticsSnapshot,
     meta: &crate::cross_file::CrossFileMetadata,
     uri: &Url,
-    prefix: &[(u32, u32)],
+    prefix: &[(u32, u32, u32)],
     before: Option<(u32, u32)>,
     visited: &mut HashSet<Url>,
-    first_attached: &mut HashMap<String, Vec<(u32, u32)>>,
+    first_attached: &mut HashMap<String, Vec<(u32, u32, u32)>>,
 ) {
     if !visited.insert(uri.clone()) {
         return;
     }
     let runs = |position: (u32, u32)| before.is_none_or(|cursor| position < cursor);
     let path = |position| prefix.iter().copied().chain([position]).collect::<Vec<_>>();
-    for call in &meta.library_calls {
-        let position = (call.line, call.column);
-        if call.attaches && call.function_scope.is_none() && runs(position) {
-            let path = path(position);
+    for (index, call) in meta.library_calls.iter().enumerate() {
+        if call.attaches && call.function_scope.is_none() && runs((call.line, call.column)) {
+            // The index orders the packages of one call (`p_load(a, b)`).
+            let path = path((call.line, call.column, index as u32));
             first_attached
                 .entry(call.package.clone())
                 .and_modify(|first| {
@@ -10186,12 +10189,14 @@ fn attach_order(
         let Some(line) = edge.call_site_line else {
             continue;
         };
-        let position = (line, edge.call_site_column.unwrap_or(0));
+        let column = edge.call_site_column.unwrap_or(0);
         if edge.kind != crate::cross_file::dependency::DependencyEdgeKind::OrdinarySource
-            || !runs(position)
+            || edge.is_function_scoped
+            || !runs((line, column))
         {
             continue;
         }
+        let position = (line, column, edge.tar_source_ordinal.unwrap_or(0));
         if let Some(child) = snapshot.metadata_map.get(&edge.to) {
             attach_order(
                 snapshot,
@@ -33262,6 +33267,13 @@ d[n > 1, older] := 1
         assert_eq!(
             where_undefined_names_sourcing(source_setup, &setup).await,
             vec!["captured_setup"]
+        );
+        // A `source()` in a function body hasn't run at the top level.
+        let uncalled = "setup <- function() source(\"setup.R\")\nlibrary(plain)\nlibrary(capa)\nd <- 1\nd %where% captured_fn\n";
+        let setup = [("setup.R", "library(capa)\n")];
+        assert_eq!(
+            where_undefined_names_sourcing(uncalled, &setup).await,
+            Vec::<String>::new()
         );
         let source_after = "library(capa)\nsource(\"child.R\")\nd <- 1\nd %where% missing_child\n";
         let child = [("child.R", "library(plain)\n")];
