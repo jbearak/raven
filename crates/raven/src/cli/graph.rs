@@ -459,12 +459,77 @@ fn case_name(exists: bool, case_mismatch: Option<CaseMismatchRegime>) -> Option<
 /// An exact-case portability check for code that runs from the project root:
 /// `raw_path` has no leading `/`, and the resolved endpoint is exactly
 /// `ROOT/raw_path`, normalized, with the same case, and exists.
+///
+/// On Windows the root carries the verbatim prefix and `resolved` usually
+/// doesn't (see [`display_fs_path`]), so the two are also compared as
+/// [`windows_portable`] does.
 fn portable_from_root(raw_path: &str, resolved: &Path, exists: bool, root: &Path) -> bool {
     if !exists || raw_path.starts_with('/') || Path::new(raw_path).is_absolute() {
         return false;
     }
-    crate::cross_file::path_resolve::normalize_path_public(&root.join(raw_path))
-        .is_some_and(|expected| expected.as_os_str() == resolved.as_os_str())
+    let native = crate::cross_file::path_resolve::normalize_path_public(&root.join(raw_path))
+        .is_some_and(|expected| expected.as_os_str() == resolved.as_os_str());
+    native
+        || (cfg!(windows)
+            && windows_portable(
+                raw_path,
+                &resolved.to_string_lossy(),
+                &root.to_string_lossy(),
+            ))
+}
+
+/// Whether `path` is the root or under it. On Windows a path from a file URI
+/// lacks the canonical root's verbatim prefix, which `Path::starts_with`
+/// treats as a different prefix, so the two are also compared as
+/// [`windows_is_under`] does.
+fn is_under_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        || (cfg!(windows) && windows_is_under(&path.to_string_lossy(), &root.to_string_lossy()))
+}
+
+/// A Windows path's text as the parts to compare: the verbatim prefix dropped
+/// (see [`without_verbatim_prefix`]), split at `\` and `/`, with empty and
+/// `.` parts dropped and `..` dropping the part before it (never the drive or
+/// share). A drive letter is uppercased, as std reads it; every other part
+/// keeps its case. Works on the text so it is testable on every platform.
+fn windows_parts(path: &str) -> Vec<String> {
+    let plain = without_verbatim_prefix(path).unwrap_or_else(|| path.to_string());
+    let mut parts = Vec::new();
+    // A UNC path's server and share are its root, like a drive.
+    let mut fixed = 0;
+    if plain.starts_with(r"\\") || plain.starts_with("//") {
+        parts.push(r"\\".to_string());
+        fixed = 3;
+    }
+    for part in plain.split(['\\', '/']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.len() > fixed.max(1) {
+                    parts.pop();
+                }
+            }
+            _ if parts.is_empty() && part.len() == 2 && part.ends_with(':') => {
+                parts.push(part.to_ascii_uppercase());
+            }
+            _ => parts.push(part.to_string()),
+        }
+    }
+    parts
+}
+
+/// [`is_under_root`] for Windows path text, with or without the verbatim
+/// prefix on either side.
+fn windows_is_under(path: &str, root: &str) -> bool {
+    windows_parts(path).starts_with(&windows_parts(root))
+}
+
+/// [`portable_from_root`]'s comparison for Windows path text: `root\raw_path`,
+/// normalized, names exactly `resolved`, with or without the verbatim prefix
+/// on either side.
+fn windows_portable(raw_path: &str, resolved: &str, root: &str) -> bool {
+    !raw_path.starts_with(['\\', '/'])
+        && windows_parts(&format!(r"{root}\{raw_path}")) == windows_parts(resolved)
 }
 
 fn edge_row(
@@ -556,7 +621,7 @@ fn edge_row(
                 endpoint,
                 exists,
                 case: case_name(exists, *case_mismatch),
-                outside_root: !path.starts_with(root),
+                outside_root: !is_under_root(path, root),
                 working_directory: if backward {
                     None
                 } else {
@@ -575,7 +640,7 @@ fn edge_row(
                 endpoint,
                 exists,
                 case: case_name(exists, None),
-                outside_root: path.as_deref().is_none_or(|p| !p.starts_with(root)),
+                outside_root: path.as_deref().is_none_or(|p| !is_under_root(p, root)),
                 working_directory: None,
             })
         }
@@ -1363,6 +1428,55 @@ mod tests {
         let report = report(tmp.path(), true);
         let paths: Vec<_> = report.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["a.R"]);
+    }
+
+    /// The containment and portability comparisons, on Windows path text,
+    /// run on every platform: a verbatim root (`\\?\C:\work`, as canonicalize
+    /// gives it) and a path from a file URI (`C:\work\...`) are the same tree.
+    #[test]
+    fn verbatim_root_contains_uri_paths_as_windows_text() {
+        let root = r"\\?\C:\work";
+        assert!(windows_is_under(r"C:\work\R\helper.R", root));
+        assert!(windows_is_under(r"c:\work\helper.R", root));
+        assert!(windows_is_under(r"C:\work", root));
+        assert!(windows_is_under(r"\\?\C:\work\helper.R", r"C:\work"));
+        assert!(!windows_is_under(r"C:\workshop\helper.R", root));
+        assert!(!windows_is_under(r"C:\shared\x.R", root));
+        assert!(!windows_is_under(r"D:\work\helper.R", root));
+        assert!(!windows_is_under(r"C:\Work\helper.R", root));
+        let unc_root = r"\\?\UNC\Server\share\work";
+        assert!(windows_is_under(r"\\server\share\work\a.R", unc_root));
+        assert!(!windows_is_under(r"\\server\other\work\a.R", unc_root));
+
+        assert!(windows_portable("R/helper.R", r"C:\work\R\helper.R", root));
+        assert!(windows_portable(r"R\helper.R", r"C:\work\R\helper.R", root));
+        assert!(windows_portable("./helper.R", r"C:\work\helper.R", root));
+        assert!(windows_portable(
+            "../work/helper.R",
+            r"C:\work\helper.R",
+            root
+        ));
+        assert!(!windows_portable("r/helper.R", r"C:\work\R\helper.R", root));
+        assert!(!windows_portable("helper.R", r"C:\work\R\helper.R", root));
+        assert!(!windows_portable(r"\helper.R", r"C:\work\helper.R", root));
+        assert!(!windows_portable("../shared/x.R", r"C:\work\x.R", root));
+    }
+
+    /// An ordinary in-workspace edge is inside the root and portable from it,
+    /// on every platform. On Windows the canonical root has the verbatim
+    /// prefix and the resolved path doesn't; the Windows CI job runs this
+    /// (it runs the `verbatim_root` tests).
+    #[test]
+    fn verbatim_root_in_workspace_edge_is_inside_and_portable() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "main.R", "source(\"R/helper.R\")\n");
+        write(tmp.path(), "R/helper.R", "h <- 1\n");
+        let report = report(tmp.path(), true);
+        let row = edge(&report, "main.R", "R/helper.R", 0);
+        let resolution = row.resolution.as_ref().unwrap();
+        assert!(resolution.exists);
+        assert!(!resolution.outside_root);
+        assert_eq!(row.portable_from_root, Some(true));
     }
 
     /// An oversized file has no stored text, so `syntax_errors` rereads it.
