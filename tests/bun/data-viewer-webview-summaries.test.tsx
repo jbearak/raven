@@ -414,6 +414,31 @@ describe('non-finite filter values over the JSON transport', () => {
         expect(Date.parse(far.value)).toBe(2_932_897 * 86_400_000);
     });
 
+    test('a Value counts pick holding a comma survives editing only Include missing', async () => {
+        const { FilterPopover } = await import('../../editors/vscode/src/data-viewer/webview/filter-popover');
+        const col = { name: 'who', arrowType: 'Utf8', dictionaryShipped: false, isInteger: false } as any;
+        const picked = setFilterFor(col, 'character', [{ value: 'Smith, Jane', count: 1, error: 0 }] as any, true)!;
+        expect(picked).toEqual({ kind: 'setIn', values: ['Smith, Jane'] });
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+        const root = createRoot(container);
+        roots.push(root);
+        const applied: any[] = [];
+        act(() => {
+            root.render(<FilterPopover column={col} columnIndex={0} anchor={{ leftPx: 0, topPx: 0 }}
+                initial={{ id: 'f', columnIndex: 0, predicate: picked, enabled: true, includeMissing: false }}
+                onApply={e => { applied.push(e); }} onCancel={() => {}} />);
+        });
+        const props = (el: Element): any => Object.entries(el).find(([k]) => k.startsWith('__reactProps$'))![1];
+        const missing = document.querySelector('.filter-popover-missing-row input') as HTMLInputElement;
+        act(() => { props(missing).onChange({ target: { checked: true } }); });
+        const apply = [...document.querySelectorAll('.filter-popover-footer button')].find(b => b.textContent === 'Apply') as HTMLButtonElement;
+        act(() => { apply.click(); });
+        expect(applied).toHaveLength(1);
+        expect(applied[0].predicate).toEqual({ kind: 'setIn', values: ['Smith, Jane'] });
+        expect(applied[0].includeMissing).toBe(true);
+    });
+
     test('pure: a labelled column\'s Inf pick builds a filter with Inf', () => {
         const col = { name: 'x', arrowType: 'Float64', dictionaryShipped: false, isInteger: false, valueLabels: { 5: 'five' } };
         const p = setFilterFor(col as any, 'labelled', [{ value: Infinity, count: 1, error: 0 }] as any, true);
