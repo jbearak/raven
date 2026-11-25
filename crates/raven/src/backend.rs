@@ -13290,8 +13290,13 @@ fn commit_open_metadata_reenrichment(
         // trigger (the text and version are unchanged), so it could consume
         // that marker first and leave the new one gated out. This commit
         // holds the publish lock, and workers re-check cancellation under it
-        // before consuming, so cancelling here retires them.
+        // before consuming, so cancelling here retires them. The direct
+        // publisher has no token to cancel; advancing the refresh generation
+        // it captured with its snapshot retires it the same way.
         state.cross_file_revalidation.cancel(&uri);
+        state
+            .diagnostics_gate
+            .advance_metadata_refresh_generation(&uri);
         state.diagnostics_gate.ensure_force_republish(&uri);
     }
     Ok(effects.revalidations)
@@ -24931,7 +24936,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // Phase 1: brief read lock — gate check, build the diagnostics
     // snapshot, capture inputs for the off-lock work. NO scope
     // resolution or other heavy work happens inside this scope.
-    let (trigger, snapshot, coherence_generation) = {
+    let (trigger, metadata_refresh_generation, snapshot, coherence_generation) = {
         let state = state_arc.read().await;
         // Full trigger capture (version + revision + epoch + config
         // generation): the direct path has no cancellation token, so the
@@ -24939,6 +24944,9 @@ pub(crate) async fn publish_diagnostics_inner(
         // against a lifecycle reuse (close+reopen), a same-version edit, or a
         // configuration reload racing the off-lock compute below.
         let trigger = DiagnosticsTrigger::capture(&state, uri);
+        // A metadata refresh changes none of the trigger's fields; see
+        // `CrossFileDiagnosticsGate::metadata_refresh_generation`.
+        let metadata_refresh_generation = state.diagnostics_gate.metadata_refresh_generation(uri);
 
         if !state.diagnostics_publish_allowed(uri) {
             log::trace!(
@@ -24994,7 +25002,12 @@ pub(crate) async fn publish_diagnostics_inner(
 
         let coherence_generation = state.diagnostics_coherence.generation();
 
-        (trigger, snapshot, coherence_generation)
+        (
+            trigger,
+            metadata_refresh_generation,
+            snapshot,
+            coherence_generation,
+        )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
 
@@ -25066,6 +25079,16 @@ pub(crate) async fn publish_diagnostics_inner(
                 uri
             );
             (state.documents.contains_key(uri), coherence_deferred)
+        } else if state.diagnostics_gate.metadata_refresh_generation(uri)
+            != metadata_refresh_generation
+        {
+            // The refresh's own ticket republishes from the new metadata and
+            // owns the force marker; leave both to it.
+            log::trace!(
+                "Skipping diagnostics for {}: metadata refreshed after snapshot",
+                uri
+            );
+            return;
         } else if !trigger.commit_publish(&state.diagnostics_gate, uri) {
             log::trace!(
                 "Skipping diagnostics for {}: gate refused after async (version={:?})",
@@ -39664,122 +39687,427 @@ mod project_config_initialize_tests {
     }
 
     async fn an_open_file_follows_its_parent_changing_directory_with(child_text: &str) {
-        use futures_util::StreamExt;
-        use tower::{Service, ServiceExt};
-        use tower_lsp::jsonrpc::Request;
+        let fixture = ParentDirectoryFixture::open(child_text).await;
+        let backend = fixture.backend();
 
-        let tmp = TempDir::new().unwrap();
-        let base = fs::canonicalize(tmp.path()).unwrap();
-        for dir in ["lib", "lib2", "scripts"] {
-            fs::create_dir_all(base.join(dir)).unwrap();
+        change_doc(backend, &fixture.main_uri, 2, &fixture.main_text("lib2")).await;
+        fixture.until(false, "util.R resolves from lib2/").await;
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("lib2")));
+
+        // Closing the unsaved parent reverts it to its file (`cd lib`).
+        close_doc(backend, &fixture.main_uri).await;
+        fixture
+            .until(true, "util.R is missing again once the parent closes")
+            .await;
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
+    }
+
+    /// `main.R` (`# raven: cd lib`) sources `scripts/child.R`, whose
+    /// `source("util.R")` resolves only from `lib2/`. Both are open, the
+    /// child's missing-file diagnostic has been published, and the workers
+    /// the opens scheduled have finished, so a later publish for the child
+    /// can only come from what the test does next.
+    struct ParentDirectoryFixture {
+        svc: tower_lsp::LspService<Backend>,
+        _tmp: TempDir,
+        base: std::path::PathBuf,
+        child_text: String,
+        main_uri: Url,
+        child_uri: Url,
+        /// Each diagnostics publish for the child since the last
+        /// [`Self::forget_published`], in order: `true` when it reports
+        /// `util.R` missing.
+        published: Arc<std::sync::Mutex<Vec<bool>>>,
+        collector: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ParentDirectoryFixture {
+        fn drop(&mut self) {
+            self.collector.abort();
         }
-        let main_text = |dir: &str| format!("# raven: cd {dir}\nsource(\"../scripts/child.R\")\n");
-        fs::write(base.join("main.R"), main_text("lib")).unwrap();
-        fs::write(base.join("scripts/child.R"), child_text).unwrap();
-        fs::write(base.join("lib2/util.R"), "f <- function() 1\n").unwrap();
-        let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
-        let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+    }
 
-        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
-        // The latest diagnostics published for the child: `Some(true)` while
-        // they report `util.R` missing.
-        let missing = Arc::new(std::sync::Mutex::new(None::<bool>));
-        let collector = {
-            let missing = missing.clone();
-            let child_uri = child_uri.clone();
-            tokio::spawn(async move {
-                while let Some(message) = socket.next().await {
-                    if message.method() != "textDocument/publishDiagnostics" {
-                        continue;
-                    }
-                    let params: PublishDiagnosticsParams =
-                        serde_json::from_value(message.params().unwrap().clone()).unwrap();
-                    if params.uri == child_uri {
-                        *missing.lock().unwrap() = Some(
-                            params
-                                .diagnostics
-                                .iter()
-                                .any(|diagnostic| diagnostic.message.contains("util.R")),
-                        );
-                    }
-                }
-            })
-        };
-        let initialize = Request::build("initialize")
-            .id(1)
-            .params(
-                serde_json::to_value(InitializeParams {
-                    workspace_folders: Some(vec![WorkspaceFolder {
-                        uri: Url::from_file_path(&base).unwrap(),
-                        name: "t".into(),
-                    }]),
-                    initialization_options: Some(serde_json::json!({
-                        "crossFile": { "indexWorkspace": false },
-                        "packages": { "enabled": false },
-                        "diagnosticUris": [main_uri.to_string(), child_uri.to_string()]
-                    })),
-                    ..Default::default()
-                })
-                .unwrap(),
-            )
-            .finish();
-        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
-        assert!(response.is_some_and(|response| response.is_ok()));
-        let backend = svc.inner();
-        backend.state.write().await.workspace_scan_complete = true;
-        open_doc(backend, &main_uri, "r", 1, &main_text("lib")).await;
-        open_doc(backend, &child_uri, "r", 1, child_text).await;
-        let inherited = |state: &WorldState| {
-            state
-                .get_enriched_metadata(&child_uri)
-                .and_then(|meta| meta.inherited_working_directory.clone())
-        };
-        let lib = |dir: &str| base.join(dir).to_string_lossy().into_owned();
-        let until = |want: bool, what: &'static str| {
-            let missing = missing.clone();
-            async move {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                loop {
-                    let now = *missing.lock().unwrap();
-                    if now == Some(want) {
-                        return;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "{child_text:?}: {what}, latest {now:?}"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+    impl ParentDirectoryFixture {
+        async fn open(child_text: &str) -> Self {
+            use futures_util::StreamExt;
+            use tower::{Service, ServiceExt};
+            use tower_lsp::jsonrpc::Request;
+
+            let tmp = TempDir::new().unwrap();
+            let base = fs::canonicalize(tmp.path()).unwrap();
+            for dir in ["lib", "lib2", "scripts"] {
+                fs::create_dir_all(base.join(dir)).unwrap();
             }
+            let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
+            let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+
+            let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+            let published = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let collector = {
+                let published = published.clone();
+                let child_uri = child_uri.clone();
+                tokio::spawn(async move {
+                    while let Some(message) = socket.next().await {
+                        if message.method() != "textDocument/publishDiagnostics" {
+                            continue;
+                        }
+                        let params: PublishDiagnosticsParams =
+                            serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                        if params.uri == child_uri {
+                            published.lock().unwrap().push(
+                                params
+                                    .diagnostics
+                                    .iter()
+                                    .any(|diagnostic| diagnostic.message.contains("util.R")),
+                            );
+                        }
+                    }
+                })
+            };
+            let main_text = |dir: &str| Self::main_text_for(dir);
+            fs::write(base.join("main.R"), main_text("lib")).unwrap();
+            fs::write(base.join("scripts/child.R"), child_text).unwrap();
+            fs::write(base.join("lib2/util.R"), "f <- function() 1\n").unwrap();
+
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        workspace_folders: Some(vec![WorkspaceFolder {
+                            uri: Url::from_file_path(&base).unwrap(),
+                            name: "t".into(),
+                        }]),
+                        initialization_options: Some(serde_json::json!({
+                            "crossFile": { "indexWorkspace": false },
+                            "packages": { "enabled": false },
+                            "diagnosticUris": [main_uri.to_string(), child_uri.to_string()]
+                        })),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let fixture = Self {
+                svc,
+                _tmp: tmp,
+                base,
+                child_text: child_text.to_string(),
+                main_uri,
+                child_uri,
+                published,
+                collector,
+            };
+            let backend = fixture.backend();
+            backend.state.write().await.workspace_scan_complete = true;
+            open_doc(
+                backend,
+                &fixture.main_uri,
+                "r",
+                1,
+                &fixture.main_text("lib"),
+            )
+            .await;
+            open_doc(backend, &fixture.child_uri, "r", 1, child_text).await;
+            fixture
+                .until(true, "util.R must be missing from lib/")
+                .await;
+            fixture.settle().await;
+            assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
+            fixture
+        }
+
+        fn backend(&self) -> &Backend {
+            self.svc.inner()
+        }
+
+        fn main_text_for(dir: &str) -> String {
+            format!("# raven: cd {dir}\nsource(\"../scripts/child.R\")\n")
+        }
+
+        fn main_text(&self, dir: &str) -> String {
+            Self::main_text_for(dir)
+        }
+
+        fn dir(&self, dir: &str) -> String {
+            self.base.join(dir).to_string_lossy().into_owned()
+        }
+
+        /// The child's installed inherited working directory.
+        async fn inherited(&self) -> Option<String> {
+            self.backend()
+                .state
+                .read()
+                .await
+                .get_enriched_metadata(&self.child_uri)
+                .and_then(|meta| meta.inherited_working_directory.clone())
+        }
+
+        /// Outstanding force-republish markers for the child.
+        async fn markers(&self) -> u32 {
+            self.backend()
+                .state
+                .read()
+                .await
+                .diagnostics_gate
+                .force_republish_count_for_test(&self.child_uri)
+        }
+
+        /// The child's publishes since the last [`Self::forget_published`].
+        fn published(&self) -> Vec<bool> {
+            self.published.lock().unwrap().clone()
+        }
+
+        fn forget_published(&self) {
+            self.published.lock().unwrap().clear();
+        }
+
+        /// Wait until the latest diagnostics published for the child report
+        /// `util.R` missing (`want`) or not.
+        async fn until(&self, want: bool, what: &'static str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let now = self.published.lock().unwrap().last().copied();
+                if now == Some(want) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}: {what}, latest {now:?}",
+                    self.child_text
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Wait until no debounced diagnostics worker is pending for the child.
+        async fn settle(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while self
+                .backend()
+                .state
+                .read()
+                .await
+                .cross_file_revalidation
+                .has_pending_for_test(&self.child_uri)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child diagnostics settle"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// A `didSave` of an open child races the refresh of its inherited
+    /// directory (issue #885). The save computes its diagnostics before the
+    /// refresh commits and takes the publish lock after it, while the
+    /// refreshed worker has not published yet. The save's result was computed
+    /// against the replaced metadata, so it must not be sent, and it must
+    /// leave the refresh's force marker for the refreshed worker.
+    #[tokio::test]
+    async fn a_save_computed_before_a_directory_refresh_does_not_take_its_republish() {
+        let fixture = ParentDirectoryFixture::open("source(\"util.R\")\n").await;
+        let backend = fixture.backend();
+        let child_uri = &fixture.child_uri;
+        let bounded = std::time::Duration::from_secs(10);
+
+        // Park the refresh coordinator before its commit, and the edit's own
+        // debounced worker for the child after its compute.
+        let (commit, predecessor) = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.revalidation_debounce_ms = 0;
+            (
+                state
+                    .open_tar_source_refresh_pre_commit_test_pause
+                    .arm(child_uri.clone()),
+                state.diagnostics_test_pause.arm(child_uri.clone()),
+            )
         };
-        until(true, "util.R must be missing from lib/").await;
-        // Let every worker the opens scheduled finish first, so the publish
-        // awaited below can only come from the parent's edit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while backend
+        assert_eq!(fixture.markers().await, 0);
+        // The appended definition changes the parent's interface, so the
+        // edit reserves a same-version republish for the child.
+        let edited = format!("{}new_name <- 1\n", fixture.main_text("lib2"));
+        change_doc(backend, &fixture.main_uri, 2, &edited).await;
+        tokio::time::timeout(bounded, commit.wait_arrived())
+            .await
+            .expect("the refresh reaches its commit");
+        tokio::time::timeout(bounded, predecessor.wait_arrived())
+            .await
+            .expect("the edit's worker computes");
+        assert_eq!(fixture.markers().await, 1);
+
+        // The save computes against `lib/` and parks before the publish lock.
+        let save_pause = backend
             .state
             .read()
             .await
-            .cross_file_revalidation
-            .has_pending_for_test(&child_uri)
+            .diagnostics_test_pause
+            .arm(child_uri.clone());
+        let save = {
+            let backend = backend.clone();
+            let uri = child_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_save(DidSaveTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        text: None,
+                    })
+                    .await;
+            })
+        };
+        tokio::time::timeout(bounded, save_pause.wait_arrived())
+            .await
+            .expect("the save computes before the refresh commits");
+
+        // The refresh commits; its worker computes against `lib2/` and parks.
+        let refreshed = backend
+            .state
+            .read()
+            .await
+            .diagnostics_test_pause
+            .arm(child_uri.clone());
+        commit.release();
+        tokio::time::timeout(bounded, refreshed.wait_arrived())
+            .await
+            .expect("the refreshed worker computes");
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("lib2")));
+        predecessor.release();
+
+        // The save takes the publish lock first.
+        fixture.forget_published();
+        save_pause.release();
+        tokio::time::timeout(bounded, save).await.unwrap().unwrap();
+        assert_eq!(
+            fixture.markers().await,
+            1,
+            "the save must leave the refresh's marker for the refreshed worker"
+        );
+
+        refreshed.release();
+        fixture.until(false, "util.R resolves from lib2/").await;
+        fixture.settle().await;
+        assert_eq!(fixture.markers().await, 0);
+        assert_eq!(
+            fixture.published(),
+            [false],
+            "only the refreshed worker's diagnostics reach the client"
+        );
+    }
+
+    /// The refresh fence above retires only direct publishes that cross a
+    /// committed refresh of their own document. A save parked across another
+    /// document's refresh, or across a replacement of its own metadata that
+    /// is not a refresh (as the workspace scan, open-document replay and
+    /// `system.file` routing make), still publishes and consumes its marker.
+    #[tokio::test]
+    async fn a_parked_save_survives_metadata_replacements_that_are_not_its_refresh() {
+        let fixture = ParentDirectoryFixture::open("source(\"util.R\")\n").await;
+        let backend = fixture.backend();
+        let child_uri = &fixture.child_uri;
+        let bounded = std::time::Duration::from_secs(10);
+
+        // A same-version publish needs a marker to pass the monotonic gate.
+        let save_pause = {
+            let state = backend.state.read().await;
+            state.diagnostics_gate.mark_force_republish(child_uri);
+            state.diagnostics_test_pause.arm(child_uri.clone())
+        };
+        fixture.forget_published();
+        let save = {
+            let backend = backend.clone();
+            let uri = child_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_save(DidSaveTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        text: None,
+                    })
+                    .await;
+            })
+        };
+        tokio::time::timeout(bounded, save_pause.wait_arrived())
+            .await
+            .expect("the save computes");
+
         {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "open diagnostics settle"
+            let mut state = backend.state.write().await;
+            let before = state
+                .diagnostics_gate
+                .metadata_refresh_generation(child_uri);
+            // The parent's refresh commits.
+            let generation = state
+                .documents
+                .get_record(&fixture.main_uri)
+                .unwrap()
+                .generation();
+            let captured = state
+                .capture_open_metadata_derivation(&fixture.main_uri, generation)
+                .unwrap();
+            let derived = derive_open_metadata_reenrichment(&captured);
+            let tickets =
+                commit_open_metadata_reenrichment(&mut state, captured, derived, &[]).unwrap();
+            assert!(tickets.iter().any(|ticket| ticket.uri == fixture.main_uri));
+            // The child's own metadata record is replaced outside a refresh.
+            let record = state.documents.get_record(child_uri).unwrap();
+            let (generation, metadata) = (record.generation(), record.metadata().clone());
+            let replaced = state
+                .replace_open_document_metadata_if_current(child_uri, generation, metadata)
+                .unwrap();
+            assert_ne!(replaced.generation(), generation);
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .metadata_refresh_generation(child_uri),
+                before
             );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
 
-        change_doc(backend, &main_uri, 2, &main_text("lib2")).await;
-        until(false, "util.R resolves from lib2/").await;
-        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib2")));
+        save_pause.release();
+        tokio::time::timeout(bounded, save).await.unwrap().unwrap();
+        fixture.until(true, "the parked save still publishes").await;
+        assert_eq!(fixture.markers().await, 0);
+    }
 
-        // Closing the unsaved parent reverts it to its file (`cd lib`).
-        close_doc(backend, &main_uri).await;
-        until(true, "util.R is missing again once the parent closes").await;
-        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
-        collector.abort();
+    /// A save that starts after a refresh of its document committed captures
+    /// the advanced generation, so it publishes.
+    #[tokio::test]
+    async fn a_save_started_after_a_directory_refresh_publishes() {
+        let fixture = ParentDirectoryFixture::open("source(\"util.R\")\n").await;
+        let backend = fixture.backend();
+        let child_uri = &fixture.child_uri;
+
+        {
+            let mut state = backend.state.write().await;
+            let generation = state.documents.get_record(child_uri).unwrap().generation();
+            let captured = state
+                .capture_open_metadata_derivation(child_uri, generation)
+                .unwrap();
+            let derived = derive_open_metadata_reenrichment(&captured);
+            let tickets =
+                commit_open_metadata_reenrichment(&mut state, captured, derived, &[]).unwrap();
+            assert!(tickets.iter().any(|ticket| ticket.uri == *child_uri));
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .metadata_refresh_generation(child_uri),
+                Some(1)
+            );
+        }
+        assert_eq!(fixture.markers().await, 1);
+        fixture.forget_published();
+        backend
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: child_uri.clone(),
+                },
+                text: None,
+            })
+            .await;
+        fixture.until(true, "the later save publishes").await;
+        assert_eq!(fixture.markers().await, 0);
     }
 
     /// A self-contained file indexed on demand through a caller with a
