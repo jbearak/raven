@@ -1034,6 +1034,13 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) did_open_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// How many didOpen install attempts reached their commit while holding
+    /// the state write lock from capture.
+    #[cfg(test)]
+    pub(crate) did_open_locked_attempts_for_test: usize,
+    /// The same count for didClose.
+    #[cfg(test)]
+    pub(crate) did_close_locked_attempts_for_test: usize,
     /// Deterministic barriers around the OpenClose central CAS and empty
     /// publication while the diagnostics publish lock is held.
     #[cfg(test)]
@@ -1773,7 +1780,7 @@ pub(crate) struct OpenInstallIntentToken {
     uri: Url,
     generation: u64,
     /// Target slot identity at arrival. Unlike unrelated context authorities,
-    /// this is never rebased across the one permitted retry.
+    /// this is never rebased across a retry.
     target: OpenRecordToken,
 }
 
@@ -1801,8 +1808,10 @@ struct OpenInstallSubjectBasis {
 pub(crate) struct OpenCloseIntentToken {
     uri: Url,
     generation: u64,
-    /// Arrival-time record identity. Retries may refresh ancillary context but
-    /// must never rebase onto an edit, metadata replacement, or reopen.
+    /// Record identity the close targets. Retries may refresh ancillary
+    /// context but must never rebase onto an edit or a reopen. A background
+    /// replacement of the same document is followed, through
+    /// [`WorldState::follow_open_close_target`].
     target: OpenRecordToken,
 }
 
@@ -7616,6 +7625,10 @@ impl WorldState {
             did_open_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            did_open_locked_attempts_for_test: 0,
+            #[cfg(test)]
+            did_close_locked_attempts_for_test: 0,
+            #[cfg(test)]
             did_close_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -8024,6 +8037,14 @@ impl WorldState {
             == Some(&OpenInstallIntentState::Pending(token.generation))
     }
 
+    /// Whether the slot `token` targeted on arrival is unchanged. An edit or a
+    /// metadata replacement of an already-open record moves it without
+    /// touching the pending intent. An install whose target moved can never
+    /// commit, so its caller must stop instead of deriving again.
+    pub(crate) fn open_install_target_is_current(&self, token: &OpenInstallIntentToken) -> bool {
+        self.documents.record_token_is_current(&token.target)
+    }
+
     /// Invalidate every pending install for `uri`, including while absent.
     pub(crate) fn cancel_open_install_intent(&mut self, uri: &Url) {
         let generation = Self::mint_open_install_intent_generation();
@@ -8078,6 +8099,28 @@ impl WorldState {
         self.open_close_intents.get(token.uri())
             == Some(&OpenCloseIntentState::Pending(token.generation))
             && self.documents.record_token_is_current(&token.target)
+    }
+
+    /// Re-point a still-pending close at the record now in its slot, if that
+    /// record holds the editor document the close arrived for.
+    ///
+    /// Background work replaces an open record without the editor taking
+    /// part: a metadata refresh after a workspace scan or a dependency
+    /// change, or a diagnostics-lifecycle change. The editor has closed the
+    /// document either way, so the close follows the record. Treating the
+    /// replacement as superseding the close dropped it, and the server kept a
+    /// closed tab open (issue #897). An edit changes the revision and is not
+    /// followed, and a reopen or a newer close ends the pending intent.
+    pub(crate) fn follow_open_close_target(&self, token: &mut OpenCloseIntentToken) {
+        if self.open_close_intents.get(token.uri())
+            != Some(&OpenCloseIntentState::Pending(token.generation))
+        {
+            return;
+        }
+        let current = self.documents.record_token(token.uri());
+        if current.holds_same_document_as(&token.target) {
+            token.target = current;
+        }
     }
 
     #[cfg(test)]
