@@ -39702,11 +39702,13 @@ mod project_config_initialize_tests {
         assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
     }
 
-    /// `main.R` (`# raven: cd lib`) sources `scripts/child.R`, whose
-    /// `source("util.R")` resolves only from `lib2/`. Both are open, the
-    /// child's missing-file diagnostic has been published, and the workers
-    /// the opens scheduled have finished, so a later publish for the child
-    /// can only come from what the test does next.
+    /// An open parent and an open child whose `source("util.R")` does not
+    /// resolve yet. The child's missing-file diagnostic has been published
+    /// and the workers the opens scheduled have finished, so a later publish
+    /// for the child can only come from what the test does next.
+    ///
+    /// [`Self::open`] builds the usual pair: `main.R` (`# raven: cd lib`)
+    /// sources `scripts/child.R`, and `util.R` exists only in `lib2/`.
     struct ParentDirectoryFixture {
         svc: tower_lsp::LspService<Backend>,
         _tmp: TempDir,
@@ -39729,17 +39731,43 @@ mod project_config_initialize_tests {
 
     impl ParentDirectoryFixture {
         async fn open(child_text: &str) -> Self {
+            let fixture = Self::open_files(
+                ("main.R", &Self::main_text_for("lib")),
+                ("scripts/child.R", child_text),
+                &["lib/", "lib2/util.R"],
+            )
+            .await;
+            assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
+            fixture
+        }
+
+        /// Open `parent` and `child` (each a relative path and its text) in
+        /// a workspace that also holds `others`: a directory when the path
+        /// ends in `/`, else a file defining `f`.
+        async fn open_files(parent: (&str, &str), child: (&str, &str), others: &[&str]) -> Self {
             use futures_util::StreamExt;
             use tower::{Service, ServiceExt};
             use tower_lsp::jsonrpc::Request;
 
             let tmp = TempDir::new().unwrap();
             let base = fs::canonicalize(tmp.path()).unwrap();
-            for dir in ["lib", "lib2", "scripts"] {
-                fs::create_dir_all(base.join(dir)).unwrap();
+            let (main_path, child_path) = (base.join(parent.0), base.join(child.0));
+            let child_text = child.1;
+            let write = |path: &std::path::Path, text: &str| {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            };
+            write(&main_path, parent.1);
+            write(&child_path, child_text);
+            for other in others {
+                if other.ends_with('/') {
+                    fs::create_dir_all(base.join(other)).unwrap();
+                } else {
+                    write(&base.join(other), "f <- function() 1\n");
+                }
             }
-            let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
-            let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+            let main_uri = Url::from_file_path(&main_path).unwrap();
+            let child_uri = Url::from_file_path(&child_path).unwrap();
 
             let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
             let published = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -39764,11 +39792,6 @@ mod project_config_initialize_tests {
                     }
                 })
             };
-            let main_text = |dir: &str| Self::main_text_for(dir);
-            fs::write(base.join("main.R"), main_text("lib")).unwrap();
-            fs::write(base.join("scripts/child.R"), child_text).unwrap();
-            fs::write(base.join("lib2/util.R"), "f <- function() 1\n").unwrap();
-
             let initialize = Request::build("initialize")
                 .id(1)
                 .params(
@@ -39801,20 +39824,10 @@ mod project_config_initialize_tests {
             };
             let backend = fixture.backend();
             backend.state.write().await.workspace_scan_complete = true;
-            open_doc(
-                backend,
-                &fixture.main_uri,
-                "r",
-                1,
-                &fixture.main_text("lib"),
-            )
-            .await;
+            open_doc(backend, &fixture.main_uri, "r", 1, parent.1).await;
             open_doc(backend, &fixture.child_uri, "r", 1, child_text).await;
-            fixture
-                .until(true, "util.R must be missing from lib/")
-                .await;
+            fixture.until(true, "util.R must be missing at first").await;
             fixture.settle().await;
-            assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
             fixture
         }
 
@@ -39899,6 +39912,36 @@ mod project_config_initialize_tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
+    }
+
+    /// An active Shiny app runs the files it `source()`s in its application
+    /// directory (issue #885). When the open `app.R` starts sourcing an open
+    /// file, that file takes the directory and its `source("util.R")`
+    /// resolves from it; when the app stops, the file loses it again. Neither
+    /// needs an edit to the sourced file.
+    #[tokio::test]
+    async fn an_open_file_follows_a_shiny_app_that_starts_and_stops_sourcing_it() {
+        let fixture = ParentDirectoryFixture::open_files(
+            ("demo/app.R", "a <- 1\n"),
+            ("demo/sub/child.R", "source(\"util.R\")\n"),
+            &["demo/util.R"],
+        )
+        .await;
+        let backend = fixture.backend();
+        assert_eq!(fixture.inherited().await, None);
+
+        let sourcing = "a <- 1\nsource(\"sub/child.R\")\n";
+        change_doc(backend, &fixture.main_uri, 2, sourcing).await;
+        fixture
+            .until(false, "util.R resolves from the app directory")
+            .await;
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("demo")));
+
+        change_doc(backend, &fixture.main_uri, 3, "a <- 1\n").await;
+        fixture
+            .until(true, "util.R is missing once the app stops sourcing")
+            .await;
+        assert_eq!(fixture.inherited().await, None);
     }
 
     /// A `didSave` of an open child races the refresh of its inherited

@@ -12584,6 +12584,13 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 /// call, which runs the child in its own directory. A parent that proposes
 /// nothing (no `cd` in effect, no `chdir = TRUE`) gives an empty set.
 ///
+/// The directory is the first of the parent's explicit `# raven: cd`, its
+/// Shiny application directory, and its inherited directory, the order
+/// [`PathContext::from_metadata`](crate::cross_file::path_resolve::PathContext::from_metadata)
+/// applies them in. The values are compared as stored, without resolving
+/// them: this runs under the `WorldState` write lock, and two spellings of
+/// one directory only cost a refresh that changes nothing.
+///
 /// A commit re-derives the open children whose proposal changed between the
 /// parent's old and new sets, whether because the directory it runs them in
 /// changed or because it started or stopped sourcing them.
@@ -12603,6 +12610,7 @@ fn forward_child_proposals(
         metadata
             .working_directory
             .clone()
+            .or_else(|| metadata.application_working_directory.clone())
             .or_else(|| metadata.inherited_working_directory.clone())
     });
     children
@@ -16751,6 +16759,50 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 .inherited_working_directory,
             None,
             "nothing sources old.R once the batch lists wd/members"
+        );
+    }
+
+    /// The proposal comparison reads a parent's directory in the order path
+    /// resolution applies it: an explicit `cd`, then the Shiny application
+    /// directory, then an inherited one (issue #885). A change the
+    /// application directory masks is no change, and a `chdir = TRUE` call
+    /// proposes the child's own directory whatever the parent's is.
+    #[test]
+    fn forward_child_proposals_follow_path_resolution_precedence() {
+        let child = Url::parse("file:///w/demo/sub/child.R").unwrap();
+        let metadata = |cd: Option<&str>, app: Option<&str>, inherited: Option<&str>| {
+            crate::cross_file::CrossFileMetadata {
+                working_directory: cd.map(str::to_string),
+                application_working_directory: app.map(str::to_string),
+                inherited_working_directory: inherited.map(str::to_string),
+                ..Default::default()
+            }
+        };
+        let proposed = |chdir: bool, metadata: &crate::cross_file::CrossFileMetadata| {
+            forward_child_proposals(vec![(child.clone(), chdir)], Some(metadata))
+                .into_iter()
+                .map(|(_, proposal)| proposal)
+                .collect::<Vec<_>>()
+        };
+        let dir = |dir: &str| vec![Some(dir.to_string())];
+
+        assert!(proposed(false, &metadata(None, None, None)).is_empty());
+        assert_eq!(
+            proposed(false, &metadata(None, Some("/w/demo"), None)),
+            dir("/w/demo")
+        );
+        assert_eq!(
+            proposed(false, &metadata(None, Some("/w/demo"), Some("/w/a"))),
+            proposed(false, &metadata(None, Some("/w/demo"), Some("/w/b"))),
+            "the application directory masks the inherited one"
+        );
+        assert_eq!(
+            proposed(false, &metadata(Some("lib"), Some("/w/demo"), None)),
+            dir("lib")
+        );
+        assert_eq!(
+            proposed(true, &metadata(None, Some("/w/demo"), None)),
+            vec![None]
         );
     }
 
