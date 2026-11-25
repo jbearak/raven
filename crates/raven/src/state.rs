@@ -13722,8 +13722,19 @@ fn collect_files_matching_inner(
 
         // `is_dir()` follows symlinks, so a symlink to a directory is walked
         // (after the cycle check) and a symlink to a file falls through to the
-        // `accept` branch.
-        if path.is_dir() {
+        // `accept` branch. A directory that lists its names but denies access
+        // to them (mode 0400) can't say which are directories, so that is a
+        // walk error too; a dangling symlink (not found) is just no directory.
+        let is_dir = match fs::metadata(&path) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    errors.push((path.clone(), error));
+                }
+                false
+            }
+        };
+        if is_dir {
             // Cheap first pass: prune by the entry name (a real `node_modules`,
             // `.git`, … — no canonicalize needed for the common case).
             if path

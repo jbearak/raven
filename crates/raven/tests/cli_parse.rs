@@ -102,29 +102,33 @@ fn workspace_mode_prints_only_the_workspace_files() {
     assert_eq!(paths(&documents(&output)), ["child.R", "main.R"]);
 }
 
-/// A directory that can't be listed hides files that should have been
-/// printed: the rest are still printed, and the run is an operator error.
+/// A directory that can't be listed (mode 0000), or whose entries can't be
+/// examined (mode 0400: names but not whether each is a directory), hides
+/// files that should have been printed: the rest are still printed, and the
+/// run is an operator error.
 #[cfg(unix)]
 #[test]
 fn unlistable_directory_is_an_operator_error() {
     use std::os::unix::fs::PermissionsExt as _;
-    let (_tmp, ws) = workspace();
-    write(&ws, "top.R", b"x <- 1\n");
-    write(&ws, "locked/a.R", b"y <- 1\n");
-    let locked = ws.join("locked");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    if std::fs::read_dir(&locked).is_ok() {
-        // Running as root: permissions don't stop the listing.
+    for mode in [0o000, 0o400] {
+        let (_tmp, ws) = workspace();
+        write(&ws, "top.R", b"x <- 1\n");
+        write(&ws, "locked/sub/a.R", b"y <- 1\n");
+        let locked = ws.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap();
+        if std::fs::metadata(locked.join("sub")).is_ok() {
+            // Running as root: permissions don't stop the walk.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let outputs = [parse_in(&ws, &["locked"]), parse_in(&ws, &[])];
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        return;
-    }
-    let outputs = [parse_in(&ws, &["locked"]), parse_in(&ws, &[])];
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    for (output, printed) in outputs.iter().zip([&[][..], &["top.R"][..]]) {
-        assert_eq!(output.status.code(), Some(2), "{output:?}");
-        assert_eq!(paths(&documents(output)), printed);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("raven parse: cannot read dir"), "{stderr}");
+        for (output, printed) in outputs.iter().zip([&[][..], &["top.R"][..]]) {
+            assert_eq!(output.status.code(), Some(2), "{mode:o}: {output:?}");
+            assert_eq!(paths(&documents(output)), printed, "{mode:o}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("raven parse: cannot read dir"), "{stderr}");
+        }
     }
 }
 
