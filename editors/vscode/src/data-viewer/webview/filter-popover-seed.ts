@@ -135,7 +135,7 @@ export function seedFromEntry(p: FilterPredicate, int64 = false): FormState {
  *  shortest spelling that reads back as the same double
  *  (`1000000000000000100` for 1000000000000000128), which {@link parseBound}
  *  would then take for a different exact integer. */
-function boundText(b: NumBound, int64: boolean): string {
+export function boundText(b: NumBound, int64: boolean): string {
     return int64 && typeof b === 'number' && Number.isInteger(b) ? BigInt(b).toString() : String(b);
 }
 

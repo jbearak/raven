@@ -352,9 +352,11 @@ async function acceptorFor(
         const t = schema.arrowType;
         const isNumericLabelled = !isFactor && hasValueLabels
             && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
-        if (isNumericLabelled && isInt64Type(t)) {
-            // Int64/UInt64: exact, on the decimal text (Value Counts counts
-            // on the bigint and sends values a double can't hold as text).
+        if (isInt64Type(t)) {
+            // Int64/UInt64, labelled or not: exact, on the integer each
+            // value names (Value Counts counts on the bigint and sends
+            // values a double can't hold as text; a value edited to
+            // `007` is 7, as in the code Copy as R code writes).
             const want = new Set(predicate.values.map(int64SetKey).filter(k => k !== undefined));
             const values = await loadString(reader, columnIndex, signal);
             return predicate.kind === 'setIn'

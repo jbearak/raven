@@ -17,39 +17,6 @@ g.MessageEvent = dom.window.MessageEvent;
 g.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
 g.IS_REACT_ACT_ENVIRONMENT = true;
 
-class ResizeObserverStub {
-    constructor(private readonly callback: ResizeObserverCallback) {}
-    observe(target: Element) {
-        this.callback([{ target, contentRect: { width: 800, height: 500 } as DOMRectReadOnly }] as ResizeObserverEntry[], this as unknown as ResizeObserver);
-    }
-    unobserve() {}
-    disconnect() {}
-}
-g.ResizeObserver = ResizeObserverStub;
-(dom.window as unknown as { ResizeObserver: typeof ResizeObserverStub }).ResizeObserver = ResizeObserverStub;
-
-const canvasContext = new Proxy({
-    canvas: undefined,
-    measureText: (text: string) => ({ width: String(text).length * 8 }),
-    createLinearGradient: () => ({ addColorStop: () => undefined }),
-    getImageData: () => ({ data: new Uint8ClampedArray(4) }),
-}, {
-    get(target, prop) {
-        if (prop in target) return target[prop as keyof typeof target];
-        return () => undefined;
-    },
-    set(target, prop, value) {
-        (target as Record<PropertyKey, unknown>)[prop] = value;
-        return true;
-    },
-});
-(dom.window.HTMLCanvasElement.prototype as unknown as {
-    getContext: () => unknown;
-}).getContext = function getContext(this: HTMLCanvasElement) {
-    canvasContext.canvas = this;
-    return canvasContext;
-};
-
 const { FilterPopover } = await import('../../editors/vscode/src/data-viewer/webview/filter-popover');
 const { ValueCountsPopover, formatEntry } = await import('../../editors/vscode/src/data-viewer/webview/value-counts-popover');
 const { entryCell, setFilterFor } = await import('../../editors/vscode/src/data-viewer/webview/summary-model');

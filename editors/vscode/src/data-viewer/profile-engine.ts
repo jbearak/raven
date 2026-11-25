@@ -740,8 +740,15 @@ function labelledLevels(col: ColumnSchema, declared: Map<string, number>): Colum
     const vl = col.valueLabels ?? {};
     const numeric = !col.arrowType.startsWith('Utf8') && !col.arrowType.startsWith('LargeUtf8');
     const keys = Object.keys(vl);
+    // A 64-bit code a double can't hold keeps its digits and its place
+    // among its neighbours (as doubles they tie).
+    const exact = (k: string): bigint | undefined =>
+        (isInt64Type(col.arrowType) && /^-?[0-9]+$/.test(k) && !Number.isSafeInteger(Number(k)) ? BigInt(k) : undefined);
     const ordered = numeric
-        ? keys.map(k => ({ k, v: Number(k) as string | number })).sort((a, b) => (a.v as number) - (b.v as number))
+        ? keys.map(k => ({ k, n: Number(k), big: exact(k) }))
+            .sort((a, b) => a.n - b.n
+                || (a.big !== undefined && b.big !== undefined ? (a.big < b.big ? -1 : a.big > b.big ? 1 : 0) : 0))
+            .map(({ k, n, big }) => ({ k, v: (big !== undefined ? k : n) as string | number }))
         : keys.map(k => ({ k, v: k as string | number }));
     let used = 0;
     for (const { k } of ordered) if ((declared.get(k) ?? 0) > 0) used++;

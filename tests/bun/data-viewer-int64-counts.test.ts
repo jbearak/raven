@@ -64,7 +64,7 @@ describe('integer64 value counts past the cap count each ID, not its double', ()
             { name: 'id', kind: 'i64', gen: value, fieldMd: { 'raven.type_tag': '<int64>' } },
             {
                 name: 'lab', kind: 'i64', gen: value,
-                fieldMd: { 'raven.type_tag': '<int64>', 'raven.value_labels': JSON.stringify({ [HEAVY_A.toString()]: 'first', [HEAVY_B.toString()]: 'second' }) },
+                fieldMd: { 'raven.type_tag': '<int64>', 'raven.value_labels': JSON.stringify({ [HEAVY_B.toString()]: 'second', [HEAVY_A.toString()]: 'first' }) },
             },
         ],
     });
@@ -109,9 +109,11 @@ describe('integer64 value counts past the cap count each ID, not its double', ()
         expect(profile.top!.values.slice(0, 2).map(e => [e.value, e.label])).toEqual([
             [HEAVY_A.toString(), 'first'], [HEAVY_B.toString(), 'second'],
         ]);
-        // The per-label counts beside it are exact, as before.
-        expect(profile.levels!.counts.map(e => [e.label, e.count])).toEqual([
-            ['first', truth.get(HEAVY_A.toString())!], ['second', truth.get(HEAVY_B.toString())!],
+        // The per-label counts beside it are exact, as before, each with
+        // its own code (as doubles the two codes are one number).
+        expect(profile.levels!.counts.map(e => [e.value, e.label, e.count])).toEqual([
+            [HEAVY_A.toString(), 'first', truth.get(HEAVY_A.toString())!],
+            [HEAVY_B.toString(), 'second', truth.get(HEAVY_B.toString())!],
         ]);
         await r.close();
     });

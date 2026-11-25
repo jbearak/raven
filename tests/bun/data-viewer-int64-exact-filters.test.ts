@@ -150,6 +150,14 @@ describe('integer64 comparison and range filters are exact', () => {
         expect(await rows(2, { kind: 'numCompare', op: '<', value: '-0.5' })).toEqual([]);
     });
 
+    test('a set value on an unlabelled column is the integer it names, as in Copy as R code', async () => {
+        // Edited by hand after a Value counts pick: a leading zero.
+        expect(await rows(0, { kind: 'setIn', values: ['09007199254740993'] })).toEqual([1]);
+        expect(await rows(0, { kind: 'setIn', values: ['9007199254740993', 3] })).toEqual([1, 5]);
+        expect(await rows(0, { kind: 'setNotIn', values: ['-007'] })).toEqual([0, 1, 2, 5]);
+        expect(await rows(0, { kind: 'setIn', values: ['abc', '2.5'] })).toEqual([]);
+    });
+
     test('an unsigned column compares past 2^63', async () => {
         expect(await rows(2, { kind: 'numCompare', op: '>', value: '9223372036854775808' })).toEqual([0]);
         expect(await rows(2, { kind: 'numCompare', op: '=', value: '18446744073709551615' })).toEqual([0]);
@@ -238,6 +246,16 @@ describe('reopening the popover keeps a numeric integer64 bound exact', () => {
         expect(p).toEqual({ kind: 'numCompare', op: '=', value: 1000000000000000128 });
         expect(seedFromEntry(p, true).numCompare.value).toBe('1000000000000000128');
         expect(reapply(p)).toEqual(p);
+        // The chip names the same ID, in comparisons and ranges alike.
+        const big: ColumnSchema = { name: 'big', arrowType: 'Int64', dictionaryShipped: false, isInteger: true };
+        expect(summarizePredicate(p, big)).toBe('big = 1000000000000000128');
+        expect(summarizePredicate({ kind: 'numBetween', lo: -1000000000000000128, hi: 1000000000000000128, inclusive: true }, big))
+            .toBe('big -1000000000000000128–1000000000000000128');
+        expect(summarizePredicate({ kind: 'numNotBetween', lo: 3, hi: 1000000000000000128, inclusive: false }, big))
+            .toBe('big not in (3, 1000000000000000128)');
+        // Another column keeps the double's own spelling.
+        expect(summarizePredicate({ kind: 'numCompare', op: '=', value: 2.5 }, { ...big, arrowType: 'Float64', isInteger: false }))
+            .toBe('big = 2.5');
         const between: FilterPredicate = { kind: 'numBetween', lo: -1000000000000000128, hi: 1e21, inclusive: true };
         expect(seedFromEntry(between, true).numBetween).toEqual({ lo: '-1000000000000000128', hi: '1000000000000000000000', inclusive: true });
         expect(reapply(between)).toEqual(between);
