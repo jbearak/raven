@@ -301,12 +301,17 @@ async function acceptorFor(
             }
             case 'dateBetween': {
                 const lo = bound(predicate.lo), hi = bound(predicate.hi);
+                if (!Number.isFinite(lo) || !Number.isFinite(hi)) return () => false;
                 return predicate.inclusive
                     ? (i) => values[i] >= lo && values[i] <= hi
                     : (i) => values[i] > lo && values[i] < hi;
             }
             case 'dateNotBetween': {
+                // One unparseable bound matches nothing, as in the code
+                // Copy as R code writes; `||` would keep the rows on the
+                // readable bound's side.
                 const lo = bound(predicate.lo), hi = bound(predicate.hi);
+                if (!Number.isFinite(lo) || !Number.isFinite(hi)) return () => false;
                 return predicate.inclusive
                     ? (i) => values[i] < lo || values[i] > hi
                     : (i) => values[i] <= lo || values[i] >= hi;

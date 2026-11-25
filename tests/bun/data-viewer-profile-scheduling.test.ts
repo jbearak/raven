@@ -174,6 +174,13 @@ describe('ProfileScheduler.refresh: a sort made exact quartiles available', () =
         await tick();
         expect(posted).toEqual([]);
         expect(s.cached(0)).toEqual({ state: 'ready', profile: sampled(0) });
+        // Nor while the client is looking at the column.
+        s.setInterest([0]);
+        posted.length = 0;
+        s.refresh(0);
+        runs[2].resolve(sampled(0));
+        await tick();
+        expect(posted).toEqual([]);
     });
 
     test('an exact, failed or unknown profile is left alone', async () => {

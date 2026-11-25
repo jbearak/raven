@@ -340,6 +340,16 @@ describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..0
         expect(Array.from(out!)).toEqual([1, 2, 3]);
         await r.close();
     });
+    test('a range with one unparseable bound is a no-match, as in Copy as R code', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        for (const kind of ['dateBetween', 'dateNotBetween'] as const) {
+            for (const [lo, hi] of [['2024-01-03', 'not-a-date'], ['not-a-date', '2024-01-03']]) {
+                const out = await computeFilteredIndices(r, state([entry('a', 4, { kind, lo, hi, inclusive: true })]), CTX_LABELS_ON);
+                expect([kind, lo, Array.from(out!)]).toEqual([kind, lo, []]);
+            }
+        }
+        await r.close();
+    });
     test('dateCompare != with unparseable date is a no-match (not keep-all)', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         const e = entry('a', 4, { kind: 'dateCompare', op: '!=', value: 'not-a-date' });

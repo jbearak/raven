@@ -139,10 +139,12 @@ export class ProfileScheduler {
         this.started.push(columnIndex);
         void this.run(columnIndex, abort.signal).then(
             profile => {
-                if (refresh) this.stale.delete(columnIndex);
-                // A refresh that is still sampled (the sort key can't give
-                // quartiles) is what the client already shows.
-                this.finish(columnIndex, abort, { state: 'ready', profile }, refresh && profile.quantiles?.exact === true);
+                if (!refresh) return this.finish(columnIndex, abort, { state: 'ready', profile });
+                this.stale.delete(columnIndex);
+                // Still sampled (the sort key can't give quartiles): the
+                // client already shows this, so nothing is replaced.
+                const exact = profile.quantiles?.exact === true;
+                this.finish(columnIndex, abort, exact ? { state: 'ready', profile } : undefined, true);
             },
             err => {
                 if (refresh) {
