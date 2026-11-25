@@ -885,10 +885,14 @@ function sortTerms(ctx: Ctx): SortTerm[] {
                 if (ctx.flavor === 'base') {
                     // Base R's order() reads an integer64 as its raw bits
                     // until bit64 is attached, and then refuses a second
-                    // key; its rank is a double that orders the same,
-                    // NA kept as NA (so last).
+                    // key. Sort by its dense rank instead, NA put back as
+                    // NA (so last). Not rank.integer64(): it aborts R on
+                    // a key that is all NA (bit64 4.8.6).
                     ctx.needs.add('bit64');
-                    terms.push({ expr: `bit64::rank.integer64(${x})`, desc, character: false, bare: false });
+                    terms.push({
+                        expr: `replace(bit64::keypos(${x}), bit64::is.na.integer64(${x}), NA)`,
+                        desc, character: false, bare: false,
+                    });
                     continue;
                 }
                 terms.push({ expr: x, desc, character: false, bare: true });

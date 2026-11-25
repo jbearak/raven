@@ -488,14 +488,16 @@ df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
 // and as a second key with the other direction. Base R's order() reads an
 // integer64 as its raw bits until bit64 is attached, and once it is
 // attached refuses more than one key; the base R code sorts by
-// bit64::rank.integer64() instead.
-const I64_SORT_FRAME = `df <- data.frame(id = 1:6, g = c(1L, 2L, 1L, 2L, 1L, 2L))
-df$big <- bit64::as.integer64(c("-1", "5", "-3", "9007199254740993", "9007199254740992", NA))`;
+// bit64::keypos() instead.
+const I64_SORT_FRAME = `df <- data.frame(id = 1:7, g = c(1L, 2L, 1L, 2L, 1L, 2L, 1L))
+df$big <- bit64::as.integer64(c("-1", "5", "-3", "9007199254740993", "9007199254740992", NA, NA))`;
 const I64_SORT: EdgeCase[] = [
     { name: 'big asc', sort: [{ ci: 2, dir: 'asc' }] },
     { name: 'big desc', sort: [{ ci: 2, dir: 'desc' }] },
     { name: 'g asc, big desc', sort: [{ ci: 1, dir: 'asc' }, { ci: 2, dir: 'desc' }] },
     { name: 'big asc, g desc', sort: [{ ci: 2, dir: 'asc' }, { ci: 1, dir: 'desc' }] },
+    // rank.integer64() aborts R on a key that is all NA.
+    { name: 'big missing only, sorted by big', filters: [{ ci: 2, p: { kind: 'isEmpty' } }], sort: [{ ci: 2, dir: 'asc' }] },
 ];
 edgeSuite('Copy as R code round trip: integer64 sort keys, bit64 not attached (real R)',
     I64_SORT_FRAME, ['df', 'dtobj'], I64_SORT);
