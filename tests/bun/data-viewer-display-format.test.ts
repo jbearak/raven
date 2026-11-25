@@ -14,6 +14,7 @@ import {
     formatTimestamp,
     isRightAligned,
     parseDisplayFormat,
+    zonedTimeToMs,
 } from '../../editors/vscode/src/data-viewer/display-format';
 import { encodeTimestampMicros } from '../../editors/vscode/src/data-viewer/wire-format';
 
@@ -148,6 +149,14 @@ describe('source display formats', () => {
     });
     test('Format off ignores the source format', () => {
         expect(formatCell(1234.5, withFmt('DOLLAR10.2'), undefined, { ...on, formatOn: false }).text).toBe('1234.5');
+    });
+    test('a zero-decimal format on a column holding a fraction: Format off shows and copies the stored value', () => {
+        // `isInteger` is what the reader sets for such a format.
+        const price: ColumnSchema = { ...withFmt('DOLLAR8'), isInteger: true };
+        const shown = formatCell(12.75, price, undefined, { ...on, alignPad: true });
+        expect([shown.text, shown.copyText]).toEqual(['$13', '$13']);
+        const stored = formatCell(12.75, price, undefined, { ...on, formatOn: false, alignPad: true });
+        expect([stored.text, stored.copyText]).toEqual(['12.75', '12.75']);
     });
     test('formatNumber with a significant-digit spec on tiny values', () => {
         expect(formatNumber(0.000012345, {
@@ -285,5 +294,32 @@ describe('isLabel (labels never overflow to ###)', () => {
     test('an unlabelled value, or Labels off, is a number', () => {
         expect(formatCell(3, lbl, undefined, on).isLabel).toBeUndefined();
         expect(formatCell(1, lbl, undefined, { ...on, labelsOn: false }).isLabel).toBeUndefined();
+    });
+});
+
+describe('zonedTimeToMs: a wall-clock date-time in a zone', () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    test('reads the time in the zone, with the offset in effect then', () => {
+        expect(iso(zonedTimeToMs('2024-01-01T00:00', 'UTC'))).toBe('2024-01-01T00:00:00.000Z');
+        expect(iso(zonedTimeToMs('2024-01-01T00:00', 'Asia/Kolkata'))).toBe('2023-12-31T18:30:00.000Z');
+        // New York: UTC-5 in winter, UTC-4 in summer.
+        expect(iso(zonedTimeToMs('2024-01-01T12:00', 'America/New_York'))).toBe('2024-01-01T17:00:00.000Z');
+        expect(iso(zonedTimeToMs('2024-07-01T12:00:30.25', 'America/New_York'))).toBe('2024-07-01T16:00:30.250Z');
+        // The hour after clocks spring forward, and the day they fall back.
+        expect(iso(zonedTimeToMs('2024-03-10T03:30', 'America/New_York'))).toBe('2024-03-10T07:30:00.000Z');
+        expect(iso(zonedTimeToMs('2024-11-03T12:00', 'America/New_York'))).toBe('2024-11-03T17:00:00.000Z');
+    });
+    test('names the instant the grid shows that text for', () => {
+        for (const zone of ['UTC', 'America/New_York', 'Asia/Kolkata', 'Australia/Lord_Howe']) {
+            for (const ms of [Date.UTC(2024, 0, 1, 0, 0, 0), Date.UTC(2024, 6, 15, 13, 45, 10), Date.UTC(1969, 11, 31, 23, 59, 59)]) {
+                const shown = formatTimestamp(ms, 0, zone, 0).text.replace(' ', 'T');
+                expect([zone, zonedTimeToMs(shown, zone)]).toEqual([zone, ms]);
+            }
+        }
+    });
+    test('a zone the grid falls back to UTC for is read as UTC; text that is no date-time is NaN', () => {
+        expect(iso(zonedTimeToMs('2024-01-01T09:00', 'Not/AZone'))).toBe('2024-01-01T09:00:00.000Z');
+        expect(zonedTimeToMs('nonsense', 'UTC')).toBeNaN();
+        expect(zonedTimeToMs('+275760-09-13T12:00', 'Asia/Kolkata')).toBeNaN();
     });
 });

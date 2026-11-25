@@ -58,6 +58,7 @@ import { readSync } from 'node:fs';
 import { AsyncRecordBatchFileReader, makeData, makeVector, Type } from 'apache-arrow';
 import type { DataType } from 'apache-arrow';
 import {
+    encodeInt64,
     encodeNumber,
     encodeString,
     encodeDate,
@@ -108,15 +109,19 @@ export type ColumnSchema = {
      *  via raven.value_labels). Looked up by stringified cell value. */
     valueLabels?: Record<string, string>;
     /** Source-file format string (Stata %w.dC, SAS/SPSS F8.0, etc.).
-     *  Used to detect integer-display Float columns so Format doesn't
-     *  render "5" as "5.000". See format-string.ts. */
+     *  A recognized one formats a Float column while Format is on
+     *  (`parseDisplayFormat`), and it tells whether the column is
+     *  declared for whole numbers (format-string.ts). */
     format?: string;
     /** Dictionary level strings, present iff dictionaryShipped. */
     dictionary?: string[];
     /** True iff this column is dictionary-encoded AND its dictionary fits
      *  under the cardinality threshold. */
     dictionaryShipped: boolean;
-    /** True iff the column type is integer (Format toggle ignores these). */
+    /** True iff the column type is integer, or a Float whose format
+     *  declares whole numbers. The digits dropdown ignores these; Format
+     *  still applies a recognized source format to such a Float (it may
+     *  hold fractions all the same). */
     isInteger: boolean;
     /** pillar-style type tag from the R class (`<dbl>`, `<fct>`,
      *  `<dttm>`, `<drtn secs>`, `<dbl+lbl>`, ...), from `raven.type_tag`.
@@ -792,7 +797,7 @@ export class ArrowSliceReader {
                     case 1: return dv.getInt8(0);
                     case 2: return dv.getInt16(0, true);
                     case 4: return dv.getInt32(0, true);
-                    case 8: return Number(dv.getBigInt64(0, true));
+                    case 8: return encodeInt64(dv.getBigInt64(0, true));
                 }
                 break;
             case 'float':
@@ -1104,7 +1109,7 @@ export function encodeArrowCell(child: any, row: number, arrowType: string): Cel
         const v = child.get(row);
         if (v === null || v === undefined) return null;
         // Int64 columns yield bigint; Cell type and JSON.stringify can't carry it.
-        return typeof v === 'bigint' ? Number(v) : (v as number);
+        return typeof v === 'bigint' ? encodeInt64(v) : (v as number);
     }
     if (arrowType.startsWith('Float')) {
         const v = child.get(row);
