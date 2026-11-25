@@ -10065,8 +10065,8 @@ fn infix_sites_from_snapshot(
 /// it puts nothing on the search path, so the operator isn't reachable by
 /// its bare name.
 ///
-/// In the package's own files the imports come first, as the namespace's
-/// imports environment precedes the search path. Elsewhere each package
+/// In the package's `R/` sources the imports come first, as the
+/// namespace's imports environment precedes the search path. Elsewhere each package
 /// this file attaches, through a top-level `library()` call or one in a
 /// file it sources ([`attach_order`]), is its own tier, the most recently
 /// attached first, since R puts each new attachment in front. Only calls
@@ -10085,7 +10085,25 @@ fn attached_at(
 ) -> InfixSite {
     let scope = stream.package_snapshot();
     let imports = &snapshot.scope_contribution.full_imports;
-    let package_file = analysis.self_nse_package.is_some();
+    // The package's `R/` sources: code that runs in its namespace. Its tests,
+    // vignettes and scripts attach packages like any script.
+    let package_file = analysis.self_nse_package.is_some()
+        && snapshot
+            .scope_contribution
+            .workspace_root
+            .as_deref()
+            .zip(
+                snapshot
+                    .package_query_uri
+                    .as_ref()
+                    .unwrap_or(uri)
+                    .to_file_path()
+                    .ok(),
+            )
+            .is_some_and(|(root, path)| {
+                crate::package_state::is_r_source_path(&path, root)
+                    == Some(crate::package_state::RFileKind::Source)
+            });
     let mut tiers: Vec<Vec<String>> = Vec::new();
     if package_file && !imports.is_empty() {
         tiers.push(imports.iter().cloned().collect());
@@ -33349,15 +33367,33 @@ d %where% missing_redef
             ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
             RFileKind,
         };
-        let code = "f <- function(d) d %where% captured_col\n";
+        let source_code = "f <- function(d) d %where% captured_col\n";
+        let test_code = "library(plain)\nlibrary(capa)\nd <- 1\nd %where% captured_test\n";
         let mut flagged = Vec::new();
-        for (package, namespace, own_op) in [
+        for (package, namespace, own_op, path, code) in [
             (
                 "usesca",
                 "importFrom(capa, \"%where%\")\nimport(plain)\nexport(f)\n",
                 false,
+                "/work/pkg/R/f.R",
+                source_code,
             ),
-            ("ownop", "import(plain)\nexport(f)\n", true),
+            (
+                "ownop",
+                "import(plain)\nexport(f)\n",
+                true,
+                "/work/pkg/R/f.R",
+                source_code,
+            ),
+            // A test file attaches packages like a script: the one attached
+            // last wins, whatever the package imports.
+            (
+                "usesca",
+                "import(plain)\nexport(f)\n",
+                false,
+                "/work/pkg/tests/testthat/test-f.R",
+                test_code,
+            ),
         ] {
             let (_root, lib) = where_library().await;
             let mut state = WorldState::new();
@@ -33374,7 +33410,7 @@ d %where% missing_redef
             state.package_inputs.namespace = Some(NamespaceInput {
                 text: namespace.into(),
             });
-            let mut files = vec![("/work/pkg/R/f.R", code)];
+            let mut files = vec![("/work/pkg/R/f.R", source_code), (path, code)];
             if own_op {
                 files.push((
                     "/work/pkg/R/op.R",
@@ -33386,14 +33422,18 @@ d %where% missing_redef
                 state.package_inputs.r_files.insert(
                     std::path::PathBuf::from(path),
                     RFileInput {
-                        kind: RFileKind::Source,
+                        kind: if path.contains("/tests/") {
+                            RFileKind::Test
+                        } else {
+                            RFileKind::Source
+                        },
                         text: text.clone(),
                         content_digest: ContentDigest::of(&text),
                     },
                 );
             }
             state.apply_package_event(&PackageInputDelta::Initial);
-            let uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+            let uri = Url::from_file_path(path).unwrap();
             state.open_document(uri.clone(), code, Some(1));
             let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
             let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
@@ -33402,6 +33442,7 @@ d %where% missing_redef
         }
         assert_eq!(flagged[0], Vec::<String>::new(), "importFrom");
         assert_eq!(flagged[1], Vec::<String>::new(), "own definition");
+        assert_eq!(flagged[2], Vec::<String>::new(), "test file");
     }
 
     // ---- Package-declared bracket NSE (`[subset]` in `inst/raven/nse.toml`) ----
