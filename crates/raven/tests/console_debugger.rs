@@ -63,6 +63,9 @@ struct Console {
     master: Option<File>,
     out: Arc<Mutex<Vec<u8>>>,
     dir: PathBuf,
+    /// Leave `dir` in place when the console is dropped (another console
+    /// of the test uses it).
+    keep_dir: bool,
 }
 
 impl Console {
@@ -93,7 +96,11 @@ impl Console {
     /// Start a console and return once its IPC socket exists (R may still
     /// be starting).
     fn launch(env: &[(&str, &str)], dap: DapArg, r_args: &[&str]) -> Console {
-        let dir = scratch();
+        Console::launch_in(scratch(), env, dap, r_args)
+    }
+
+    /// As `launch`, with the sockets in `dir`.
+    fn launch_in(dir: PathBuf, env: &[(&str, &str)], dap: DapArg, r_args: &[&str]) -> Console {
         let mut master: libc::c_int = 0;
         let mut slave: libc::c_int = 0;
         let ws = libc::winsize {
@@ -167,6 +174,7 @@ impl Console {
             master: Some(master),
             out,
             dir,
+            keep_dir: false,
         };
         let deadline = Instant::now() + TIMEOUT;
         while !c.dir.join("i").exists() {
@@ -276,7 +284,9 @@ impl Drop for Console {
         let _ = self.child.kill();
         drop(self.master.take());
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -2897,6 +2907,82 @@ fn subscribing_while_r_is_stopped_reports_the_stop() {
         other.event("stopped", Duration::from_secs(1)).is_none(),
         "replayed a stop a live session shows"
     );
+}
+
+/// Two consoles given the same `--ipc`/`--dap` paths (only possible from the
+/// command line: the extension makes each console a directory of its own).
+/// The second is refused both sockets and the first keeps its clients; a
+/// console killed outright leaves its sockets behind, and the next console
+/// on those paths replaces them.
+#[test]
+fn a_second_console_on_live_sockets_is_refused_and_stale_sockets_are_replaced() {
+    if !r_available() {
+        return;
+    }
+    let args = ["--no-save", "--no-restore", "--vanilla", "-q"];
+    let mut a = Console::spawn();
+    a.keep_dir = true;
+    let dir = a.dir.clone();
+    let mut d = Dap::connect(&a);
+    d.req("configurationDone", json!({}));
+
+    let mut b = Console::launch_in(dir.clone(), &[], DapArg::Socket, &args);
+    b.keep_dir = true;
+    for socket in ["i", "d"] {
+        b.expect(&format!(
+            "cannot listen on {}: another raven console is listening here",
+            dir.join(socket).display()
+        ));
+    }
+    // New connections reach A, not B...
+    let m = d.mark();
+    a.send(
+        "(function() { held <- toupper('in the first console'); browser() })()",
+        None,
+    );
+    a.expect("Browse[");
+    assert!(!b.text().contains("Browse["), "{}", b.text());
+    // ...and the session connected before B started is still A's.
+    d.event("stopped", m);
+    assert_eq!(
+        d.locals().get("held").map(String::as_str),
+        Some("\"IN THE FIRST CONSOLE\"")
+    );
+    // So is a session connected after.
+    assert!(!Dap::open(&dir, true).stack().is_empty());
+
+    // Both die without a chance to clean up.
+    drop(b);
+    drop(a);
+    assert!(dir.join("i").exists() && dir.join("d").exists());
+    let c = Console::launch_in(dir.clone(), &[], DapArg::Socket, &args);
+    let mirror = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {}});
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        // Until C replaces it, the stale socket refuses connections.
+        let status = UnixStream::connect(dir.join("i")).ok().map(|s| {
+            s.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut w = s.try_clone().unwrap();
+            writeln!(w, "{mirror}").unwrap();
+            let mut line = String::new();
+            let _ = BufReader::new(s).read_line(&mut line);
+            line
+        });
+        if status.is_some_and(|l| l.contains("\"ok\"")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new console never listened:\n{}",
+            c.text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!c.text().contains("cannot listen"), "{}", c.text());
+    c.send("cat(toupper('reached the new console'), '\\n')", None);
+    c.expect("REACHED THE NEW CONSOLE");
+    let mut d = Dap::open(&dir, true);
+    assert_eq!(d.req("threads", json!({}))["success"], true);
 }
 
 /// The value an evaluate in the Debug Console prints, at the top frame.
