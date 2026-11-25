@@ -181,7 +181,7 @@ Use the bump script to update versions, commit, tag, and push:
 
 This updates `Cargo.toml` (workspace version) and `editors/vscode/package.json`, commits the change, creates a git tag, and pushes both. Run from a terminal, it first asks you to confirm the version and channel.
 
-Create release tags only with the bump script. The extension, archive, and Debian package take their version from the tag, and `raven --version` takes it from `Cargo.toml`. Both release workflows therefore run `scripts/check-release-tag.sh` before anything else: it fails unless the tag is `v` plus the `[workspace.package]` version in the tagged commit's `Cargo.toml`, so a tag pushed without the version bump builds and publishes nothing. To check a tag yourself (the script needs `python3` 3.11 or later):
+Create release tags only with the bump script. The extension, archive, and Debian package take their version from the tag, and `raven --version` takes it from `Cargo.toml`. Both release workflows run `scripts/check-release-tag.sh` before any build or publish step. It fails unless the tag is `v` plus the `[workspace.package]` version in the tagged commit's `Cargo.toml`, so a tag pushed without the version bump builds and publishes nothing. To check a tag yourself, with `python3` 3.11 or later on PATH:
 
 ```bash
 git show "refs/tags/v0.24.0^{commit}:Cargo.toml" | ./scripts/check-release-tag.sh v0.24.0
@@ -2292,7 +2292,7 @@ User docs live in `docs/` as plain GitHub-flavored Markdown, and GitHub renders 
   ```
 
   `.github/workflows/docs.yml` runs that build on docs PRs (a check, not a required one). On `main` it deploys to GitHub Pages at <https://jbearak.github.io/raven/>. Pages uses "GitHub Actions" as its source, and the deploy runs only while the repository variable `DOCS_PAGES_ENABLED` is `true`; set it to anything else to pause deploys. `site_url` in `docs/user-pages.json` makes the generated hub and `llms.txt` link the site. The two READMEs link it by hand.
-- **Tutorial checks.** `editors/vscode/src/test-getting-started/getting-started.test.ts` walks through `docs/getting-started.md` in VS Code. It runs as the `getting-started` label in `.vscode-test.mjs`, with a temp copy of the tutorial files as its workspace. `scripts/fresh-install-check.sh` packages the VSIX, installs it into an empty profile on a machine without R or `raven` on PATH, and runs the same test against the installed extension. It refuses to start when R is on PATH or in any other location the server probes; the cargo test `fresh_install_check_lists_every_common_r_path` fails if `get_common_r_paths` gains a location the script does not check. Run it under `xvfb-run -a` on Linux.
+- **Tutorial checks.** `editors/vscode/src/test-getting-started/getting-started.test.ts` walks through `docs/getting-started.md` in VS Code. It runs as the `getting-started` label in `.vscode-test.mjs`, with a temp copy of the tutorial files as its workspace. `scripts/fresh-install-check.sh` packages the VSIX, installs it into an empty profile on a machine without R or `raven` on PATH, and runs the same test against the installed extension. It refuses to start when R is on PATH or in any other location the server probes. The cargo test `fresh_install_check_lists_every_common_r_path` fails if `get_common_r_paths` gains a location the script does not check. Run it under `xvfb-run -a` on Linux.
 
 ## Docs verification
 
