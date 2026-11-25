@@ -8190,6 +8190,22 @@ where
             }
         }
     }
+    // Visit each parent's retained calls in call-site order. The shared
+    // `visited` map admits a parent again only at a strictly later position,
+    // so a later call visited first (a replacement keeps the replaced call's
+    // slot) would hide an earlier `local()` block call.
+    let mut parent_rank: HashMap<&Url, usize> = HashMap::new();
+    for edge in &parent_edges {
+        let rank = parent_rank.len();
+        parent_rank.entry(&edge.from).or_insert(rank);
+    }
+    parent_edges.sort_by_key(|edge| {
+        (
+            parent_rank[&edge.from],
+            edge.call_site_line.unwrap_or(u32::MAX),
+            edge.call_site_column.unwrap_or(u32::MAX),
+        )
+    });
 
     for edge in parent_edges {
         // Get call site position for filtering
@@ -15912,7 +15928,8 @@ g <- function() {
     /// are distinct frames: the later call must not subsume the earlier one,
     /// so the child sees the bindings of both blocks. A default `source()` in
     /// a block runs in the global environment, so a later top-level call still
-    /// subsumes it and the block's bindings stay out of the child.
+    /// subsumes it and the block's bindings stay out of the child. A block
+    /// call between two top-level calls is not hidden by the later one.
     #[test]
     fn same_parent_local_block_invocations_keep_distinct_frames() {
         let current_frame = r#"local({
@@ -15930,10 +15947,20 @@ local({
 })
 source("child.R")
 "#;
+        // The later top-level call replaces the earlier one; the block call
+        // between them must still be visited.
+        let between_top_level = r#"source("child.R", local = TRUE)
+local({
+  inner_only <- 1
+  source("child.R", local = TRUE)
+})
+source("child.R", local = TRUE)
+"#;
         for (parent_code, name, visible) in [
             (current_frame, "first_val", true),
             (current_frame, "second_val", true),
             (global, "only_local", false),
+            (between_top_level, "inner_only", true),
         ] {
             assert_same_parent_child_prefix(parent_code, name, visible);
         }
