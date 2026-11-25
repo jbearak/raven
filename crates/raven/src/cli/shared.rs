@@ -21,6 +21,52 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_LINT_FAILED: i32 = 1;
 pub const EXIT_OPERATOR_ERROR: i32 = 2;
 
+/// Where `raven parse` and `raven graph` write: stdout, through a handle whose write errors all
+/// come back. `std::io::Stdout` reports a write to a descriptor that isn't
+/// open for writing (`raven parse 1</dev/null`, `EBADF`) as a success, on
+/// purpose, so on Unix the output is written through a duplicate of the
+/// descriptor as a plain file. Nothing else writes to stdout during a run.
+///
+/// A stdout closed before the run (`1>&-`) can't be told from `>/dev/null`:
+/// Rust's runtime reopens a closed standard descriptor on `/dev/null` before
+/// `main`.
+pub(crate) fn stdout_writer() -> Box<dyn std::io::Write> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        if let Ok(fd) = std::io::stdout().as_fd().try_clone_to_owned() {
+            return Box::new(std::fs::File::from(fd));
+        }
+    }
+    Box::new(std::io::stdout().lock())
+}
+
+/// The exit code after writing to stdout failed: `code` for a closed pipe
+/// (`raven graph | head`), which only ends the output, otherwise an operator
+/// error, reported on stderr as `{command}: cannot write output: ...`, since
+/// output was lost (a full disk, a stdout not open for writing).
+pub(crate) fn output_failed(command: &str, error: &std::io::Error, code: i32) -> i32 {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return code;
+    }
+    eprintln!("{command}: cannot write output: {error}");
+    EXIT_OPERATOR_ERROR
+}
+
+/// Writes `text` to `out` and flushes it; returns `code`, or what
+/// [`output_failed`] makes of a failed write or flush.
+pub(crate) fn write_output(
+    command: &str,
+    mut out: impl std::io::Write,
+    text: &str,
+    code: i32,
+) -> i32 {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => code,
+        Err(error) => output_failed(command, &error, code),
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum OutputFormat {
     Text,

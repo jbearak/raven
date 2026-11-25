@@ -359,7 +359,7 @@ The text format is for reading and may change between releases. For scripts, use
 - `--no-config`: ignore `raven.toml` and `.lintr` and use Raven's built-in defaults.
 - `--format text|json`: output format, default `text`. `sarif` isn't accepted, because the graph isn't a list of findings.
 
-`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config or a `--workspace` that isn't a directory exits `2`.
+`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config or a `--workspace` that isn't a directory exits `2`. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, also exits `2`, with the reason on stderr. A closed pipe, as in `raven graph | head`, only ends the output and still exits `0`.
 
 ### Graph JSON
 

@@ -37,6 +37,7 @@ use crate::cli::check::{
 use crate::cli::graph::{display_fs_path, display_path};
 use crate::cli::shared::{
     EXIT_OK, EXIT_OPERATOR_ERROR, absolute_path, collect_r_file_paths_with_exclusions, is_r_file,
+    output_failed, stdout_writer,
 };
 
 pub use document::SCHEMA_VERSION;
@@ -187,26 +188,6 @@ pub async fn run(args: ParseArgs) -> i32 {
     print_documents(stdout_writer(), documents)
 }
 
-/// Where the documents go: stdout, through a handle whose write errors all
-/// come back. `std::io::Stdout` reports a write to a descriptor that isn't
-/// open for writing (`raven parse 1</dev/null`, `EBADF`) as a success, on
-/// purpose, so on Unix the documents are written through a duplicate of the
-/// descriptor as a plain file. Nothing else writes to stdout during a run.
-///
-/// A stdout closed before the run (`1>&-`) can't be told from `>/dev/null`:
-/// Rust's runtime reopens a closed standard descriptor on `/dev/null` before
-/// `main`.
-fn stdout_writer() -> Box<dyn std::io::Write> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsFd as _;
-        if let Ok(fd) = std::io::stdout().as_fd().try_clone_to_owned() {
-            return Box::new(std::fs::File::from(fd));
-        }
-    }
-    Box::new(std::io::stdout().lock())
-}
-
 /// Writes each document's JSON line, with whether it is an error document,
 /// and returns the exit code. A closed pipe (`raven parse | head -1`) ends
 /// the output, not the run's verdict on the files already printed. Any other
@@ -223,23 +204,13 @@ fn print_documents(
             code = EXIT_UNREADABLE;
         }
         if let Err(error) = writeln!(out, "{line}") {
-            return output_failed(&error, code);
+            return output_failed("raven parse", &error, code);
         }
     }
     match out.flush() {
         Ok(()) => code,
-        Err(error) => output_failed(&error, code),
+        Err(error) => output_failed("raven parse", &error, code),
     }
-}
-
-/// The exit code after stdout failed: `code` for a closed pipe, otherwise an
-/// operator error, reported on stderr.
-fn output_failed(error: &std::io::Error, code: i32) -> i32 {
-    if error.kind() == std::io::ErrorKind::BrokenPipe {
-        return code;
-    }
-    eprintln!("raven parse: cannot write output: {error}");
-    EXIT_OPERATOR_ERROR
 }
 
 /// One requested file: its printed `path` and what to do with it.

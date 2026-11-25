@@ -18,7 +18,7 @@ use tower_lsp::lsp_types::Url;
 use crate::cli::check::{
     PreparedWorkspace, WorkspaceSetup, prepare_workspace, resolve_workspace_root,
 };
-use crate::cli::shared::{EXIT_OK, EXIT_OPERATOR_ERROR};
+use crate::cli::shared::{EXIT_OK, EXIT_OPERATOR_ERROR, stdout_writer, write_output};
 use crate::cross_file::dependency::DependencyEdge;
 use crate::cross_file::dependency::DependencyEdgeKind;
 use crate::cross_file::dependency::export::TracedGraph;
@@ -108,9 +108,11 @@ Options:
                        contract (schema_version {SCHEMA_VERSION}); text may change.
 
 Exit codes:
-  0   The graph was printed (even with dropped call sites or complete: false)
+  0   The graph was printed (even with dropped call sites or complete: false),
+      or stdout was a pipe that closed early (`raven graph | head`)
   1   A usage error (unknown flag / bad option value)
-  2   Operator error while running (config load failure)
+  2   Operator error while running (config load failure, workspace not a
+      directory, output that couldn't be written)
 ",
         env!("CARGO_PKG_VERSION")
     );
@@ -125,17 +127,25 @@ pub async fn run(args: GraphArgs) -> i32 {
         }
     };
     match build_graph_report(&args, &cwd).await {
-        Ok(report) => {
-            match args.format {
-                GraphFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).expect("graph report serializes")
-                ),
-                GraphFormat::Text => print!("{}", render_text(&report)),
-            }
-            EXIT_OK
-        }
+        Ok(report) => write_output(
+            "raven graph",
+            stdout_writer(),
+            &render(&report, args.format),
+            EXIT_OK,
+        ),
         Err(code) => code,
+    }
+}
+
+/// The report as printed in `format`, ending in a newline.
+fn render(report: &GraphReport, format: GraphFormat) -> String {
+    match format {
+        GraphFormat::Json => {
+            let mut json = serde_json::to_string_pretty(report).expect("graph report serializes");
+            json.push('\n');
+            json
+        }
+        GraphFormat::Text => render_text(report),
     }
 }
 
