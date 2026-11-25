@@ -288,6 +288,13 @@ describe('refresh', () => {
         untitled.wv.deliver({ type: 'refresh', panelGeneration: gen2 });
         await flush();
         expect(sent).toEqual([`View(${expr}, title = "${cut}")`]);
+        // Titled with the whole expression: R doesn't cut a title.
+        sent = [];
+        const same = await setup({ source: { expression: expr, sourceKind: 'data.frame', sessionId: 'live' }, title: expr });
+        const gen3 = await ready(same.wv);
+        same.wv.deliver({ type: 'refresh', panelGeneration: gen3 });
+        await flush();
+        expect(sent).toEqual([`View(${expr}, title = ${JSON.stringify(expr)})`]);
     });
 
     test('after the R session that made the view ends, it explains instead of asking', async () => {
