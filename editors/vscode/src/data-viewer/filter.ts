@@ -396,8 +396,14 @@ async function acceptorFor(
  * extension host's zone. Everything else is `Date.parse`: an explicit
  * offset is honored, and a bare date is UTC midnight (what a Date column
  * stores).
+ *
+ * The pickers write a year past 9999 unsigned (`10000-01-01`), where
+ * ECMAScript wants a sign and six digits (`+010000-01-01`); unsigned,
+ * `Date.parse` reads the date in the host's zone and rejects the
+ * date-time. So a five- or six-digit year is respelled before parsing.
  */
-export function dateBoundMs(iso: string, col: ColumnSchema): number {
+export function dateBoundMs(input: string, col: ColumnSchema): number {
+    const iso = input.replace(/^\d{5,6}(?=-\d\d-\d\d(?:T|$))/, year => `+${year.padStart(6, '0')}`);
     const t = iso.indexOf('T');
     if (col.arrowType.startsWith('Timestamp') && t > 0 && !/[zZ+-]/.test(iso.slice(t))) {
         return zonedTimeToMs(iso, col.timeZone ?? 'UTC');
