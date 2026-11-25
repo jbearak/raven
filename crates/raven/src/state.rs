@@ -13710,6 +13710,8 @@ fn collect_files_matching_inner(
         }
     };
 
+    // Whether `dir`'s entries already reported that their type can't be read.
+    let mut unexamined_reported = false;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -13719,36 +13721,47 @@ fn collect_files_matching_inner(
             }
         };
         let path = entry.path();
+        // Cheap first pass: prune by the entry name (a real `node_modules`,
+        // `.git`, … — no canonicalize needed for the common case).
+        let skip_listed = || {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(should_skip_directory)
+        };
+        let excluded = || {
+            exclusions.is_some_and(|exclusions| {
+                exclusions.can_prune_directory(&path)
+                    || (discovery && exclusions.is_gitignored(&path, true))
+            })
+        };
 
         // `is_dir()` follows symlinks, so a symlink to a directory is walked
         // (after the cycle check) and a symlink to a file falls through to the
         // `accept` branch. A directory that lists its names but denies access
         // to them (mode 0400) can't say which are directories, so that is a
-        // walk error too; a dangling symlink (not found) is just no directory.
+        // walk error of `dir`, reported once, unless the entry would be pruned
+        // as a directory anyway; a dangling symlink (not found) is just no
+        // directory.
         let is_dir = match fs::metadata(&path) {
             Ok(metadata) => metadata.is_dir(),
             Err(error) => {
-                if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    errors.push((path.clone(), error));
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && !unexamined_reported
+                    && !skip_listed()
+                    && !excluded()
+                {
+                    unexamined_reported = true;
+                    errors.push((dir.to_path_buf(), error));
                 }
                 false
             }
         };
         if is_dir {
-            // Cheap first pass: prune by the entry name (a real `node_modules`,
-            // `.git`, … — no canonicalize needed for the common case).
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(should_skip_directory)
-            {
+            if skip_listed() {
                 log::trace!("Skipping directory: {}", path.display());
                 continue;
             }
-            if exclusions.is_some_and(|exclusions| {
-                exclusions.can_prune_directory(&path)
-                    || (discovery && exclusions.is_gitignored(&path, true))
-            }) {
+            if excluded() {
                 log::trace!("Skipping excluded directory: {}", path.display());
                 continue;
             }

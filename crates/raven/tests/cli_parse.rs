@@ -114,6 +114,7 @@ fn unlistable_directory_is_an_operator_error() {
         let (_tmp, ws) = workspace();
         write(&ws, "top.R", b"x <- 1\n");
         write(&ws, "locked/sub/a.R", b"y <- 1\n");
+        write(&ws, "locked/b.R", b"z <- 1\n");
         let locked = ws.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap();
         if std::fs::metadata(locked.join("sub")).is_ok() {
@@ -123,11 +124,21 @@ fn unlistable_directory_is_an_operator_error() {
         }
         let outputs = [parse_in(&ws, &["locked"]), parse_in(&ws, &[])];
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for (output, printed) in outputs.iter().zip([&[][..], &["top.R"][..]]) {
+        // Under 0400 the direct file is listed; it then can't be read, so it
+        // gets its error document.
+        let listed: &[&str] = if mode == 0o400 { &["locked/b.R"] } else { &[] };
+        let in_root: Vec<&str> = listed.iter().copied().chain(["top.R"]).collect();
+        for (output, printed) in outputs.iter().zip([listed, &in_root[..]]) {
             assert_eq!(output.status.code(), Some(2), "{mode:o}: {output:?}");
             assert_eq!(paths(&documents(output)), printed, "{mode:o}");
+            // The directory is named once, whatever it holds.
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(stderr.contains("raven parse: cannot read dir"), "{stderr}");
+            assert_eq!(
+                stderr.matches("raven parse: cannot read dir").count(),
+                1,
+                "{mode:o}: {stderr}"
+            );
+            assert!(stderr.contains("locked: "), "{mode:o}: {stderr}");
         }
     }
 }
