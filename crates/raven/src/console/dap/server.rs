@@ -135,7 +135,12 @@ pub fn start(
                 if write_frame(stream, &msg).is_err() {
                     // Gone as far as the debugger is concerned, exactly as
                     // when its reader finds the connection closed (which,
-                    // no longer current, then reports nothing).
+                    // no longer current, then reports nothing). Closed for
+                    // the client too: its reader here holds the connection
+                    // open, and a client that is only slow would go on
+                    // believing it has a session.
+                    #[cfg(unix)]
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     *g = None;
                     writer_on_close();
                 }
@@ -308,6 +313,9 @@ mod tests {
         fn a_failed_write_reports_the_client_gone_once() {
             let server = Server::start("write");
             let client = server.client();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             // More than any socket buffer holds.
             for _ in 0..64 {
                 server
@@ -319,7 +327,13 @@ mod tests {
                 assert!(Instant::now() < deadline, "the write never failed");
                 std::thread::sleep(Duration::from_millis(50));
             }
-            client.shutdown(Shutdown::Both).unwrap();
+            // The connection is closed for the client as well: what was
+            // buffered, then end of file.
+            use std::io::Read;
+            let mut rest = Vec::new();
+            (&client)
+                .read_to_end(&mut rest)
+                .expect("the dropped client's connection stayed open");
             settle();
             assert_eq!(server.closes(), 1);
         }

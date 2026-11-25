@@ -66,8 +66,11 @@ mod imp {
     /// * It is a POSIX record lock (`fcntl`), not `flock`: a record lock
     ///   belongs to the process and is not inherited across `fork`, so a
     ///   child R forked (`parallel::mclapply`) that outlives a killed
-    ///   console doesn't keep the endpoint locked. Record locks don't
-    ///   conflict within one process, which never binds a path twice.
+    ///   console doesn't keep the endpoint locked. The price: record locks
+    ///   don't conflict within one process (`--ipc` and `--dap` given the
+    ///   same path replace each other, as before), and the process loses
+    ///   the lock if it closes any other descriptor for the lock file (R
+    ///   code in this console reading `<path>.lock`).
     /// * Only consoles that take the lock are protected from each other: a
     ///   console that predates it replaces the socket regardless.
     /// * A filesystem that can't lock gives no protection, as before.

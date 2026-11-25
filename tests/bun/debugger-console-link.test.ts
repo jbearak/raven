@@ -22,7 +22,7 @@ const change_listeners: Array<() => void> = [];
 const close_listeners: Array<(t: unknown) => void> = [];
 const start_listeners: Array<(s: unknown) => void> = [];
 /** Every session `host_launch` started. */
-const start_sessions: Array<{ id: string; configuration: { consoleSocket?: string } }> = [];
+const start_sessions: HostSession[] = [];
 let tracker_factory: { createDebugAdapterTracker(s: unknown): { onDidSendMessage(m: unknown): void } } | null = null;
 /** Every `startDebugging` call's configuration. */
 const started: Array<{ consoleSocket?: string }> = [];
@@ -769,6 +769,38 @@ describe('auto-attach', () => {
     });
 });
 
+describe('a stop heard while its console\'s session is being torn down', () => {
+    test('is dropped when R leaves it before the teardown finishes', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        play_host = true;
+        try {
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await until(() => start_sessions.some((s) => s.configuration.consoleSocket === sock), 3_000);
+            const session = start_sessions.find((s) => s.configuration.consoleSocket === sock)!;
+            // The console ends the session; VS Code is tearing it down
+            // when R stops again, and the user types `c` at `Browse>`.
+            tracker_factory!.createDebugAdapterTracker(session).onDidSendMessage({ type: 'event', event: 'terminated' });
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            con.push({ event: 'running' });
+            await settle(200);
+            const before = started.filter((c) => c.consoleSocket === sock).length;
+            host_end(session as HostSession);
+            await settle(300);
+            expect(started.filter((c) => c.consoleSocket === sock).length - before).toBe(0);
+            // A stop still there when the teardown finishes attaches.
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await until(() => started.filter((c) => c.consoleSocket === sock).length - before === 1, 2_000);
+        } finally {
+            play_host = false;
+        }
+    });
+});
+
 describe('an explicit launch', () => {
     test('a stop heard while it resolves (F5 reattaching a stopped console) is left to its session', async () => {
         const { con, sock } = await console_at();
@@ -1013,14 +1045,14 @@ describe('an explicit launch', () => {
 
 describe("the host's launch sequence: a launch whose preLaunchTask outlasts its claim", () => {
     /** A console with a terminal here and a DAP socket; claims last `claim_ms`. */
-    async function ready_console(): Promise<{ con: FakeConsole; sock: string }> {
+    async function ready_console(): Promise<{ con: FakeConsole; sock: string; terminal: object }> {
         const { con, sock } = await console_at();
         set_breakpoints([]);
-        attach(sock);
+        const terminal = attach(sock);
         await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
         await settle(200);
         fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
-        return { con, sock };
+        return { con, sock, terminal };
     }
     /** A `preLaunchTask` the test finishes. */
     function slow_task(): { task: Promise<boolean>; finish(ok: boolean): void } {
@@ -1059,6 +1091,41 @@ describe("the host's launch sequence: a launch whose preLaunchTask outlasts its 
         expect(await launch).toBeUndefined();
         expect(issued(sock)).toBe(1);
         expect(warning_messages.slice(warned).join()).toContain('"Slow build" was not started, and its program did not run');
+    }));
+
+    test("closing the console's terminal while the task runs (a Perch console lives on) changes nothing", () => hosted(async () => {
+        const { con, sock, terminal } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        // The session showing the stop is still there.
+        detach(terminal);
+        finish(true);
+        expect(await launch).toBeUndefined();
+        expect(issued(sock)).toBe(1);
+    }));
+
+    test('a launch that finds a session another launch started replaces it, as before', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        // The stop's session ends, and the user starts a session by hand.
+        host_end([...start_sessions].reverse().find((s) => s.configuration.consoleSocket === sock)!);
+        const by_hand = await host_launch({ type: 'raven-r', request: 'launch', name: 'R console', consoleSocket: sock });
+        expect(by_hand).toBeDefined();
+        finish(true);
+        const session = await launch;
+        expect(session).toBeDefined();
+        expect(issued(sock)).toBe(3);
+        host_end(by_hand!);
+        host_end(session!);
     }));
 
     test('a launch whose task finishes within its claim gets the console, and the stop is its to show', () => hosted(async () => {

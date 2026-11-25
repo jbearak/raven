@@ -23,10 +23,11 @@ declare const suiteTeardown: Mocha.HookFunction;
  * the extension's private mark), and ends the launch quietly when the hook
  * returns nothing.
  *
- * The task is `raven-test: slow preLaunchTask` in fixtures/.vscode/tasks.json.
- * Uses a debug build (`target/debug/raven`) when there is one, else the
- * binary bundled with the extension (CI); skipped without either, without R
- * with a shared libR, and on Windows (the task is a `sleep`).
+ * The task is `raven-test: slow preLaunchTask` in fixtures/.vscode/tasks.json;
+ * it runs until the test releases it. Uses a debug build
+ * (`target/debug/raven`) when there is one, else the binary bundled with
+ * the extension (CI); skipped without either, without R with a shared libR,
+ * and on Windows (the task is a `/bin/sh` loop).
  */
 const DEBUG_BUILD = path.resolve(__dirname, '..', '..', '..', '..', 'target', 'debug', 'raven');
 const BUNDLED = path.resolve(__dirname, '..', '..', 'bin', 'raven');
@@ -67,6 +68,7 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
     }
     this.timeout(180_000);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rvdbg-task-'));
+    const task_release = path.join(folder.uri.fsPath, '.raven-test-slow-task-release');
     const task_done = path.join(folder.uri.fsPath, '.raven-test-slow-task-done');
     /** Everything the R debug adapter sent, in order. */
     const sent: Array<{ type?: string; event?: string; body?: Record<string, unknown> }> = [];
@@ -75,6 +77,7 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
 
     suiteSetup(async () => {
         await activate();
+        fs.rmSync(task_release, { force: true });
         fs.rmSync(task_done, { force: true });
         if (fs.existsSync(DEBUG_BUILD)) {
             await vscode.workspace
@@ -93,6 +96,10 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
 
     suiteTeardown(async () => {
         for (const d of disposables) d.dispose();
+        // Also ends a task a failed test left waiting.
+        fs.writeFileSync(task_release, '');
+        await sleep(500);
+        fs.rmSync(task_release, { force: true });
         fs.rmSync(task_done, { force: true });
         vscode.debug.removeBreakpoints(vscode.debug.breakpoints);
         for (const t of vscode.window.terminals) t.dispose();
@@ -116,6 +123,10 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
         await vscode.commands.executeCommand('raven.runLineOrSelection');
         await sleep(5000);
 
+        let task_started = false;
+        disposables.push(vscode.tasks.onDidStartTask((e) => {
+            if (e.execution.task.name === TASK) task_started = true;
+        }));
         const launch = vscode.debug.startDebugging(folder, {
             type: 'raven-r',
             request: 'launch',
@@ -124,18 +135,23 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
             preLaunchTask: TASK,
         });
         // The launch has resolved and claimed the console; its task runs.
-        await sleep(3000);
+        await until('the preLaunchTask to start', () => task_started || undefined);
         assert.strictEqual(sessions_started, 0);
         const mark = sent.length;
         await open_at(file, 4);
         await vscode.commands.executeCommand('raven.runLineOrSelection');
-        // The stop waits for the launch while its claim lasts, then gets a
-        // session of its own.
-        const stop = await until('a stop', () =>
-            sent.slice(mark).find((m) => m.type === 'event' && m.event === 'stopped'));
+        // The stop waits for the launch while its claim lasts (10 s), then
+        // gets a session of its own.
+        const stop = await until(
+            'a stop',
+            () => sent.slice(mark).find((m) => m.type === 'event' && m.event === 'stopped'),
+            60_000,
+        );
         assert.strictEqual(stop.body?.reason, 'breakpoint');
         const session = await until('a session', () => vscode.debug.activeDebugSession);
 
+        // Only now does the task finish.
+        fs.writeFileSync(task_release, '');
         const started = await launch;
         assert.ok(fs.existsSync(task_done), 'the preLaunchTask did not run to its end');
         assert.strictEqual(started, false, 'the launch started over the session showing the stop');
