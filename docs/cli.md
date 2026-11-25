@@ -634,7 +634,7 @@ The fields:
 - `unpaired`: an `-end` with no open block, which does nothing, or a `-start` that nothing closes. Raven honors that `-start` through the last line.
 - `chunk_only`: `# raven: ignore-chunk`, which works only in R Markdown and Quarto chunks.
 
-An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and `@lsp-` blocks pair with each other, and `# nolint start` and `# nolint end` with each other.
+An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and `@lsp-` blocks pair with each other, as `raven check` pairs them. A `# nolint start` or `# nolint end` pairs as `raven lint` reads blocks: one block is open at a time, and any `-end` or `# nolint end` closes it, so `# raven: ignore-end` closes an open `# nolint start`.
 
 ### Name resolution
 
