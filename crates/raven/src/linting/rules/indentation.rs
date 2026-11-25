@@ -55,6 +55,7 @@ use crate::linting::LINT_SOURCE;
 use crate::linting::config::InfixContinuationStyle;
 use crate::linting::nolint::{Suppressions, matches_keyword};
 use crate::linting::rule_ids;
+use crate::parser_pool::ancestors;
 use crate::utf16::strip_leading_bom_for_scan;
 
 /// Resolved auto-indent policy available to the diagnostics pass.
@@ -1207,6 +1208,15 @@ fn collect_changes(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
 /// the *parent call's* end), so a child ending above `min_row` is skipped
 /// unless it is that call's `function` field; everything deeper extends at
 /// most to an ancestor within the skipped subtree.
+///
+/// The subtree bound does not help with a long operator chain. `a |>\n b |>\n
+/// c` nests to the left, so every operator node of the chain starts on the
+/// chain's first row and none is pruned. `operator_change` therefore applies
+/// `max_row` to the operator itself and emits nothing when its change would
+/// begin below that row. The node's children are still walked: an operator
+/// nested inside it sits on an earlier row and can cover a requested one.
+/// Without this an Enter near the top of an n-step pipeline climbed to the
+/// root from all n operators (issue #906).
 fn collect_changes_bounded(
     node: Node<'_>,
     lines: &[&str],
@@ -1259,7 +1269,7 @@ fn collect_changes_bounded(
             }
         }
         "binary_operator" | "extract_operator" | "namespace_operator" => {
-            operator_change(node, lines, out);
+            operator_change(node, lines, bounds.map(|(_, max_row)| max_row), out);
         }
         "argument" | "parameter" => named_eq_change(node, out),
         _ => {}
@@ -1428,7 +1438,7 @@ fn subtree_has_eol_opener(node: Node<'_>, lines: &[&str]) -> bool {
 /// treating the first operand's already-indented line as a second floor.
 fn owning_statement_indent(node: Node<'_>, lines: &[&str]) -> u32 {
     let mut owner = node;
-    while let Some(parent) = owner.parent() {
+    for parent in ancestors(node) {
         if matches!(
             parent.kind(),
             "program" | "braced_expression" | "argument" | "parameter"
@@ -1453,7 +1463,7 @@ fn owning_statement_indent(node: Node<'_>, lines: &[&str]) -> u32 {
 /// target's column. (`suppressed_as_assignment_rhs` cannot cover this: it
 /// suppresses operators *nested under* an assignment, not the assignment
 /// node itself.)
-fn operator_change(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
+fn operator_change(node: Node<'_>, lines: &[&str], max_row: Option<usize>, out: &mut Vec<Change>) {
     let Some(op) = node.child_by_field_name("operator") else {
         return;
     };
@@ -1461,6 +1471,11 @@ fn operator_change(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
         return;
     };
     if rhs.start_position().row <= op.end_position().row {
+        return;
+    }
+    // The change begins on the row after the operator, so it covers no row at
+    // or above `max_row` when the operator is on that row or below it.
+    if max_row.is_some_and(|max_row| op.end_position().row >= max_row) {
         return;
     }
     if suppressed_as_assignment_rhs(node) {
@@ -1537,7 +1552,7 @@ fn named_eq_change(node: Node<'_>, out: &mut Vec<Change>) {
 /// expression does not.
 fn suppressed_as_assignment_rhs(node: Node<'_>) -> bool {
     let mut child = node;
-    while let Some(parent) = child.parent() {
+    for parent in ancestors(node) {
         match parent.kind() {
             "binary_operator" => {
                 let is_rhs = parent
@@ -1857,6 +1872,15 @@ mod tests {
              if (a)\n    b <- 2\n  else\n    c(3,\n      4)\n}\n",
             "res <- http_head(url)$\n  then(function(x) {\n    x + 1\n  })\n",
             "dt[, y :=\n     z]\nrepeat\n  f(\n    1)\nresult <- a +\n  b\n",
+            // Operator chains nest to the left, so each operator below starts
+            // on its chain's first row and only the operator's own row can
+            // rule its change out (#906): a pipeline with a multi-line step
+            // and a chain inside an argument, a called extract chain, chained
+            // assignments, and a named argument whose value is a chain.
+            "r <- x |>\n  f() |>\n  g(\n    a +\n      b,\n    c\n  ) |>\n  h() |>\n  k()\n",
+            "res <- a$\n  b$\n  then(\n    x |>\n      g()\n  )$\n  done()\n",
+            "x <-\n  y <-\n  a +\n  b +\n  c\nfit <- lm(y ~ a +\n  b +\n  c, data = d)\n",
+            "f(a =\n    x |>\n      g() |>\n      h(),\n  b = (p ||\n    q) &&\n    r\n)\n",
         ];
         for source in sources {
             let tree = with_parser(|p| p.parse(source, None)).expect("test source must parse");
@@ -1876,6 +1900,25 @@ mod tests {
                         "pruned per-line query diverged on line {line} ({style:?}) of \
                          {source:?}"
                     );
+                    // The on-type judge asks for two rows at once: a reference
+                    // row and the probe row below it.
+                    for above in 0..line {
+                        let pair = accepted_indents_for_lines(
+                            source,
+                            tree.root_node(),
+                            2,
+                            style,
+                            &[above, line],
+                        );
+                        let above_reference =
+                            whole_document_expectation(tree.root_node(), &lines, 2, style, above);
+                        assert_eq!(
+                            pair,
+                            [above_reference, reference.clone()],
+                            "pruned query for lines {above} and {line} diverged ({style:?}) on \
+                             {source:?}"
+                        );
+                    }
                 }
             }
         }
