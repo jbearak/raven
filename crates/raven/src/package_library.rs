@@ -2025,6 +2025,35 @@ impl PackageLibrary {
             .and_then(|info| info.nse_declarations.policies.get(name).cloned())
     }
 
+    /// What an installed package that is **not** in the cache declares in
+    /// `raven/nse.toml`, read from disk without loading the package: its
+    /// `NAMESPACE` for the names it exports by name (a pattern export proves
+    /// nothing here) and the sidecar itself. `None` for a cached package
+    /// (its cache entry is the authority), one that isn't installed, and one
+    /// that declares nothing for such a name.
+    ///
+    /// Synchronous, two small reads, and the cache is not touched: whether a
+    /// package is cached decides how other calls are checked, so a caller
+    /// that only wants this package's declaration must not warm it. Callers
+    /// read once per diagnostic pass, outside the usage walk.
+    pub(crate) fn uncached_declarations(
+        &self,
+        package: &str,
+    ) -> Option<crate::nse_declarations::Declarations> {
+        if is_load_all_sentinel(package) || self.is_cached_sync(package) {
+            return None;
+        }
+        let dir = self.find_package_directory(package)?;
+        let exports: HashSet<String> =
+            crate::namespace_parser::parse_namespace_attachment_visible_explicit_exports(
+                &dir.join("NAMESPACE"),
+            )
+            .into_iter()
+            .collect();
+        let declared = crate::nse_declarations::load_declared_policies(&dir, &exports);
+        (!declared.is_empty()).then_some(declared)
+    }
+
     /// The `[[operator]]` form `package` declares for its exported infix
     /// operator `op` in `raven/nse.toml`. Same cached-only contract as
     /// [`Self::declared_nse_policy`].

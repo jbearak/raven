@@ -10084,16 +10084,21 @@ fn infix_sites_from_snapshot(
     if !text.contains(":=") && !text.contains('%') {
         return None;
     }
-    // (operator, operator token) for each declared operator call.
-    let mut calls: Vec<(&str, Node)> = Vec::new();
+    // (operator, operator token, whether the file-wide lookup finds a
+    // declaration) for each operator call some declaration or
+    // `supplementary_infix_policy` may apply to.
+    let mut calls: Vec<(&str, Node, bool)> = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "binary_operator"
             && let Some(op) = declarable_infix_operator(node, text)
             && let Some(operator) = node.child_by_field_name("operator")
-            && declared_infix_operator(op, operator.start_byte(), analysis) != (None, None)
         {
-            calls.push((op, operator));
+            let declared =
+                declared_infix_operator(op, operator.start_byte(), analysis) != (None, None);
+            if declared || analysis.may_have_supplementary_infix_policy(op) {
+                calls.push((op, operator, declared));
+            }
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
@@ -10101,7 +10106,7 @@ fn infix_sites_from_snapshot(
     if calls.is_empty() {
         return None;
     }
-    calls.sort_by_key(|(_, operator)| operator.start_byte());
+    calls.sort_by_key(|(_, operator, _)| operator.start_byte());
     let artifacts = snapshot.artifacts_map.get(uri)?;
     let late_defs = function_defs_by_name(artifacts);
     let line_starts: Vec<usize> = std::iter::once(0)
@@ -10117,7 +10122,7 @@ fn infix_sites_from_snapshot(
     snapshot.with_scope_stream(uri, cancel, |stream| {
         let stream = stream?;
         let mut sites = HashMap::with_capacity(calls.len());
-        for (op, operator) in calls {
+        for (op, operator, declared) in calls {
             if cancel.is_cancelled() {
                 return None;
             }
@@ -10167,10 +10172,158 @@ fn infix_sites_from_snapshot(
                 Some(_) => InfixSite::Shadowed,
                 None => attached_at(stream, snapshot, analysis, None),
             };
+            let site = match site {
+                InfixSite::Packages(_) if !declared => InfixSite::Undeclared,
+                site => site,
+            };
             sites.insert(operator.start_byte(), site);
         }
         Some(sites)
     })
+}
+
+/// [`NseAnalysis::uncached_alias_policies`] for the analysis's file.
+///
+/// `resolve_call_arg_policy` and `declared_infix_operator` resolve a
+/// `name <- pkg::target` alias through the package cache, and `raven check`
+/// loads only the packages a checked file attaches or imports, so an alias
+/// to any other package found no declaration there (issue #900). The
+/// language server loads the packages a document names with `pkg::` before
+/// it publishes, so it had the declaration already. Loading the package
+/// here as well would change how unrelated calls are checked (a cached
+/// package's exports resolve calls that are otherwise left alone), so only
+/// its declaration is read, from disk, and only the alias uses it.
+///
+/// A name the package also declares as an `[[operator]]` is left out. With
+/// the package cached, the operator's form decides how `x[...] OP value` is
+/// read and still checks the call heads in `value`; the `[[function]]`
+/// policy alone would skip `value` whole.
+fn uncached_alias_policies(
+    snapshot: &DiagnosticsSnapshot,
+    analysis: &NseAnalysis,
+) -> HashMap<String, crate::nse_declarations::DeclaredPolicies> {
+    let mut policies = HashMap::new();
+    if !snapshot.cross_file_config.packages_enabled || !snapshot.package_library_ready {
+        return policies;
+    }
+    let last = analysis
+        .local_callee_aliases
+        .values()
+        .filter_map(|alias| match alias {
+            LocalCalleeAlias::Qualified { package, .. } => Some(package),
+            LocalCalleeAlias::Unknown => None,
+        });
+    let mut read = HashSet::new();
+    for package in last {
+        if !read.insert(package) || !crate::r_subprocess::is_valid_package_name(package) {
+            continue;
+        }
+        if let Some(mut declared) = snapshot.package_library.uncached_declarations(package) {
+            declared
+                .policies
+                .retain(|name, _| !declared.operators.contains_key(name));
+            if !declared.policies.is_empty() {
+                policies.insert(package.clone(), declared.policies);
+            }
+        }
+    }
+    policies
+}
+
+/// [`NseAnalysis::stable_callees`]: of the names the suppression added in
+/// issue #900 can rest on (the file's aliases to packages the cache doesn't
+/// hold), those whose top-level assignments are the only thing in sight
+/// that can decide what a call of the name runs:
+///
+/// - every mention of the name in the file is a top-level assignment to it
+///   or a call of it ([`only_bound_and_called`]). `rm(name)`,
+///   `assign("name", ...)`, `body(name) <- ...`, a `for` variable or formal
+///   of that name, and a `<<-` from a function body are all something else;
+/// - no other file in the snapshot (the files it sources and the files that
+///   source it) binds the name at top level or removes it. Scope keeps this
+///   file's binding over a sourced file's later one, so a call site can't
+///   tell which it runs under.
+///
+/// Almost always empty, and then it costs one pass over the file's callable
+/// top-level names. Otherwise one walk of the tree per name.
+fn stable_callees(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    root: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> HashSet<String> {
+    analysis
+        .local_callee_bindings
+        .keys()
+        .filter(|key| {
+            matches!(
+                analysis.local_callee_aliases.get(*key),
+                Some(LocalCalleeAlias::Qualified { package, .. })
+                    if analysis.uncached_alias_policies.contains_key(package)
+            )
+        })
+        .filter(|key| {
+            let name = unquote_backtick_name(key).unwrap_or(key);
+            let is_name =
+                |spelling: &str| unquote_backtick_name(spelling).unwrap_or(spelling) == name;
+            let elsewhere = snapshot.artifacts_map.iter().any(|(other, artifacts)| {
+                other != uri
+                    && (artifacts.exported_interface.contains_key(name)
+                        || artifacts.timeline.iter().any(|event| {
+                            matches!(
+                                event,
+                                scope::ScopeEvent::Removal { symbols, .. }
+                                    if symbols.iter().any(|removed| is_name(removed))
+                            )
+                        }))
+            });
+            !elsewhere && only_bound_and_called(root, text, name, false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether every mention of `name` under `node` is a top-level assignment
+/// to it or a call of it. A string that contains the name counts as a
+/// mention of another kind (`assign("name", ...)`, `do.call("name", ...)`),
+/// and so does the name as an argument (`rm(name)`, `body(name) <- ...`,
+/// `sapply(x, name)`, `.GlobalEnv$name <- ...`). `pkg::name` and an
+/// argument label are not mentions of the binding. A name put together at
+/// run time (`assign(paste0("na", "me"), ...)`) is out of reach.
+/// `in_function` is whether `node` is inside a function definition.
+fn only_bound_and_called(node: Node, text: &str, name: &str, in_function: bool) -> bool {
+    match node.kind() {
+        "comment" => true,
+        "string" => !node_text(node, text).contains(name),
+        "identifier" => {
+            let spelling = node_text(node, text);
+            if unquote_backtick_name(spelling).unwrap_or(spelling) != name {
+                return true;
+            }
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            let is =
+                |field: &str| parent.child_by_field_name(field).map(|n| n.id()) == Some(node.id());
+            match parent.kind() {
+                "namespace_operator" => true,
+                "call" => is("function"),
+                "argument" => is("name"),
+                "binary_operator" => {
+                    !in_function
+                        && assignment_target_node(parent).map(|n| n.id()) == Some(node.id())
+                }
+                _ => false,
+            }
+        }
+        kind => {
+            let in_function = in_function || kind == "function_definition";
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .all(|child| only_bound_and_called(child, text, name, in_function))
+        }
+    }
 }
 
 /// [`InfixSite::Packages`] at the stream's cursor: the attached packages,
@@ -10289,8 +10442,10 @@ fn collect_undefined_variables_from_snapshot(
         &cross_file_nse.deferred_nse,
         &cross_file_nse.deferred_funcs,
     );
+    nse_analysis.uncached_alias_policies = uncached_alias_policies(snapshot, &nse_analysis);
     nse_analysis.infix_sites =
         infix_sites_from_snapshot(snapshot, uri, node, text, &nse_analysis, cancel);
+    nse_analysis.stable_callees = stable_callees(snapshot, uri, node, text, &nse_analysis);
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
         node,
@@ -20388,6 +20543,56 @@ enum LocalCalleeAlias {
     Unknown,
 }
 
+/// The last callable top-level binding of a name
+/// ([`NseAnalysis::local_callee_bindings`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct CalleeBindingSite {
+    /// Where the binding's assignment ends.
+    end: usize,
+    /// Whether the assignment is a statement of the file itself, not
+    /// nested in a branch, a loop or a block, so that it has run by the
+    /// time anything below it does.
+    unconditional: bool,
+}
+
+/// Whether the call at `call` runs under `binding`, the last callable
+/// top-level binding of its callee, as far as the text of the file shows:
+/// the binding is made unconditionally, and the call is written below it.
+///
+/// A call written above the binding can run after it, from a function body
+/// or a loop, and the lookups that predate issue #900 apply a binding to
+/// those as well. Nothing in the text says when such a call runs (a function
+/// can be called before the binding through S3 dispatch or a sourced file;
+/// a loop's first pass reaches the call before the binding), so a
+/// suppression that is new stays out of them.
+///
+/// Used only to grant a suppression, together with
+/// [`NseAnalysis::stable_callees`].
+fn callee_binding_reaches(call: Node, binding: CalleeBindingSite) -> bool {
+    binding.unconditional && binding.end <= call.start_byte()
+}
+
+/// Whether a function enclosing `call` binds `name` (in the
+/// [`canonical_use_name`](crate::r_names::canonical_use_name) spelling)
+/// itself: as a formal, or by an assignment of something callable anywhere
+/// in its body. The call then need not run under a top-level binding of
+/// `name`.
+fn enclosing_function_binds(call: Node, text: &str, name: &str) -> bool {
+    let is_name = |raw: &str| crate::r_names::canonical_use_name(raw) == name;
+    crate::parser_pool::ancestors(call)
+        .filter(|ancestor| ancestor.kind() == "function_definition")
+        .any(|def| {
+            if function_formal_names(def, text).iter().any(|f| is_name(f)) {
+                return true;
+            }
+            let mut bound = HashSet::new();
+            if let Some(body) = function_body_node(def) {
+                potential_function_binding_names(body, text, &mut bound);
+            }
+            bound.iter().any(|b| is_name(b))
+        })
+}
+
 /// How a top-level identifier's last binding presents in call position, for the
 /// direct-call NSE policy (issue #450). A literal definition keeps its own
 /// inferred policy; any other callable value is an alias/rebinding tracked in
@@ -20509,6 +20714,12 @@ pub(crate) struct NseAnalysis<'a> {
     /// `local_function_defs` / `local_function_policies` by last-binding-wins
     /// bookkeeping in [`collect_nse_facts`].
     local_callee_aliases: HashMap<String, LocalCalleeAlias>,
+    /// Where each name in `local_callee_shadows` was last bound. The maps
+    /// above are file-wide and order-blind; the reason to skip an argument
+    /// added in issue #900 reads this through [`callee_binding_reaches`], so
+    /// that it applies only where the binding it was read from is the one
+    /// the call runs under.
+    local_callee_bindings: HashMap<String, CalleeBindingSite>,
     /// Packages detectably in play across the file/workspace: `library()` /
     /// `require()` calls, DESCRIPTION `Imports`, `importFrom`, and test-attached
     /// packages. A loaded package shadows base when classifying a bare callee.
@@ -20589,6 +20800,16 @@ pub(crate) struct NseAnalysis<'a> {
     /// pipeline, where [`declared_infix_operator`] falls back to the
     /// file-wide package set.
     infix_sites: Option<HashMap<usize, InfixSite>>,
+    /// The `[[function]]` policies of packages that a top-level
+    /// `name <- pkg::target` alias names and the package cache doesn't hold,
+    /// by package (see [`uncached_alias_policies`]). Read only through
+    /// [`NseAnalysis::uncached_alias_policy`], for a call of such an alias.
+    uncached_alias_policies: HashMap<String, crate::nse_declarations::DeclaredPolicies>,
+    /// The alias names (keyed like `local_callee_bindings`) whose top-level
+    /// assignments are the only thing in sight that can decide what a call
+    /// of the name runs (see [`stable_callees`]). The suppression added in
+    /// issue #900 requires the alias's name here.
+    stable_callees: HashSet<String>,
 }
 
 /// What a declarable infix operator (`:=`, `%op%`) reaches at one call
@@ -20607,9 +20828,57 @@ enum InfixSite {
     /// attached at this position (this file's earlier `library()` calls,
     /// what callers lend, the package's own imports).
     Packages(Vec<String>),
+    /// A call [`declared_infix_operator`] finds no declaration for through
+    /// the file-wide package set, and so reads as if it had no site. It has
+    /// one for [`supplementary_infix_policy`]: the call's own scope doesn't
+    /// rebind the operator.
+    Undeclared,
 }
 
 impl<'a> NseAnalysis<'a> {
+    /// Whether [`supplementary_infix_policy`] could have a policy for some
+    /// call of `op` in the file: the test [`infix_sites_from_snapshot`] uses
+    /// to give the call a site. Errs toward `true`.
+    fn may_have_supplementary_infix_policy(&self, op: &str) -> bool {
+        if self.local_callee_bindings.is_empty() || raven_models_infix_operator(op, self) {
+            return false;
+        }
+        matches!(
+            self.local_callee_aliases.get(&format!("`{op}`")),
+            Some(LocalCalleeAlias::Qualified { package, .. })
+                if self.uncached_alias_policies.contains_key(package)
+        )
+    }
+
+    /// The policy `package` declares for `target` on disk, for the call at
+    /// `call` of the alias `name <- package::target` (`name` as
+    /// `collect_nse_facts` keys it), when `package` isn't cached and so
+    /// [`package_arg_policy`] found none.
+    ///
+    /// The cached lookup applies an alias to every call of the name in the
+    /// file, above the binding too (a limitation
+    /// [`declared_infix_operator`] documents). This one is new, so it is
+    /// held to where the alias is what the call runs under:
+    /// [`callee_binding_reaches`] the call, the name is among the
+    /// [`stable_callees`](Self::stable_callees), and no enclosing function
+    /// binds it.
+    fn uncached_alias_policy(
+        &self,
+        call: Node,
+        text: &str,
+        name: &str,
+        package: &str,
+        target: &str,
+    ) -> Option<crate::nse::ArgPolicy> {
+        let target = unquote_backtick_name(target).unwrap_or(target);
+        let policy = self.uncached_alias_policies.get(package)?.get(target)?;
+        let binding = self.local_callee_bindings.get(name)?;
+        (callee_binding_reaches(call, *binding)
+            && self.stable_callees.contains(name)
+            && !enclosing_function_binds(call, text, name))
+        .then(|| policy.clone())
+    }
+
     /// Walk `root` once to gather the file-local facts (top-level function
     /// definitions, data.table-like objects), bundle them with the supplied
     /// config flags and package context (including the file's `pkg::`
@@ -20642,6 +20911,7 @@ impl<'a> NseAnalysis<'a> {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
         let mut local_callee_shadows = HashSet::new();
         let mut local_callee_aliases: HashMap<String, LocalCalleeAlias> = HashMap::new();
+        let mut local_callee_bindings: HashMap<String, CalleeBindingSite> = HashMap::new();
         let mut data_table_objects = HashSet::new();
         let mut non_data_table_objects = HashSet::new();
         let mut class_transitions: HashMap<String, Vec<(usize, DataTableClass)>> = HashMap::new();
@@ -20695,6 +20965,7 @@ impl<'a> NseAnalysis<'a> {
             &mut formal_order,
             &mut local_callee_shadows,
             &mut local_callee_aliases,
+            &mut local_callee_bindings,
             &mut data_table_objects,
             &mut non_data_table_objects,
             &mut class_transitions,
@@ -20727,6 +20998,7 @@ impl<'a> NseAnalysis<'a> {
             local_function_policies,
             local_callee_shadows,
             local_callee_aliases,
+            local_callee_bindings,
             in_play_packages,
             self_nse_package,
             bracket_nse_in_play,
@@ -20741,6 +21013,8 @@ impl<'a> NseAnalysis<'a> {
             directive_nse: HashMap::new(),
             deferred_directive_nse: HashMap::new(),
             infix_sites: None,
+            uncached_alias_policies: HashMap::new(),
+            stable_callees: HashSet::new(),
         };
         // Issue #433, second (context-aware) inference pass: a local function
         // that forwards its `...` directly into a covered verb's data-mask
@@ -21165,6 +21439,7 @@ fn collect_nse_facts<'t>(
     formal_order: &mut FormalOrderTracker,
     local_callee_shadows: &mut HashSet<String>,
     local_callee_aliases: &mut HashMap<String, LocalCalleeAlias>,
+    local_callee_bindings: &mut HashMap<String, CalleeBindingSite>,
     data_table_objects: &mut HashSet<String>,
     non_data_table_objects: &mut HashSet<String>,
     class_transitions: &mut HashMap<String, Vec<(usize, DataTableClass)>>,
@@ -21220,6 +21495,11 @@ fn collect_nse_facts<'t>(
         match classify_callee_binding(value, text) {
             Some(binding) => {
                 local_callee_shadows.insert(callee_name.to_string());
+                let site = local_callee_bindings
+                    .entry(callee_name.to_string())
+                    .or_default();
+                site.end = node.end_byte();
+                site.unconditional = node.parent().is_some_and(|p| p.kind() == "program");
                 match binding {
                     LocalCalleeBinding::Definition(def) => {
                         // Record this definition's formal order for the
@@ -21277,6 +21557,7 @@ fn collect_nse_facts<'t>(
             formal_order,
             local_callee_shadows,
             local_callee_aliases,
+            local_callee_bindings,
             data_table_objects,
             non_data_table_objects,
             class_transitions,
@@ -22653,8 +22934,13 @@ fn resolve_call_arg_policy(
                 package,
                 name: target,
             } => {
-                let policy =
-                    package_arg_policy(package, target, analysis).unwrap_or(ArgPolicy::Standard);
+                let policy = package_arg_policy(package, target, analysis)
+                    .or_else(|| {
+                        analysis
+                            .uncached_alias_policy(call_node, text, name, package, target)
+                            .filter(|policy| arguments_bind_as_written(call_node, text, policy))
+                    })
+                    .unwrap_or(ArgPolicy::Standard);
                 upgrade_plyr_ply_dots(call_node, target, text, analysis, policy)
             }
             // An opaque callable whose policy we cannot prove: suppress
@@ -22722,6 +23008,38 @@ fn resolve_call_arg_policy(
     }
     // 6. Unresolved: suppress arguments.
     ArgPolicy::WholeCall
+}
+
+/// Whether the per-formal mask of `policy` binds the arguments of `call` to
+/// the formals R binds them to, as far as the call's text shows. It doesn't
+/// when a label is no formal's exact name (R matches by prefix too), when
+/// the call forwards `...` (which may be empty, or carry a named argument),
+/// or when a pipe feeds the call (a placeholder may put the piped value
+/// anywhere). The mask is used regardless for every policy that predates
+/// issue #900; this guards only the one added there.
+fn arguments_bind_as_written(call: Node, text: &str, policy: &crate::nse::ArgPolicy) -> bool {
+    let crate::nse::ArgPolicy::PerFormal { formals, .. } = policy else {
+        return true;
+    };
+    if call_is_pipe_fed(call, text) {
+        return false;
+    }
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return true;
+    };
+    let mut cursor = args.walk();
+    args.children(&mut cursor)
+        .filter(|arg| arg.kind() == "argument")
+        .all(|arg| {
+            let forwards_dots = arg
+                .child_by_field_name("value")
+                .is_some_and(|value| matches!(value.kind(), "dots" | "dot_dot_i"));
+            let exact_label = arg.child_by_field_name("name").is_none_or(|label| {
+                let label = node_text(label, text);
+                formals.iter().any(|formal| formal == label)
+            });
+            !forwards_dots && exact_label
+        })
 }
 
 /// Issue #467: plyr's `*ply` split-apply verbs forward their `...` to `.fun`
@@ -23539,6 +23857,10 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
 /// it reads the file-wide in-play packages and the same alias map.
 /// `tests/package_declaration_choice.rs` holds the programs R runs that a
 /// narrower rule has to keep quiet.
+///
+/// Where this lookup finds nothing, [`supplementary_infix_policy`] may still
+/// have a reason to skip an operand (issue #900): an alias to a package the
+/// cache doesn't hold. That never changes what this function returns.
 fn declared_infix_operator(
     op: &str,
     operator_start: usize,
@@ -23561,7 +23883,7 @@ fn declared_infix_operator(
     let attached = match site {
         Some(InfixSite::Shadowed) => return none,
         Some(InfixSite::Packages(packages)) => packages,
-        None => &analysis.in_play_packages,
+        Some(InfixSite::Undeclared) | None => &analysis.in_play_packages,
     };
     let lookup = |pkg: &str| {
         let found = (
@@ -23596,6 +23918,45 @@ fn declared_infix_operator(
                 .and_then(|owner| lookup(&owner))
         })
         .unwrap_or(none)
+}
+
+/// A policy for `lhs OP rhs` from a source [`declared_infix_operator`] doesn't
+/// read (issue #900), consulted only where that lookup finds nothing, so it
+/// can skip an operand the plain walk would visit and can do nothing else.
+/// `node` is the `binary_operator`.
+///
+/// The one source is an alias `` `op` <- pkg::`op` `` to a package the cache
+/// doesn't hold, when that is the last top-level binding of the operator:
+/// [`NseAnalysis::uncached_alias_policy`].
+///
+/// It needs a site that isn't [`InfixSite::Shadowed`]: without one nothing
+/// says the call's own scope (an enclosing function, a sourced file) doesn't
+/// rebind the operator. The site doesn't see a formal named after the
+/// operator, so [`enclosing_function_binds`] is asked as well. Like every
+/// declaration, it gives way to the operators Raven models itself.
+fn supplementary_infix_policy(
+    node: Node,
+    text: &str,
+    op: &str,
+    operator_start: usize,
+    analysis: &NseAnalysis,
+) -> Option<crate::nse::ArgPolicy> {
+    if let InfixSite::Shadowed = analysis.infix_sites.as_ref()?.get(&operator_start)? {
+        return None;
+    }
+    if raven_models_infix_operator(op, analysis) {
+        return None;
+    }
+    // `collect_nse_facts` keys a non-syntactic binding with its backticks.
+    let key = format!("`{op}`");
+    match analysis.local_callee_aliases.get(&key)? {
+        LocalCalleeAlias::Qualified { package, name }
+            if unquote_backtick_name(name).unwrap_or(name) == op =>
+        {
+            analysis.uncached_alias_policy(node, text, &key, package, name)
+        }
+        _ => None,
+    }
 }
 
 /// Visit an infix `binary_operator` whose operator a package declares in its
@@ -23638,7 +23999,25 @@ fn collect_declared_infix_usages<'a>(
         return true;
     }
     let Some(policy) = policy else {
-        return false;
+        // No declaration applies. Before issue #900 that meant the plain
+        // walk of both operands; now an operand is skipped when
+        // `supplementary_infix_policy` has a reason, and the other is
+        // walked exactly as the plain walk would.
+        let Some(policy) =
+            supplementary_infix_policy(node, text, op, operator.start_byte(), analysis)
+        else {
+            return false;
+        };
+        let mask = crate::nse::suppressed_arguments(&policy, &[None, None], false);
+        if !mask.contains(&true) {
+            return false;
+        }
+        for (operand, suppress) in [lhs, rhs].into_iter().zip(mask) {
+            if !suppress {
+                collect_usages_with_analysis(operand, text, analysis, context, used);
+            }
+        }
+        return true;
     };
     let mask = crate::nse::suppressed_arguments(&policy, &[None, None], false);
     for (operand, suppress) in [lhs, rhs].into_iter().zip(mask) {
