@@ -48,7 +48,7 @@ import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
 export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
-const SOCKET_WAIT_MS = 10_000;
+let SOCKET_WAIT_MS = 10_000;
 /** Longest a new console's first send waits for its breakpoints. */
 const MIRROR_GATE_MS = 15_000;
 
@@ -79,14 +79,14 @@ const links = new Map<string, ConsoleLink>();
 /** Consoles a session is being started for (a stop can be heard twice). */
 const attaching = new Set<string>();
 /**
- * Consoles a launch (F5, launch.json, Raven commands) has chosen, until its
- * session starts (or the claim expires). A stop heard meanwhile is the
- * launch's to show: F5 can reattach a stopped persistent console, whose
- * subscription then replays the stop, and the console replays it to the
- * launch's session too.
+ * Consoles a launch (F5, launch.json, Raven commands) has chosen: held while
+ * the launch resolves, then until its session starts or the claim expires
+ * (the timer). A stop heard meanwhile is the launch's to show: F5 can
+ * reattach a stopped persistent console, whose subscription then replays the
+ * stop, and the console replays it to the launch's session too.
  */
-const launch_claims = new Map<string, ReturnType<typeof setTimeout>>();
-const LAUNCH_CLAIM_MS = 10_000;
+const launch_claims = new Map<string, ReturnType<typeof setTimeout> | undefined>();
+let LAUNCH_CLAIM_MS = 10_000;
 /** Launches still choosing their console, which may be any of them. */
 let launches_choosing = 0;
 /**
@@ -96,6 +96,13 @@ let launches_choosing = 0;
  */
 const deferred_stops = new Set<string>();
 
+/** Hold `ipc` for a launch still resolving (no expiry). */
+function hold_console(ipc: string): void {
+    clearTimeout(launch_claims.get(ipc));
+    launch_claims.set(ipc, undefined);
+}
+
+/** Claim `ipc` for a resolved launch until its session starts. */
 function claim_console(ipc: string): void {
     clearTimeout(launch_claims.get(ipc));
     launch_claims.set(ipc, setTimeout(() => {
@@ -107,6 +114,12 @@ function claim_console(ipc: string): void {
 function release_console(ipc: string): void {
     clearTimeout(launch_claims.get(ipc));
     launch_claims.delete(ipc);
+}
+
+/** Test hook: shorter claim and socket waits. */
+export function _set_launch_timeouts_for_test(claim_ms: number, socket_ms: number): void {
+    LAUNCH_CLAIM_MS = claim_ms;
+    SOCKET_WAIT_MS = socket_ms;
 }
 
 function reconsider_stops(): void {
@@ -332,6 +345,8 @@ class ConsoleLink {
                     this.mirror();
                 }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
+                // R is back at the prompt: a held stop is over.
+                if (msg.event === 'running') deferred_stops.delete(this.ipc);
                 // The debugger started after R ran its startup profiles: a
                 // mirror that gave up waiting for it is sent again.
                 if (msg.event === 'ready') this.mirror();
@@ -496,6 +511,7 @@ class ConsoleLink {
     dispose(): void {
         this.mirrored_once();
         this.closed = true;
+        deferred_stops.delete(this.ipc);
         this.control?.destroy();
         this.states = [];
         update_status();
@@ -605,22 +621,38 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
     async resolveDebugConfiguration(_folder, config) {
         const given: unknown = config.consoleSocket;
         if (typeof given === 'string' && attaching.has(given)) return resolve_configuration(config);
-        if (typeof given === 'string') claim_console(given);
+        // Until it knows its console, a launch holds back every stop; then
+        // only its console's.
+        let choosing = typeof given !== 'string';
+        let held: string | undefined;
+        const hold = (ipc: string) => {
+            held = ipc;
+            hold_console(ipc);
+            if (choosing) {
+                choosing = false;
+                launches_choosing--;
+                reconsider_stops();
+            }
+        };
+        if (typeof given === 'string') hold(given);
         else launches_choosing++;
         try {
-            const resolved = await resolve_configuration(config);
+            const resolved = await resolve_configuration(config, hold);
             const chosen: unknown = resolved?.consoleSocket;
             if (typeof chosen === 'string') claim_console(chosen);
-            else if (typeof given === 'string') release_console(given);
+            if (held !== undefined && held !== chosen) release_console(held);
             return resolved;
         } finally {
-            if (typeof given !== 'string') launches_choosing--;
+            if (choosing) launches_choosing--;
             reconsider_stops();
         }
     },
 };
 
-async function resolve_configuration(config: vscode.DebugConfiguration): Promise<vscode.DebugConfiguration | undefined> {
+async function resolve_configuration(
+    config: vscode.DebugConfiguration,
+    on_console: (ipc: string) => void = () => undefined,
+): Promise<vscode.DebugConfiguration | undefined> {
     if (!debugger_enabled()) {
         void vscode.window.showInformationMessage(
             'Raven: the R debugger is turned off (raven.debugger.enabled).',
@@ -656,6 +688,7 @@ async function resolve_configuration(config: vscode.DebugConfiguration): Promise
         }
         config.consoleSocket = ipc;
     }
+    on_console(config.consoleSocket);
     if (!(await wait_for_file(dap_socket_for(config.consoleSocket), SOCKET_WAIT_MS))) {
         void vscode.window.showErrorMessage(
             "Raven: this R console wasn't started with the debugger. Close it and open a new R console.",

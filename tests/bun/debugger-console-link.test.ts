@@ -27,6 +27,8 @@ const started: Array<{ consoleSocket?: string }> = [];
 /** Configuration providers by registration order. */
 const config_providers: Array<{ resolveDebugConfiguration(...a: unknown[]): unknown }> = [];
 const error_messages: string[] = [];
+/** Open documents (`workspace.textDocuments`). */
+const text_documents: Array<{ uri: { fsPath: string }; isDirty: boolean; save(): Promise<boolean> }> = [];
 
 class SourceBreakpoint {
     enabled = true;
@@ -87,12 +89,12 @@ mock.module('vscode', () => ({
     },
     workspace: {
         workspaceFolders: undefined,
-        textDocuments: [],
+        get textDocuments() { return text_documents; },
         getConfiguration: () => ({ get: (_k: string, fallback?: unknown) => fallback }),
     },
 }));
 
-const { register_debugger, register_debugger_unavailable } = await import('../../editors/vscode/src/debugger/index');
+const { register_debugger, register_debugger_unavailable, _set_launch_timeouts_for_test } = await import('../../editors/vscode/src/debugger/index');
 const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
 
 // --------------------------------------------------------------- fake console
@@ -623,16 +625,98 @@ describe('an explicit launch', () => {
         await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
         await settle(200);
         fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
-        await config_providers[0].resolveDebugConfiguration(
+        _set_launch_timeouts_for_test(600, 10_000);
+        try {
+            await config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'Source R file', consoleSocket: sock },
+            );
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await settle(300);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            // The claim expires with no session: the stop auto-attaches.
+            await until(() => started.some((c) => c.consoleSocket === sock), 3_000);
+        } finally {
+            _set_launch_timeouts_for_test(10_000, 10_000);
+        }
+    });
+
+    test('a launch still resolving keeps its console past the claim timeout', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        // Saving the program takes longer than a claim lasts.
+        const program = path.join(root, 'slow-save.R');
+        let saved: (ok: boolean) => void = () => undefined;
+        text_documents.push({ uri: { fsPath: program }, isDirty: true, save: () => new Promise((r) => { saved = r; }) });
+        _set_launch_timeouts_for_test(200, 10_000);
+        try {
+            const resolving = config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'Source R file', program, consoleSocket: sock },
+            );
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await settle(500);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            saved(true);
+            expect(await resolving).toMatchObject({ consoleSocket: sock });
+            for (const l of start_listeners) l({ type: 'raven-r', id: 'slow', configuration: { consoleSocket: sock } });
+            await settle(400);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+        } finally {
+            text_documents.length = 0;
+            _set_launch_timeouts_for_test(10_000, 10_000);
+        }
+    });
+
+    test("a launch that has chosen its console doesn't hold back another console's stop", async () => {
+        const b = await console_at();
+        const a = await console_at();
+        set_breakpoints([]);
+        attach(b.sock);
+        attach(a.sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === a.sock));
+        await settle(200);
+        // F5 with no console given picks the newest (A) and waits for its
+        // DAP socket, which doesn't exist yet.
+        const resolving = config_providers[0].resolveDebugConfiguration(
             undefined,
-            { type: 'raven-r', request: 'launch', name: 'Source R file', consoleSocket: sock },
+            { type: 'raven-r', request: 'launch', name: 'R console' },
         );
-        con.push({ event: 'stopped', reason: 'breakpoint' });
-        await settle(300);
-        expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
-        // The claim expires (10 s) with no session: the stop auto-attaches.
-        await until(() => started.some((c) => c.consoleSocket === sock), 12_000);
-    }, 20_000);
+        await settle(100);
+        b.con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => started.some((c) => c.consoleSocket === b.sock), 2_000);
+        fs.writeFileSync(path.join(path.dirname(a.sock), 'd'), '');
+        expect(await resolving).toMatchObject({ consoleSocket: a.sock });
+        for (const l of start_listeners) l({ type: 'raven-r', id: 'f5a', configuration: { consoleSocket: a.sock } });
+    });
+
+    test('a held stop that R has moved past is dropped', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        // The launch waits for a DAP socket that never appears, and fails.
+        _set_launch_timeouts_for_test(10_000, 600);
+        try {
+            const resolving = config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'Source R file', consoleSocket: sock },
+            );
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await settle(100);
+            con.push({ event: 'running' });
+            expect(await resolving).toBeUndefined();
+            await settle(300);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+        } finally {
+            _set_launch_timeouts_for_test(10_000, 10_000);
+        }
+    });
 });
 
 describe('with the R console turned off', () => {
