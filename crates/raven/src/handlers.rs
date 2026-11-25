@@ -23544,30 +23544,40 @@ fn declared_infix_operator(
         Some(InfixSite::Packages { tiers, inherited }) => (tiers, inherited),
         None => (vec![analysis.in_play_packages.clone()], Vec::new()),
     };
+    // The package a tier member puts `op` on the search path through: its
+    // own export, or (`depends`) one a package it depends on attaches with it.
+    let exporter_of = |pkg: &String| {
+        if lib.namespace_member_status_sync(pkg, op)
+            == crate::package_library::NamespaceMemberStatus::Present
+        {
+            Some(pkg.clone())
+        } else {
+            lib.find_package_owner_for_symbol(op, std::slice::from_ref(pkg))
+                .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
+        }
+    };
+    let last = tiers.len().saturating_sub(1);
     for (index, tier) in tiers.iter().enumerate() {
-        // Packages attached before this tier's (the ordered tiers after it,
-        // short of the last, unordered one, and what callers attached): a
-        // `Depends:` on one of them doesn't move it in front.
-        let attached_before = |owner: &String| {
-            inherited.contains(owner)
-                || tiers
-                    .get(index + 1..tiers.len().saturating_sub(1))
-                    .is_some_and(|earlier| earlier.iter().any(|tier| tier.contains(owner)))
+        // What was attached before this tier: the ordered tiers after it,
+        // short of the last, unordered one, and what callers attached. An
+        // exporter already attached there, directly or through a
+        // `Depends:`, doesn't move in front when this tier attaches it again.
+        let earlier: Vec<&String> = tiers
+            .get(index + 1..last)
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .chain(&inherited)
+            .collect();
+        let attached_before = |exporter: &String| {
+            index < last
+                && earlier
+                    .iter()
+                    .any(|pkg| *pkg == exporter || exporter_of(pkg).as_ref() == Some(exporter))
         };
-        // The package in this tier whose `op` R finds: its own export, or
-        // one a package it depends on puts on the search path with it.
         let mut exporters: Vec<String> = Vec::new();
         for pkg in tier {
-            let exporter = if lib.namespace_member_status_sync(pkg, op)
-                == crate::package_library::NamespaceMemberStatus::Present
-            {
-                Some(pkg.clone())
-            } else {
-                lib.find_package_owner_for_symbol(op, std::slice::from_ref(pkg))
-                    .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
-                    .filter(|owner| !attached_before(owner))
-            };
-            if let Some(exporter) = exporter
+            if let Some(exporter) = exporter_of(pkg).filter(|exporter| !attached_before(exporter))
                 && !exporters.contains(&exporter)
             {
                 exporters.push(exporter);
@@ -33228,7 +33238,13 @@ d[n > 1, older] := 1
         let depends = "library(capa)\nlibrary(wrapplain)\nd <- 1\nd %where% missing_dep\n";
         assert_eq!(where_undefined_names(depends).await, vec!["missing_dep"]);
         // `plain` is already attached, so `wrapplain` doesn't move it in
-        // front of `capa`.
+        // front of `capa`, nor `library(plain)` after `wrapplain`.
+        let depends_first =
+            "library(wrapplain)\nlibrary(capa)\nlibrary(plain)\nd <- 1\nd %where% captured_dep\n";
+        assert_eq!(
+            where_undefined_names(depends_first).await,
+            Vec::<String>::new()
+        );
         let depends_attached =
             "library(plain)\nlibrary(capa)\nlibrary(wrapplain)\nd <- 1\nd %where% captured_dep\n";
         assert_eq!(
