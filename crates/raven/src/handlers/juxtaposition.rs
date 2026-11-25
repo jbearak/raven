@@ -74,6 +74,11 @@ pub(super) fn collect_juxtaposed_expression_errors(
 fn check_sequence(sequence: Node, text: &str, found: &mut Vec<Diagnostic>) {
     let mut cursor = sequence.walk();
     let mut previous: Option<Node> = None;
+    // Only a line's leftmost pair is reported, and the children come in
+    // source order, so later pairs on a row that already has one are skipped
+    // before their positions are computed. Each position is a scan of the
+    // line, which made a line of n juxtaposed tokens cost n scans.
+    let mut reported_row: Option<usize> = None;
     for child in sequence.children(&mut cursor) {
         let statement = child.is_named()
             && !child.is_extra()
@@ -85,8 +90,10 @@ fn check_sequence(sequence: Node, text: &str, found: &mut Vec<Diagnostic>) {
             continue;
         }
         if let Some(first) = previous
+            && reported_row != Some(child.start_position().row)
             && let Some(diagnostic) = juxtaposition(first, child, text)
         {
+            reported_row = Some(child.start_position().row);
             found.push(diagnostic);
         }
         previous = Some(child);
