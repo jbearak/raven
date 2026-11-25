@@ -300,6 +300,34 @@ export function formatTimestamp(ms: number, us: number, zone: string, digits: nu
     return { text, offset };
 }
 
+/**
+ * The instant (ms since the epoch) of a wall-clock date-time in `zone`.
+ * `iso` is an ISO date-time without an offset, as a `datetime-local`
+ * input gives it (`2024-03-01T09:00`, optionally with seconds and a
+ * fraction); NaN when it doesn't parse. The zone resolves as the grid's
+ * formatter resolves it ({@link timestampFormatter}), so a bound typed
+ * from what a cell shows names that cell's instant. A time a DST change
+ * skips or repeats resolves to one of its two candidates.
+ */
+export function zonedTimeToMs(iso: string, zone: string): number {
+    // The wall-clock reading as if it were UTC, then minus the zone's
+    // offset; the second pass settles a guess that crossed a DST change.
+    const wall = Date.parse(`${iso}Z`);
+    if (!Number.isFinite(wall)) return NaN;
+    const offsetAt = (ms: number): number => {
+        const m = /^UTC([+-])(\d\d):(\d\d)(?::(\d\d))?$/.exec(formatTimestamp(ms, 0, zone, 0).offset);
+        if (!m) return 0;
+        const abs = (Number(m[2]) * 60 + Number(m[3])) * 60_000 + Number(m[4] ?? 0) * 1000;
+        return m[1] === '-' ? -abs : abs;
+    };
+    // Past ±8.64e15 ms there is no `Date` to format or to write as code.
+    const inRange = (ms: number): boolean => Math.abs(ms) <= 8.64e15;
+    const guess = wall - offsetAt(wall);
+    if (!inRange(guess)) return NaN;
+    const ms = wall - offsetAt(guess);
+    return inRange(ms) ? ms : NaN;
+}
+
 /** Fractional digits a timestamp needs to show all its precision (0, 3
  *  or 6). Used when the file names no column-wide digits: files written
  *  by an older `View()` lack `raven.subsecond_digits`, and dropping

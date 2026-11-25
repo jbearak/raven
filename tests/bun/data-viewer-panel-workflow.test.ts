@@ -166,7 +166,7 @@ describe('Copy as R code', () => {
         wv.deliver({ type: 'copyAsCode', panelGeneration: gen, requestId: 5, flavor: 'dplyr', hiddenColumns: [6] });
         await flush();
         expect(clipboard).toHaveLength(1);
-        expect(clipboard[0]).toContain('tiny |>\n  arrange(desc(x)) |>\n  select(-lbl)');
+        expect(clipboard[0]).toContain('tiny |>\n  ungroup() |>\n  arrange(desc(x)) |>\n  select(-lbl)');
         expect(last(wv, 'notice')).toMatchObject({ ok: true, message: 'Copied as R code (dplyr)' });
     });
 

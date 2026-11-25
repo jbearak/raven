@@ -84,7 +84,7 @@ import {
     type MissingInfo,
 } from './header-layout';
 import { CellDetailPopover } from './cell-detail-popover';
-import { hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
+import { hasDigitsEffect, hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
 import {
     buildGridColumns,
     capFrozenWidths,
@@ -624,6 +624,7 @@ export function App({
     }, [allGridColumns, display.freezeColumns, gutterPx, gutterTitle, shellWidth, visibleCols]);
     const labelsHaveEffect = hasLabelsEffect(columns);
     const formatHasEffect = hasFormatEffect(columns);
+    const digitsHaveEffect = hasDigitsEffect(columns);
     /** When a filter is active, the host's permutation has length `nrowFiltered`.
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
@@ -652,7 +653,7 @@ export function App({
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
      *  changing the toolbar width — without that the wrap state can be stale.
-     *  `labelsHaveEffect`/`formatHasEffect` are in the deps for the same reason:
+     *  `labelsHaveEffect`/`formatHasEffect`/`digitsHaveEffect` are in the deps for the same reason:
      *  they add/remove the Labels and Format/digits controls (changing the action
      *  group's width) on dataset change without changing the toolbar width. */
     const toolbarChipsWrapped = useToolbarWrap(
@@ -664,7 +665,7 @@ export function App({
         },
         // sortPending/filterPending are deps because the progress pills they
         // drive widen the chip group, which can change whether it must wrap.
-        [sort.keys, displayedFilter.entries, rowCountText, layout.hiddenColumns.length, sortPending, filterPending, labelsHaveEffect, formatHasEffect],
+        [sort.keys, displayedFilter.entries, rowCountText, layout.hiddenColumns.length, sortPending, filterPending, labelsHaveEffect, formatHasEffect, digitsHaveEffect],
     );
     /** Transient progress pills for the toolbar chip group. The data viewer
      *  has no bottom status bar: the sort/filter chip strips carry the full
@@ -2980,21 +2981,25 @@ export function App({
                             >
                                 Format
                             </button>
-                            {/* Digits is a dependent control: shown whenever
-                               Format applies, but disabled (not hidden) while
-                               Format is toggled off — a transient, user-driven
-                               state, unlike the dataset-level no-effect case. */}
-                            <select
-                                className="digits"
-                                value={toolbar.digits}
-                                disabled={!toolbar.formatOn}
-                                onChange={event => setToolbar(t => ({ ...t, digits: Number(event.target.value) }))}
-                                aria-label="Digits"
-                            >
-                                {[0, 1, 2, 3, 4, 5, 6].map(d => (
-                                    <option key={d} value={d}>{d}</option>
-                                ))}
-                            </select>
+                            {/* Digits is a dependent control: shown whenever a
+                               column would follow it (one with a recognized
+                               source format doesn't), but disabled (not
+                               hidden) while Format is toggled off — a
+                               transient, user-driven state, unlike the
+                               dataset-level no-effect case. */}
+                            {digitsHaveEffect && (
+                                <select
+                                    className="digits"
+                                    value={toolbar.digits}
+                                    disabled={!toolbar.formatOn}
+                                    onChange={event => setToolbar(t => ({ ...t, digits: Number(event.target.value) }))}
+                                    aria-label="Digits"
+                                >
+                                    {[0, 1, 2, 3, 4, 5, 6].map(d => (
+                                        <option key={d} value={d}>{d}</option>
+                                    ))}
+                                </select>
+                            )}
                         </>
                     )}
                     <div className="columns-popover-anchor">

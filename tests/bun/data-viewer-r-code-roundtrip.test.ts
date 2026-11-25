@@ -441,6 +441,73 @@ edgeSuite('Copy as R code round trip: logical columns and data.table objects (re
         { name: 'b is TRUE, hide b and s', filters: [{ ci: 1, p: { kind: 'bool', value: true } }], hide: [1, 2] },
     ]);
 
+// Grouped and rowwise tibbles: the view is the flat table, so hiding a
+// grouping column must drop it (dplyr's select() keeps grouping columns
+// and moves them to the front). `plain` is the same data ungrouped.
+edgeSuite('Copy as R code round trip: grouped and rowwise tibbles (real R)',
+    `df <- dplyr::group_by(data.frame(id = 1:6, g = c("a", "b", "a", "b", "a", "b"),
+    h = c(1L, 1L, 2L, 2L, 1L, 1L), x = c(3, 1, 2, 6, 5, 4)), g, h)`,
+    ['df', 'rw', 'plain'],
+    [
+        { name: 'nothing hidden', rows: [1, 2, 3, 4, 5, 6] },
+        { name: 'hide one grouping column', hide: [1], rows: [1, 2, 3, 4, 5, 6] },
+        { name: 'hide both grouping columns', hide: [1, 2], rows: [1, 2, 3, 4, 5, 6] },
+        { name: 'hide a column that is not grouped by', hide: [3], rows: [1, 2, 3, 4, 5, 6] },
+        {
+            name: 'filter, sort and hide a grouping column',
+            filters: [{ ci: 3, p: { kind: 'numCompare', op: '>', value: 1 } }],
+            sort: [{ ci: 3, dir: 'desc' }], hide: [1], rows: [4, 5, 6, 1, 3],
+        },
+    ],
+    'rw <- dplyr::rowwise(dplyr::ungroup(df), g)\nplain <- as.data.frame(dplyr::ungroup(df))');
+
+// Date-times: the engine and the code compare the same instants. `t`
+// holds 2023-12-31, 2024-01-01, half a second later, NA and 2024-01-02
+// (UTC); a half second is exact in a double and in microseconds. `k` is
+// shown in Asia/Kolkata and starts at that zone's 2024-01-01 00:00.
+edgeSuite('Copy as R code round trip: date-times (real R)',
+    `df <- data.frame(id = 1:5)
+df$t <- as.POSIXct(c(1703980800, 1704067200, 1704067200.5, NA, 1704153600), origin = "1970-01-01", tz = "UTC")
+df$k <- as.POSIXct(c(1704047400, 1704067200, 1704067200.5, NA, 1704153600), origin = "1970-01-01", tz = "Asia/Kolkata")`,
+    ['df', 'dtobj'],
+    [
+        { name: 't = midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00:00Z' } }], rows: [2] },
+        { name: 't != midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '!=', value: '2024-01-01T00:00:00Z' } }], rows: [1, 3, 5] },
+        { name: 't > midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '>', value: '2024-01-01T00:00:00Z' } }], rows: [3, 5] },
+        { name: 't < midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<', value: '2024-01-01T00:00:00Z' } }], rows: [1] },
+        { name: 't <= half past', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<=', value: '2024-01-01T00:00:00.500Z' } }], rows: [1, 2, 3] },
+        { name: 't between, with an offset', filters: [{ ci: 1, p: { kind: 'dateBetween', lo: '2024-01-01T01:00:00+01:00', hi: '2024-01-02T00:00:00Z', inclusive: true } }], rows: [2, 3, 5] },
+        // No offset, as the popover's input gives it: a time in the zone
+        // the column is shown in. Midnight in Kolkata is 18:30 UTC.
+        { name: 't = midnight, as typed', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00' } }], rows: [2] },
+        { name: 'k = midnight in its zone, as typed', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00' } }], rows: [1] },
+        { name: 'k >= 05:30 in its zone, as typed', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '>=', value: '2024-01-01T05:30' } }], rows: [2, 3, 5] },
+        { name: 't not between, or missing', filters: [{ ci: 1, p: { kind: 'dateNotBetween', lo: '2024-01-01T00:00:00Z', hi: '2024-01-01T00:00:01Z', inclusive: true }, includeMissing: true }], rows: [1, 4, 5] },
+    ]);
+
+// Years past 9999 and before 0000: R reads neither `+010000-01-01` nor
+// `-000001-01-01`, so the code counts from the epoch instead. `d` holds
+// 9999-12-31, 10000-01-01, 10000-01-02 and NA; `t` the same instants at
+// midnight UTC; `bc` the first days of the years -1, 0 and 1.
+edgeSuite('Copy as R code round trip: years outside 0000 to 9999 (real R)',
+    `df <- data.frame(id = 1:4)
+df$d <- as.Date(c(2932896, 2932897, 2932898, NA), origin = "1970-01-01")
+df$t <- as.POSIXct(c(2932896, 2932897, 2932898, NA) * 86400, origin = "1970-01-01", tz = "UTC")
+df$bc <- as.Date(c(-719893, -719528, -719162, NA), origin = "1970-01-01")`,
+    ['df', 'dtobj'],
+    [
+        { name: 'd = 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '+010000-01-01' } }], rows: [2] },
+        { name: 'd >= 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '>=', value: '+010000-01-01' } }], rows: [2, 3] },
+        { name: 'd between 9999 and 10000', filters: [{ ci: 1, p: { kind: 'dateBetween', lo: '9999-12-31', hi: '+010000-01-01', inclusive: true } }], rows: [1, 2] },
+        { name: 'd not between, or missing', filters: [{ ci: 1, p: { kind: 'dateNotBetween', lo: '+010000-01-01', hi: '+010000-01-01', inclusive: true }, includeMissing: true }], rows: [1, 3, 4] },
+        { name: 'd after noon on 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '>', value: '+010000-01-01T12:00:00Z' } }], rows: [3] },
+        { name: 't = 10000-01-01', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '+010000-01-01T00:00:00Z' } }], rows: [2] },
+        { name: 't < 10000-01-01', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '<', value: '+010000-01-01T00:00:00Z' } }], rows: [1] },
+        { name: 't between 9999 and 10000', filters: [{ ci: 2, p: { kind: 'dateBetween', lo: '9999-12-31T00:00:00Z', hi: '+010000-01-01T00:00:00Z', inclusive: true } }], rows: [1, 2] },
+        { name: 'bc = year -1', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '=', value: '-000001-01-01' } }], rows: [1] },
+        { name: 'bc > year -1', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '>', value: '-000001-01-01' } }], rows: [2, 3] },
+    ]);
+
 // integer64: set values are decimal strings the double can't hold
 // (Value Counts counts on the bigint), so the code compares them as
 // integer64; comparisons and ranges compare the exact integers too, in

@@ -12,8 +12,11 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeData, makeVector, Table, tableToIPC, TimestampMicrosecond } from 'apache-arrow';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
 import { computeFilteredIndices } from '../../editors/vscode/src/data-viewer/filter';
 import type { FilterEntry, FilterState } from '../../editors/vscode/src/data-viewer/messages';
@@ -337,12 +340,70 @@ describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..0
         expect(Array.from(out!)).toEqual([1, 2, 3]);
         await r.close();
     });
+    test('a range with one unparseable bound is a no-match, as in Copy as R code', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        for (const kind of ['dateBetween', 'dateNotBetween'] as const) {
+            for (const [lo, hi] of [['2024-01-03', 'not-a-date'], ['not-a-date', '2024-01-03']]) {
+                const out = await computeFilteredIndices(r, state([entry('a', 4, { kind, lo, hi, inclusive: true })]), CTX_LABELS_ON);
+                expect([kind, lo, Array.from(out!)]).toEqual([kind, lo, []]);
+            }
+        }
+        await r.close();
+    });
     test('dateCompare != with unparseable date is a no-match (not keep-all)', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         const e = entry('a', 4, { kind: 'dateCompare', op: '!=', value: 'not-a-date' });
         const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
         expect(Array.from(out!)).toEqual([]);
         await r.close();
+    });
+});
+
+describe('computeFilteredIndices — date-time predicates on a microsecond Timestamp', () => {
+    // Rows: 2023-12-31, 2024-01-01, 2024-01-01 00:00:00.5, 2024-01-02 (UTC).
+    const MICROS = [1703980800000000n, 1704067200000000n, 1704067200500000n, 1704153600000000n];
+    async function rows(predicate: FilterEntry['predicate'], micros = MICROS, zone = 'UTC'): Promise<number[]> {
+        const dir = mkdtempSync(join(tmpdir(), 'raven-dv-ts-filter-'));
+        try {
+            const type = new TimestampMicrosecond(zone);
+            const t = makeVector(makeData({ type, length: micros.length, data: BigInt64Array.from(micros) }));
+            const path = join(dir, 'ts.arrow');
+            writeFileSync(path, tableToIPC(new Table({ t }), 'file'));
+            const r = await ArrowSliceReader.open(path);
+            try {
+                return Array.from((await computeFilteredIndices(r, state([entry('a', 0, predicate)]), CTX_LABELS_ON))!);
+            } finally {
+                await r.close();
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }
+    const MIDNIGHT = '2024-01-01T00:00:00Z';
+    // What the popover's datetime-local input gives: no offset. It is the
+    // time the grid shows, so it is read in the column's zone, whatever
+    // zone this process runs in.
+    test('a bound without an offset is a time in the zone the column is shown in', async () => {
+        const typed = { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00' } as const;
+        expect(await rows(typed)).toEqual([1]);
+        // 2024-01-01 00:00 in Kolkata (UTC+05:30) is 2023-12-31 18:30 UTC.
+        const kolkata = [1704047400000000n, 1704067200000000n];
+        expect(await rows(typed, kolkata, 'Asia/Kolkata')).toEqual([0]);
+        expect(await rows({ kind: 'dateBetween', lo: '2024-01-01T00:00', hi: '2024-01-01T05:30', inclusive: true }, kolkata, 'Asia/Kolkata'))
+            .toEqual([0, 1]);
+        // An explicit offset is still an instant.
+        expect(await rows({ kind: 'dateCompare', op: '=', value: MIDNIGHT }, kolkata, 'Asia/Kolkata')).toEqual([1]);
+    });
+    test('each comparison keeps the rows on its side of the instant', async () => {
+        expect(await rows({ kind: 'dateCompare', op: '=', value: MIDNIGHT })).toEqual([1]);
+        expect(await rows({ kind: 'dateCompare', op: '!=', value: MIDNIGHT })).toEqual([0, 2, 3]);
+        expect(await rows({ kind: 'dateCompare', op: '<', value: MIDNIGHT })).toEqual([0]);
+        expect(await rows({ kind: 'dateCompare', op: '>', value: MIDNIGHT })).toEqual([2, 3]);
+        expect(await rows({ kind: 'dateCompare', op: '<=', value: '2024-01-01T00:00:00.500Z' })).toEqual([0, 1, 2]);
+    });
+    test('a range keeps the instants inside it', async () => {
+        expect(await rows({ kind: 'dateBetween', lo: MIDNIGHT, hi: '2024-01-01T12:00:00Z', inclusive: true })).toEqual([1, 2]);
+        expect(await rows({ kind: 'dateNotBetween', lo: MIDNIGHT, hi: '2024-01-01T12:00:00Z', inclusive: true })).toEqual([0, 3]);
     });
 });
 

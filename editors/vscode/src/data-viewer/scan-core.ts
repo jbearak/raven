@@ -41,7 +41,7 @@ import { computeEntryMask, maskToIndices } from './filter';
 import type { FilterContext } from './filter';
 import { computeHistogramForColumn } from './histograms';
 import { isAbortError, throwIfAborted } from './abort';
-import { computeProfile, countValues, valueCountsFrom } from './profile-engine';
+import { computeProfile, countValues, quantilesFromKey, valueCountsFrom } from './profile-engine';
 import type { CountSummary } from './profile-engine';
 import type { ColumnProfile, ValueCounts } from './profile';
 import { allocPerm, MemoryCounter, sharePerm } from './perm-buffer';
@@ -283,10 +283,19 @@ export class ScanCore {
         return bins;
     }
 
-    /** One column's profile (cached), at the lowest priority. */
+    /** One column's profile (cached), at the lowest priority. Sampled
+     *  quartiles become exact once a sort has left the column's key in
+     *  the cache, whether the profile was cached before the sort or its
+     *  scan was still running when the sort finished. */
     async profile(columnIndex: number, signal?: AbortSignal): Promise<ColumnProfile> {
         const hit = this.profiles.get(columnIndex);
-        if (hit) return hit;
+        if (hit) {
+            // Selecting from the key is a pass over every row: like a
+            // scan, it waits for higher-priority work and honors a cancel.
+            if (hit.quantiles?.exact === false) await this.pauseFor(signal)();
+            throwIfAborted(signal);
+            return this.withExactQuartiles(hit);
+        }
         const col = this.reader.schema.columns[columnIndex];
         const r = await computeProfile(this.reader, columnIndex, {
             signal,
@@ -296,7 +305,21 @@ export class ScanCore {
         this.profiles.set(columnIndex, r.profile);
         if (r.histogram50 && !this.histograms.has(columnIndex)) this.histograms.set(columnIndex, r.histogram50);
         if (r.counts) this.rememberCounts(r.counts);
-        return r.profile;
+        return this.withExactQuartiles(r.profile);
+    }
+
+    /** `p` with its sampled quartiles replaced by the exact ones from the
+     *  column's cached sort key, when there is one that can give them
+     *  (`quantilesFromKey`); `p` itself otherwise. The rest of the profile
+     *  doesn't depend on the sort and is kept. */
+    private withExactQuartiles(p: ColumnProfile): ColumnProfile {
+        if (!p.quantiles || p.quantiles.exact) return p;
+        const key = this.keys.get(`${p.columnIndex}:number`);
+        const exact = key && quantilesFromKey(key, p.rows - p.na - p.nan);
+        if (!exact) return p;
+        const next = { ...p, quantiles: { ...exact, exact: true } };
+        this.profiles.set(p.columnIndex, next);
+        return next;
     }
 
     /** Value counts for one column, from the profile's count summary when
