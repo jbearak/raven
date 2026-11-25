@@ -8,7 +8,8 @@
  */
 
 import type { ColumnSchema } from '../arrow-reader';
-import type { FilterPredicate } from '../messages';
+import type { FilterPredicate, NumBound } from '../messages';
+import { boundText } from './filter-popover-seed';
 
 const SET_TRUNC_AT = 4;
 
@@ -20,18 +21,28 @@ function short(x: number | string): string {
 
 export function summarizePredicate(p: FilterPredicate, col: ColumnSchema): string {
     const n = col.name;
+    // A bound as the editor spells it: on an Int64 / Uint64 column every
+    // digit of an integer the filter compares exactly (`String` would
+    // print 1000000000000000128 as `1000000000000000100`, another ID).
+    const int64 = /^U?[Ii]nt64$/.test(col.arrowType);
+    const b = (x: NumBound): string => boundText(x, int64);
     switch (p.kind) {
         case 'isEmpty': return `${n} is empty`;
         case 'isNotEmpty': return `${n} is not empty`;
-        case 'numCompare': return `${n} ${numOp(p.op)} ${p.value}`;
-        case 'numBetween':
+        case 'numCompare': return `${n} ${numOp(p.op)} ${b(p.value)}`;
+        case 'numBetween': {
             if (p.upperInclusive !== undefined && p.upperInclusive !== p.inclusive) {
-                // A histogram brush: half-open interval notation.
-                return `${n} ∈ ${p.inclusive ? '[' : '('}${short(p.lo)}, ${short(p.hi)}${p.upperInclusive ? ']' : ')'}`;
+                // A histogram brush: half-open interval notation. Its
+                // bounds can be edited afterwards, so on an Int64 / Uint64
+                // column a whole number keeps every digit here too.
+                const edge = (x: NumBound): string =>
+                    (int64 && typeof x === 'number' && Number.isInteger(x) ? b(x) : short(x));
+                return `${n} ∈ ${p.inclusive ? '[' : '('}${edge(p.lo)}, ${edge(p.hi)}${p.upperInclusive ? ']' : ')'}`;
             }
-            return p.inclusive ? `${n} ${p.lo}–${p.hi}` : `${n} (${p.lo}, ${p.hi})`;
+            return p.inclusive ? `${n} ${b(p.lo)}–${b(p.hi)}` : `${n} (${b(p.lo)}, ${b(p.hi)})`;
+        }
         case 'numNotBetween':
-            return p.inclusive ? `${n} not in ${p.lo}–${p.hi}` : `${n} not in (${p.lo}, ${p.hi})`;
+            return p.inclusive ? `${n} not in ${b(p.lo)}–${b(p.hi)}` : `${n} not in (${b(p.lo)}, ${b(p.hi)})`;
         case 'setIn': return `${n} ∈ {${summarizeSet(mapSetValues(p.values, col))}}`;
         case 'setNotIn': return `${n} ∉ {${summarizeSet(mapSetValues(p.values, col))}}`;
         case 'strCompare': return `${n} ${p.op === '=' ? '=' : '≠'} "${p.value}"`;

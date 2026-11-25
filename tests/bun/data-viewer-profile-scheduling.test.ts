@@ -133,6 +133,195 @@ describe('ProfileScheduler', () => {
     });
 });
 
+describe('ProfileScheduler.refresh: a sort made exact quartiles available', () => {
+    const sampled = (ci: number): ColumnProfile => ({ ...profileFor(ci), quantiles: { p25: 1, p50: 2, p75: 3, exact: false } });
+    const exact = (ci: number): ColumnProfile => ({ ...profileFor(ci), quantiles: { p25: 1.5, p50: 2.5, p75: 3.5, exact: true } });
+
+    /** A scheduler holding `first` for column 0, the client no longer
+     *  asking for anything (it has the profile). */
+    async function holding(first: ColumnProfile) {
+        const { runs, run } = fakeRunner();
+        const posted: ProfileUpdate[] = [];
+        const s = new ProfileScheduler(run, u => posted.push(...u), isAbortError);
+        s.setInterest([0]);
+        runs[0].resolve(first);
+        await tick();
+        s.setInterest([]);
+        posted.length = 0;
+        return { s, runs, posted };
+    }
+
+    test('a sampled profile runs again and the replacement is posted without interest', async () => {
+        const { s, runs, posted } = await holding(sampled(0));
+        s.refresh(0);
+        expect(runs.map(r => r.ci)).toEqual([0, 0]);
+        // The client keeps what it has meanwhile: no loading, no drop.
+        expect(posted).toEqual([]);
+        runs[1].resolve(exact(0));
+        await tick();
+        expect(posted).toEqual([[0, { state: 'ready', profile: exact(0) }]]);
+        expect(s.cached(0)).toEqual({ state: 'ready', profile: exact(0) });
+        // Now exact: a later sort changes nothing.
+        s.refresh(0);
+        expect(runs.length).toBe(2);
+    });
+
+    test('a refresh that comes back still sampled is not posted again', async () => {
+        // The sort key couldn't give quartiles (an integer64 column, say).
+        const { s, runs, posted } = await holding(sampled(0));
+        const held = s.cached(0);
+        s.refresh(0);
+        runs[1].resolve(sampled(0));
+        await tick();
+        expect(posted).toEqual([]);
+        expect(s.cached(0)).toBe(held);
+        // Nor while the client is looking at the column.
+        s.setInterest([0]);
+        posted.length = 0;
+        s.refresh(0);
+        runs[2].resolve(sampled(0));
+        await tick();
+        expect(posted).toEqual([]);
+        expect(s.cached(0)).toBe(held);
+    });
+
+    test('an exact, failed or unknown profile is left alone', async () => {
+        const { s, runs } = await holding(exact(0));
+        s.refresh(0);
+        s.refresh(7);
+        expect(runs.length).toBe(1);
+        const f = fakeRunner();
+        const failed = new ProfileScheduler(f.run, () => {}, isAbortError);
+        failed.setInterest([0]);
+        f.runs[0].reject(new Error('decode failed'));
+        await tick();
+        failed.refresh(0);
+        expect(f.runs.length).toBe(1);
+    });
+
+    test('an interest change does not cancel it; columns the client waits for go first', async () => {
+        const { s, runs, posted } = await holding(sampled(0));
+        s.refresh(0);
+        s.setInterest([1]);
+        expect(runs[1].signal.aborted).toBe(false);
+        runs[1].resolve(exact(0));
+        await tick();
+        expect(posted).toContainEqual([0, { state: 'ready', profile: exact(0) }]);
+        expect(runs.map(r => r.ci)).toEqual([0, 0, 1]);
+        // Queued behind a wanted column.
+        const b = await holding(sampled(0));
+        b.s.setInterest([1]);
+        b.s.refresh(0);
+        expect(b.runs.map(r => r.ci)).toEqual([0, 1]);
+        b.runs[1].resolve(profileFor(1));
+        await tick();
+        expect(b.runs.map(r => r.ci)).toEqual([0, 1, 0]);
+    });
+
+    test('a hidden panel pauses it; a failure keeps the profile the client has', async () => {
+        const { s, runs, posted } = await holding(sampled(0));
+        s.setActive(false);
+        s.refresh(0);
+        expect(runs.length).toBe(1);
+        s.setActive(true);
+        expect(runs.length).toBe(2);
+        s.setActive(false);
+        expect(runs[1].signal.aborted).toBe(true);
+        await tick();
+        s.setActive(true);
+        expect(runs.length).toBe(3);
+        runs[2].reject(new Error('decode failed'));
+        await tick();
+        expect(posted).toEqual([]);
+        expect(s.cached(0)).toEqual({ state: 'ready', profile: sampled(0) });
+        expect(runs.length).toBe(3);
+    });
+});
+
+describe('quartiles after a sort', () => {
+    /** Type-7 quartiles of column `a`, from a full sort done here. */
+    function trueQuartiles(): { p25: number; p50: number; p75: number } {
+        const v = Float64Array.from({ length: NROW }, (_, i) => hash01(i, 1) * 100).sort();
+        const q = (p: number) => {
+            const h = (NROW - 1) * p, l = Math.floor(h);
+            return v[l] + (h - l) * (v[Math.min(NROW - 1, l + 1)] - v[l]);
+        };
+        return { p25: q(0.25), p50: q(0.5), p75: q(0.75) };
+    }
+    const signal = () => new AbortController().signal;
+    const sortBy = (engine: LocalEngine, columnIndex: number) => engine.compute({
+        sort: { keys: [{ columnIndex, direction: 'desc' }], labelsOnWhenSorted: true },
+    }).then(t => engine.discard(t));
+
+    test('a profile cached before the sort gets exact quartiles after it', async () => {
+        const reader = await ArrowSliceReader.open(PATH);
+        const engine = new LocalEngine(reader);
+        const before = await engine.profile(0, signal());
+        expect(before.quantiles?.exact).toBe(false);
+        expect(before.quantiles?.p50).not.toBe(trueQuartiles().p50);
+        await sortBy(engine, 0);
+        const after = await engine.profile(0, signal());
+        expect(after.quantiles).toEqual({ ...trueQuartiles(), exact: true });
+        // Everything else is the profile it already had.
+        expect({ ...after, quantiles: undefined }).toEqual({ ...before, quantiles: undefined });
+        // A sort on another column leaves a sampled profile sampled.
+        const other = await engine.profile(1, signal());
+        expect(other.quantiles?.exact).toBe(false);
+        await engine.dispose();
+        await reader.close();
+    });
+
+    test('the exact quartiles of a cached profile wait at the priority gate like a scan', async () => {
+        const reader = await ArrowSliceReader.open(PATH);
+        const engine = new LocalEngine(reader);
+        await engine.profile(0, signal());
+        await sortBy(engine, 0);
+        engine.priority[0] = 1; // a viewport read in flight
+        let done = false;
+        const p = engine.profile(0, signal()).then(r => { done = true; return r; });
+        await new Promise(r => setTimeout(r, 30));
+        expect(done).toBe(false);
+        engine.priority[0] = 0;
+        expect((await p).quantiles?.exact).toBe(true);
+        await engine.dispose();
+        await reader.close();
+    });
+
+    // The extension's engine: the profile cache and the sort keys live
+    // in the scan worker thread, and the host asks again after a sort.
+    test('worker threads: a profile asked for again after a sort has exact quartiles', async () => {
+        const engine = await WorkerEngine.start({
+            filePath: PATH,
+            nrow: NROW,
+            readerScript: join(THREADS, 'reader-thread.ts'),
+            scanScript: join(THREADS, 'scan-worker.ts'),
+        });
+        try {
+            const before = await engine.profile(0, signal());
+            expect(before.quantiles?.exact).toBe(false);
+            const t = await engine.compute({ sort: { keys: [{ columnIndex: 0, direction: 'asc' }], labelsOnWhenSorted: true } });
+            expect(await engine.coordinator.install(t)).toBe(true);
+            const after = await engine.profile(0, signal());
+            expect(after.quantiles).toEqual({ ...trueQuartiles(), exact: true });
+            expect((await engine.profile(1, signal())).quantiles?.exact).toBe(false);
+        } finally {
+            await engine.dispose();
+        }
+    }, 60_000);
+
+    test('a profile whose scan a sort interrupted is exact when it finishes', async () => {
+        const reader = await ArrowSliceReader.open(PATH);
+        const engine = new LocalEngine(reader);
+        const prof = engine.profile(0, signal());
+        await new Promise(r => setTimeout(r, 1));
+        await sortBy(engine, 0);
+        expect(engine.scan.profilePauses).toBeGreaterThan(0);
+        expect((await prof).quantiles).toEqual({ ...trueQuartiles(), exact: true });
+        await engine.dispose();
+        await reader.close();
+    });
+});
+
 describe('profile priority in the scan worker', () => {
     test('in process: viewport reads in flight hold a profile at the gate', async () => {
         const reader = await ArrowSliceReader.open(PATH);

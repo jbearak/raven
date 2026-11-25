@@ -71,11 +71,12 @@ export const EMPTY_SORT: SortState = {
     labelsOnWhenSorted: true,
 };
 
-/** A numeric filter bound: a double, or decimal integer text for an
- *  integer a double can't hold exactly (an Int64 / Uint64 column past
- *  2^53). The filter popover writes text only for such a column and such
- *  a value; `filter.ts` compares those columns exactly (`int64Intervals`)
- *  and reads the text as a double anywhere else (`numBoundValue`). */
+/** A numeric filter bound: a double, or decimal text for a bound a
+ *  double may not hold exactly on an Int64 / Uint64 column (an integer
+ *  past 2^53, or anything typed with a fraction or an exponent). The
+ *  filter popover writes text only for such a column and such a value;
+ *  `filter.ts` compares those columns exactly (`int64Intervals`) and
+ *  reads the text as a double anywhere else (`numBoundValue`). */
 export type NumBound = number | string;
 
 /** A single filter predicate. Discriminated by `kind`. Predicate value

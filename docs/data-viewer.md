@@ -89,7 +89,7 @@ The left end of the toolbar shows the frame's shape, rows × columns, or `12 of 
 
 The Sort and Filter strips are hidden when no sort or filter is active. When the panel is too narrow for the strips beside the buttons, the strips move to a second row so Σ, Labels, Format, and Columns stay reachable. Each strip scrolls horizontally on its own row if its chips still overflow. The toolbar doesn't flicker between one and two rows as you resize the panel across that width.
 
-Each toggle is filled when active; click to flip it. The Labels and Format buttons (and the digits dropdown) are hidden when no column in the data would be affected. For example, an all-integer matrix hides all three, while a frame with only factors hides Format and digits but keeps Labels. The badge on Columns counts the hidden columns and is absent when none are hidden.
+Each toggle is filled when active; click to flip it. The Labels and Format buttons and the digits dropdown are each hidden when no column in the data would be affected. For example, an all-integer matrix hides all three, a frame with only factors hides Format and digits but keeps Labels, and a frame whose only decimal columns carry a display format from Stata, SPSS, or SAS keeps Format but hides digits. The badge on Columns counts the hidden columns and is absent when none are hidden.
 
 ### Labels
 
@@ -107,10 +107,13 @@ On by default in new panels. When on, non-integer numeric columns are rounded to
 
 - A nonzero value never shows as zero. A value that would round to zero, or one of 1e15 or more in size, switches to scientific notation (`1.23e-10`).
 - A whole number in a decimal column (for example `5` among `1.5` and `2.25`) shows as `5`, not `5.000`, which avoids the misleading trailing zeros common in SPSS and SAS files. It's padded so the decimal points still line up.
+- A `bit64::integer64` value shows every digit, with Format on or off. `9007199254740993` is shown, copied, and found as itself, never as its neighbour `9007199254740992`.
 - A number too wide for its column shows `###` rather than its leading digits. Hover over it for the full value, or widen the column.
 - With Format off, numbers show at full precision, with R-style exponents (`1e-07`).
 
-When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps it), Format uses it instead of the dropdown. Raven honors Stata `%w.df`, `%w.dfc` (with thousands separators), and `%w.dg` (significant digits), and SPSS and SAS `Fw.d`, `COMMAw.d`, `DOLLARw.d` (with a `$`), and `Zw.` (zero-padded). SPSS `PCTw.d` adds a `%` to the value as stored (25 shows as `25.00%`). SAS `PERCENTw.d` multiplies by 100 and shows negatives in parentheses (0.25 shows as `25.00%`, -0.25 as `(25.00%)`); `PERCENTNw.d` uses a minus sign instead. The width and `.d` can be left out, as `haven::read_xpt()` writes them (`PERCENT8`, `DOLLAR`); a format without `.d` shows no decimals. Other formats fall back to the dropdown. A column formatted for whole numbers (`%9.0f`, `F8.0`) is treated like an integer column, and the toggle is hidden when no other column would be affected.
+When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps it), Format uses it instead of the dropdown. Raven honors Stata `%w.df`, `%w.dfc` (with thousands separators), and `%w.dg` (significant digits), and SPSS and SAS `Fw.d`, `COMMAw.d`, `DOLLARw.d` (with a `$`), and `Zw.` (zero-padded). SPSS `PCTw.d` adds a `%` to the value as stored (25 shows as `25.00%`). SAS `PERCENTw.d` multiplies by 100 and shows negatives in parentheses (0.25 shows as `25.00%`, -0.25 as `(25.00%)`); `PERCENTNw.d` uses a minus sign instead. The width and `.d` can be left out, as `haven::read_xpt()` writes them (`PERCENT8`, `DOLLAR`); a format without `.d` shows no decimals. Other formats fall back to the dropdown.
+
+A format describes how to show a column, not what it holds: a column formatted for whole numbers (`%9.0f`, `F8.0`, `DOLLAR8`) can still hold `12.75`, which then shows, and copies, rounded (`13`, `$13`). Turn Format off to see and copy the stored value. Toggling Format doesn't change filter results or sort order.
 
 ### Dates and times
 
@@ -258,7 +261,11 @@ If the column already has a filter, the menu item reads Edit filter…, and the 
 
 For numeric `between` and `not between`, the editor shows a histogram of the column with draggable range handles beside the number fields. The histogram is computed the first time you open that column's filter, not when the table loads, so on a very large frame it may appear a moment after the editor opens. It is cached after that, and opening a table never waits for histograms.
 
+On a `bit64::integer64` column, a bound is compared as you typed it, digit for digit, including one with a fraction or an exponent: `< 9007199254740992.5` keeps `9007199254740992`.
+
 For factor columns, the editor shows a searchable checklist of levels when the levels are available to the panel; columns with very many levels fall back to a free-text value list. For labelled numeric columns, the editor defaults to a searchable checklist of the labelled values, each shown as label plus code, and also offers the numeric predicates in the condition dropdown.
+
+A date-time you type in a filter is read in the time zone the column is shown in (the one in its type line), so `09:00` matches the cells that show `09:00`.
 
 `matches regex` uses JavaScript regular-expression syntax, not PCRE or R regex syntax. A Case sensitive toggle controls whether all character predicates match case-sensitively.
 
@@ -352,9 +359,10 @@ Distinct counts leave out `NA` and `NaN`, as `length(unique(x[!is.na(x)]))` does
 Most numbers in a summary are exact. On very large or very varied columns, a few are estimated so the summary stays fast, and every estimate starts with `≈`:
 
 - Counts of NA and NaN, minimum, maximum, mean, standard deviation, and the histogram are always exact.
-- Percentiles are exact up to 100,000 values, or once the column has been sorted in this panel. Beyond that they come from a random sample of 100,000 values.
+- Percentiles are exact up to 100,000 values. Beyond that they come from a random sample of 100,000 values until you sort the column in this panel. Sorting a number column by its values makes its percentiles exact, and an open summary updates in place. The sample stays for a `bit64::integer64` column, for a labelled column sorted by its labels, and for a column with millions of values packed closely around a quartile.
 - Distinct counts are exact for factors, and for other columns up to 100,000 distinct values. Beyond that they're estimated, usually within 1 to 2%.
 - Most-common values have exact counts up to 100,000 distinct values. Beyond that, each count shows how far off it can be, as `≈ 4,210 ± 12`. When those margins mean two values could be in either order, the list says "approximate order".
+- On a `bit64::integer64` column, those counts and margins are for each whole integer, however large: two IDs that differ only in their last digits are counted apart.
 
 ### Value counts
 
@@ -392,6 +400,7 @@ Choose Copy as R code (dplyr) from ⋯, or base R or data.table from the Copy as
 library(dplyr)
 
 mtcars |>
+  ungroup() |>
   filter(
     cyl %in% c(6, 8),
     mpg > 20
@@ -410,6 +419,8 @@ The code returns the same rows in the same order as the grid:
 - A column whose name is duplicated or empty is read by position, as in `dat[[3]]`, so a filter on the second of two `val` columns reads that column. dplyr can't filter or sort such a frame, so the dplyr choice says so and points you to base R or data.table. The same goes for a view that filters or sorts a column named like `...` or `..1`, or keeps one when other columns are hidden; such a column left alone doesn't stop dplyr.
 - A value picked on a `bit64::integer64` column is written exactly, as `bit64::as.integer64("9007199254740993")`, because a number in R code can't hold every 64-bit integer. Comparisons and ranges on such a column compare whole 64-bit integers too, in the viewer and in the code, so `big = 9007199254740993` keeps that value and not its neighbours. A bound with a fraction is written as the nearest integer that means the same (`big >= 2.5` becomes `big >= bit64::as.integer64("3")`). The base R code sorts such a column by its rank from `bit64::keypos()`, because base R's `order()` doesn't sort `integer64` values correctly.
 - The base R code also works when the object is a data.table.
+- The grid shows a grouped or rowwise tibble as a plain table, so hiding a column hides it even when the tibble is grouped by it. dplyr's `select()` keeps grouping columns, so the dplyr code calls `ungroup()` first whenever a column is hidden. The result is then ungrouped.
+- A date or date-time in a year past 9999 or before 0000 is written as a count from 1970-01-01, as in `as.Date(2932897, origin = "1970-01-01")`, because R can't read such a year from text.
 - A regular expression filter is written for R's `grepl(perl = TRUE)` so it matches what the viewer matches. For example, `.` and `\s` keep the viewer's meaning, and `$` matches only at the very end. A pattern that would match differently in R is left out, such as one that counts characters with `.` (emoji count as two characters in the viewer and one in R).
 - The comment at the top names the packages the code needs.
 

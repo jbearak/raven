@@ -28,6 +28,12 @@ describe('render_tsv', () => {
         expect(render_tsv([[0.25] as any, [0.75] as any], [0], [pct], {}, false, true, 3)).toBe('25.00%\n75.00%');
     });
 
+    test('a zero-decimal format copies as shown, and the stored value with Format off', () => {
+        const price: ColumnSchema = { name: 'p', arrowType: 'Float64', isInteger: true, dictionaryShipped: false, format: 'DOLLAR8' };
+        expect(render_tsv([[12.75] as any], [0], [price], {}, false, true, 3)).toBe('$13');
+        expect(render_tsv([[12.75] as any], [0], [price], {}, false, false, 3)).toBe('12.75');
+    });
+
     test('Labels on swaps dictionary index for level', () => {
         const rows = [[1, 1.5, 2, 1] as any];
         const tsv = render_tsv(rows, [0, 1, 2, 3], cols, dictionaries, true, false, 3);

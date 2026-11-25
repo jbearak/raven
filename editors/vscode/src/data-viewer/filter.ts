@@ -23,8 +23,9 @@
  *   - **Int64 / Uint64 are exact**: a numeric predicate on such a column
  *     compares the stored integer with the bound's real value
  *     ({@link int64Intervals}); a bound a double can't hold arrives as
- *     decimal text (`NumBound`). Nothing is rounded to double, so
- *     `= 2^53` does not keep 2^53 + 1. Histogram bins are assigned the
+ *     decimal text (`NumBound`), fraction and exponent included, and is
+ *     read digit by digit. Nothing is rounded to double, so `= 2^53`
+ *     does not keep 2^53 + 1 and `< 2^53 + 0.5` keeps 2^53. Histogram bins are assigned the
  *     same way (`histograms.ts` `binIndex`), so a brush still filters to
  *     the rows its bars count.
  *   - **NA / NaN semantics**: missing rows fail any predicate unless
@@ -50,6 +51,7 @@ import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState } from './messages';
 import { iterateBatches } from './batch-iter';
 import { throwIfAborted, yieldToEventLoop } from './abort';
+import { zonedTimeToMs } from './display-format';
 
 export type FilterContext = {
     labelsOn: boolean;
@@ -275,27 +277,16 @@ async function acceptorFor(
     if (predicate.kind === 'dateCompare'
         || predicate.kind === 'dateBetween'
         || predicate.kind === 'dateNotBetween') {
-        // Convert ISO strings to the same numeric domain the underlying
-        // arrow values live in.
-        //
-        // apache-arrow's child.get(r) for Date32<DAY> (DateDay) returns
-        // ms-since-epoch — NOT day-count — even though the raw typed array
-        // stores days. loadNumeric therefore stores ms for all Date columns.
-        // Timestamp columns (bigint microseconds) coerce to Number ms * 1000
-        // via loadNumeric's bigint path, which loses sub-ms precision but is
-        // fine for user-typed ISO strings.
+        // Both sides in milliseconds since the epoch, which is what
+        // apache-arrow's `child.get(r)` returns for every Date and
+        // Timestamp column, whatever the stored unit: Date32<DAY> stores
+        // days and a microsecond Timestamp stores bigint microseconds,
+        // but `get` gives ms for both (fractional below a millisecond).
         const values = await loadNumeric(reader, columnIndex, signal);
-        const isTs = schema.arrowType.startsWith('Timestamp');
-        const toUnit = (iso: string): number => {
-            const ms = Date.parse(iso);
-            if (!Number.isFinite(ms)) return NaN;
-            if (isTs) return ms * 1000;
-            // Date32<DAY> / Date64: loadNumeric stores ms-since-epoch.
-            return ms;
-        };
+        const bound = (iso: string): number => dateBoundMs(iso, schema);
         switch (predicate.kind) {
             case 'dateCompare': {
-                const v = toUnit(predicate.value);
+                const v = bound(predicate.value);
                 // Unparseable ISO -> no-match, mirroring the invalid-regex
                 // fallback. Without this guard `!=` would keep every row,
                 // since `x !== NaN` is always true.
@@ -310,13 +301,18 @@ async function acceptorFor(
                 }
             }
             case 'dateBetween': {
-                const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);
+                const lo = bound(predicate.lo), hi = bound(predicate.hi);
+                if (!Number.isFinite(lo) || !Number.isFinite(hi)) return () => false;
                 return predicate.inclusive
                     ? (i) => values[i] >= lo && values[i] <= hi
                     : (i) => values[i] > lo && values[i] < hi;
             }
             case 'dateNotBetween': {
-                const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);
+                // One unparseable bound matches nothing, as in the code
+                // Copy as R code writes; `||` would keep the rows on the
+                // readable bound's side.
+                const lo = bound(predicate.lo), hi = bound(predicate.hi);
+                if (!Number.isFinite(lo) || !Number.isFinite(hi)) return () => false;
                 return predicate.inclusive
                     ? (i) => values[i] < lo || values[i] > hi
                     : (i) => values[i] <= lo || values[i] >= hi;
@@ -351,10 +347,16 @@ async function acceptorFor(
         const t = schema.arrowType;
         const isNumericLabelled = !isFactor && hasValueLabels
             && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
-        if (isNumericLabelled && isInt64Type(t)) {
-            // Int64/UInt64: exact, on the decimal text (Value Counts counts
-            // on the bigint and sends values a double can't hold as text).
-            const want = new Set(predicate.values.map(int64SetKey).filter(k => k !== undefined));
+        if (isInt64Type(t)) {
+            // Int64/UInt64, labelled or not: exact, on the integer each
+            // value names (Value Counts counts on the bigint and sends
+            // values a double can't hold as text; a value edited to
+            // `007` is 7, as in the code Copy as R code writes). bit64's
+            // range limits labelled codes, as before; an unlabelled column
+            // matches any value the file holds (an unsigned one past 2^63).
+            const want = new Set(predicate.values
+                .map(v => (isNumericLabelled ? int64SetKey(v) : setValueInteger(v)?.toString()))
+                .filter(k => k !== undefined));
             const values = await loadString(reader, columnIndex, signal);
             return predicate.kind === 'setIn'
                 ? (i) => want.has(values[i])
@@ -385,12 +387,28 @@ async function acceptorFor(
     throw new Error(`filter: unhandled predicate ${(_exhaustive as { kind: string }).kind}`);
 }
 
+/**
+ * A date filter's bound as milliseconds since the epoch (NaN when it
+ * doesn't parse), shared with Copy as R code (`r-code.ts`) so the two
+ * compare the same instant. On a Timestamp column a date-time without an
+ * offset, which is what the popover's `datetime-local` input gives, is a
+ * wall-clock time in the zone the grid shows the column in, not in the
+ * extension host's zone. Everything else is `Date.parse`: an explicit
+ * offset is honored, and a bare date is UTC midnight (what a Date column
+ * stores).
+ */
+export function dateBoundMs(iso: string, col: ColumnSchema): number {
+    const t = iso.indexOf('T');
+    if (col.arrowType.startsWith('Timestamp') && t > 0 && !/[zZ+-]/.test(iso.slice(t))) {
+        return zonedTimeToMs(iso, col.timeZone ?? 'UTC');
+    }
+    return Date.parse(iso);
+}
+
 /** An Arrow Int64 / Uint64 column (a `bit64::integer64` in R). */
 export function isInt64Type(arrowType: string): boolean {
     return /^U?[Ii]nt64$/.test(arrowType);
 }
-
-const INT_TEXT = /^[+-]?[0-9]+$/;
 
 /** A numeric bound as a double: the number itself, or numeric text read
  *  as one. `undefined` when it is no number (a `null` from a lossy
@@ -402,12 +420,44 @@ export function numBoundValue(b: unknown): number | undefined {
     return Number.isNaN(n) ? undefined : n;
 }
 
+/** Decimal text: a sign, digits with an optional point, an optional
+ *  exponent (`-12.50`, `.5`, `1e3`, `2.5E-3`). */
+const DECIMAL_TEXT = /^([+-]?)([0-9]*)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?$/;
+
+/**
+ * The exact floor and ceiling of a decimal number written as text, read
+ * digit by digit. A double can't stand in: `9007199254740992.5` rounds to
+ * 2^53, an integer, before it is ever compared. Past 10^20 in size, which
+ * no 64-bit integer reaches, both are `±Infinity`, so the work is bounded
+ * however large the exponent. `undefined` when the text is no decimal
+ * number.
+ */
+function decimalFloorCeil(text: string): { floor: bigint | number; ceil: bigint | number } | undefined {
+    const m = DECIMAL_TEXT.exec(text);
+    if (!m || (m[2] === '' && (m[3] ?? '') === '')) return undefined;
+    const negative = m[1] === '-';
+    const digits = m[2] + (m[3] ?? '');
+    const leadingZeros = /^0*/.exec(digits)![0].length;
+    const significant = digits.slice(leadingZeros);
+    if (significant === '') return { floor: 0n, ceil: 0n };
+    // How many of the significant digits sit before the decimal point
+    // (zero or negative for a size below 1).
+    const whole = m[2].length - leadingZeros + Number(m[4] ?? 0);
+    if (whole > 20) {
+        const inf = negative ? -Infinity : Infinity;
+        return { floor: inf, ceil: inf };
+    }
+    const q = whole <= 0 ? 0n : BigInt(significant.slice(0, whole).padEnd(whole, '0'));
+    const r = whole <= 0 || /[1-9]/.test(significant.slice(whole)) ? 1n : 0n;
+    return negative ? { floor: -q - r, ceil: -q } : { floor: q, ceil: q + r };
+}
+
 /** A bound's exact floor and ceiling. Infinite bounds stay `±Infinity`;
  *  `undefined` when the bound is no number, or NaN. */
 function boundFloorCeil(b: unknown): { floor: bigint | number; ceil: bigint | number } | undefined {
-    if (typeof b === 'string' && INT_TEXT.test(b.trim())) {
-        const v = BigInt(b.trim());
-        return { floor: v, ceil: v };
+    if (typeof b === 'string') {
+        const exact = decimalFloorCeil(b.trim());
+        if (exact) return exact;
     }
     const n = numBoundValue(b);
     if (n === undefined || Number.isNaN(n)) return undefined;
@@ -478,14 +528,20 @@ function intervalTest({ lo, hi }: IntInterval): (v: bigint) => boolean {
     return () => true;
 }
 
-/** A set-filter value as an Int64 column's decimal text, or undefined
- *  when it can't equal any integer (or isn't a value at all: a `null`
- *  from a lossy transport must match nothing, not 0). */
+/** The integer a set-filter value names, or undefined when it names
+ *  none (or isn't a value at all: a `null` from a lossy transport must
+ *  match nothing, not 0). */
+function setValueInteger(v: unknown): bigint | undefined {
+    if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
+    if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) return BigInt(v.trim());
+    return undefined;
+}
+
+/** A set-filter value as an integer64's decimal text, or undefined when
+ *  no integer64 can equal it. */
 export function int64SetKey(v: unknown): string | undefined {
-    let b: bigint | undefined;
-    if (typeof v === 'number' && Number.isInteger(v)) b = BigInt(v);
-    else if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) b = BigInt(v.trim());
-    // No column value lies outside ±(2^63 − 1): -2^63 is bit64's NA, and
+    const b = setValueInteger(v);
+    // No integer64 lies outside ±(2^63 − 1): -2^63 is bit64's NA, and
     // as.integer64() turns it (or anything further out) into NA, which
     // would match the missing rows in R.
     if (b === undefined || b > INT64_MAX || b < -INT64_MAX) return undefined;
@@ -589,8 +645,8 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
-            // bigint values (timestamps; an Int64 / Uint64 set or date
-            // path) coerce to Number. Numeric predicates on Int64 /
+            // bigint values (an Int64 / Uint64 set or date path) coerce
+            // to Number. Numeric predicates on Int64 /
             // Uint64 columns don't come here: they compare the exact
             // integers (`loadInt64`).
             out[start + r] = typeof v === 'bigint' ? Number(v) : (v as number);

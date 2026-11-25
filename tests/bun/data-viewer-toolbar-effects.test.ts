@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import {
+    hasDigitsEffectCol,
     hasFormatEffectCol,
     hasLabelsEffectCol,
     hasFormatEffect,
@@ -44,6 +45,40 @@ describe('hasFormatEffectCol', () => {
         expect(hasFormatEffectCol(
             col({ arrowType: 'Dictionary<Int32, Utf8>', dictionaryShipped: true }),
         )).toBe(false);
+    });
+});
+
+describe('a float with a source format', () => {
+    const fmt = (format: string, isInteger: boolean) => col({ arrowType: 'Float64', format, isInteger });
+    // The format rounds what is stored (`DOLLAR8` shows 12.75 as `$13`),
+    // so the toggle must stay available to show the stored value.
+    test('zero-decimal formats keep Format, with or without the trailing dot', () => {
+        for (const f of ['DOLLAR8', 'DOLLAR8.', 'F8.0', 'F8', '8.', '%9.0f', 'COMMA10.0', 'Z3.', 'PCT5']) {
+            expect([f, hasFormatEffectCol(fmt(f, true))]).toEqual([f, true]);
+            expect([f, hasDigitsEffectCol(fmt(f, true))]).toEqual([f, false]);
+        }
+    });
+    test('a recognized format with decimals keeps Format and ignores digits', () => {
+        for (const f of ['DOLLAR10.2', '%9.2f', 'PERCENT8.1', '%9.3g']) {
+            expect([f, hasFormatEffectCol(fmt(f, false))]).toEqual([f, true]);
+            expect([f, hasDigitsEffectCol(fmt(f, false))]).toEqual([f, false]);
+        }
+    });
+    test('an unrecognized format falls back to digits', () => {
+        expect(hasFormatEffectCol(fmt('BEST12', false))).toBe(true);
+        expect(hasDigitsEffectCol(fmt('BEST12', false))).toBe(true);
+    });
+    test('a format that only declares whole numbers changes nothing', () => {
+        // `FIX8` and `N8` mark the column integer but aren't display formats.
+        for (const f of ['FIX8', 'N8.']) {
+            expect([f, hasFormatEffectCol(fmt(f, true))]).toEqual([f, false]);
+            expect([f, hasDigitsEffectCol(fmt(f, true))]).toEqual([f, false]);
+        }
+    });
+    test('a format on an integer column is not applied', () => {
+        const c = col({ arrowType: 'Int32', isInteger: true, format: 'DOLLAR8' });
+        expect(hasFormatEffectCol(c)).toBe(false);
+        expect(hasDigitsEffectCol(c)).toBe(false);
     });
 });
 
