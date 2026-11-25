@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { register_debugger } from './debugger';
+import { register_debugger, register_debugger_unavailable } from './debugger';
 import {
     ExecuteCommandRequest,
     LanguageClient,
@@ -468,6 +468,8 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         // in package.json continues to provide them in `.R` files. See
         // docs/coexistence.md.
         registerRSnippetCompletionsForRmdAndQuarto(context);
+    } else {
+        register_debugger_unavailable(context);
     }
 
     // Perch's list of new terminals runs this (Raven's `perch.launchers` entry

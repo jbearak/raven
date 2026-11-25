@@ -180,6 +180,11 @@ struct Shared {
     file_tickets: HashMap<String, u64>,
     next_id: u64,
     filters: Vec<String>,
+    /// The newest request applied to `filters`, and to the function
+    /// breakpoints (see [`breakpoint_ticket`]): what stops a mirror that
+    /// stalled reading a file from restoring older ones.
+    filters_ticket: u64,
+    functions_ticket: u64,
     configured: bool,
     connected: bool,
     stop: Option<Stop>,
@@ -303,6 +308,34 @@ pub fn ready() -> bool {
     handle().is_some()
 }
 
+static INIT_SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// The console is past the point where it starts the debugger, whether or
+/// not it did: called once on the R thread after `init` (or in its place
+/// when the console runs without `--dap`).
+pub fn init_settled() {
+    INIT_SETTLED.store(true, Ordering::SeqCst);
+}
+
+/// The debugger will never start in this console (R too old, its helpers
+/// failed, the console runs without `--dap`). Unlike `!ready()`, this is
+/// final: the extension stops waiting for it.
+pub fn unavailable() -> bool {
+    INIT_SETTLED.load(Ordering::SeqCst) && !ready()
+}
+
+/// Why R is stopped in the debugger, if it is and no live debug session
+/// shows the stop (callable from any thread). A session another window
+/// holds is left alone.
+pub fn unattended_stop_reason() -> Option<String> {
+    let h = handle()?;
+    let s = lock(h);
+    if s.connected && !s.ended {
+        return None;
+    }
+    s.stop.as_ref().map(|st| st.reason.clone())
+}
+
 /// The debugger is running in this console.
 pub fn active() -> bool {
     R.with(|r| r.try_borrow().map(|g| g.is_some()).unwrap_or(false))
@@ -418,6 +451,9 @@ pub fn init(
     if call_helper("install_hook_only", &[]).as_deref() == Some("ok") {
         with_r(|r| r.hook_installed = true);
     }
+    // A breakpoint mirror sent while R was still starting was answered
+    // `not-ready`; the extension sends it again on this.
+    push_control(json!({"event": "ready"}));
     Ok(())
 }
 
@@ -617,7 +653,10 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                         .collect()
                 })
                 .unwrap_or_default();
-            queue_job(Job::FunctionBreakpoints(Some(msg.clone()), names));
+            let mut s = lock_shared(shared);
+            s.functions_ticket = breakpoint_ticket();
+            s.jobs
+                .push_back(Job::FunctionBreakpoints(Some(msg.clone()), names));
         }
         "setExceptionBreakpoints" => {
             let filters: Vec<String> = args["filters"]
@@ -628,7 +667,11 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                         .collect()
                 })
                 .unwrap_or_default();
-            lock_shared(shared).filters = filters;
+            {
+                let mut s = lock_shared(shared);
+                s.filters_ticket = breakpoint_ticket();
+                s.filters = filters;
+            }
             out.respond(&msg, json!({}));
         }
         "threads" => out.respond(&msg, json!({"threads": [{"id": 1, "name": "R console"}]})),
@@ -1023,15 +1066,26 @@ pub fn set_file_breakpoints(
 }
 
 /// Function breakpoints and exception filters mirrored by the extension
-/// while no session exists.
-pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>) {
+/// while no session exists. `ticket` is the request's
+/// [`breakpoint_ticket`]: like a file's breakpoints, each is left alone when
+/// a newer request (a later mirror, or a session's own
+/// `setFunctionBreakpoints` / `setExceptionBreakpoints`) has set it since.
+/// The check and the queueing share one lock, so the R thread applies
+/// function breakpoints in ticket order.
+pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>, ticket: u64) {
+    let Some(h) = handle() else { return };
+    let mut s = lock(h);
     if let Some(f) = filters
-        && let Some(h) = handle()
+        && s.filters_ticket < ticket
     {
-        lock(h).filters = f;
+        s.filters_ticket = ticket;
+        s.filters = f;
     }
-    if let Some(names) = functions {
-        queue_job(Job::FunctionBreakpoints(None, names));
+    if let Some(names) = functions
+        && s.functions_ticket < ticket
+    {
+        s.functions_ticket = ticket;
+        s.jobs.push_back(Job::FunctionBreakpoints(None, names));
     }
 }
 

@@ -478,6 +478,9 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
     {
         eprintln!("\x1b[2mraven console: {e}\x1b[0m");
     }
+    // From here on a breakpoint mirror is answered `ok` or, if the debugger
+    // didn't start, `unavailable` (never again `not-ready`).
+    dap::init_settled();
     let printer = reedline::ExternalPrinter::new(4096);
     let printer_tx = printer.sender();
     let mut ed = editor::build(editor::EditorConfig {
