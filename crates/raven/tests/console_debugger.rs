@@ -2737,8 +2737,13 @@ fn a_breakpoint_set_while_busy_binds_before_a_queued_source() {
     );
     let mut d = Dap::connect(&c);
     d.req("configurationDone", json!({}));
-    c.type_line("Sys.sleep(2)");
-    std::thread::sleep(Duration::from_millis(500));
+    // R stays busy until the test opens the gate.
+    let gate = c.dir.join("gate");
+    c.type_line(&format!(
+        "cat('bu', 'sy\\n'); while (!file.exists('{}')) Sys.sleep(0.05)",
+        gate.display()
+    ));
+    c.expect("bu sy");
     // The session's first breakpoint, while R is busy...
     d.req(
         "setBreakpoints",
@@ -2747,6 +2752,7 @@ fn a_breakpoint_set_while_busy_binds_before_a_queued_source() {
     // ... then Source File, queued behind the running code.
     let m = d.mark();
     c.send(&format!("source('{a}')"), None);
+    std::fs::write(&gate, "").unwrap();
     let stop = d.event("stopped", m);
     assert_eq!(stop["body"]["reason"], "breakpoint");
     assert_eq!(d.stack()[0].1, 2);
@@ -2803,6 +2809,13 @@ fn a_virtual_source_keeps_its_text_for_the_session() {
         "reference {first} now names: {}",
         again.lines().next().unwrap_or("")
     );
+    // A client that attaches to a stop R already made (as VS Code does)
+    // still opens that stop's sources.
+    let mut d = Dap::open(&c.dir, true);
+    d.event("stopped", 0);
+    let attached = virtual_frame(&mut d, "vapply");
+    assert_eq!(attached, second);
+    assert!(content(&mut d, attached).starts_with("vapply <- function"));
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);

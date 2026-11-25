@@ -1321,13 +1321,10 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
 
 /// Pop a socket request (if any) and return its first line for R.
 fn start_request(prompt: &str, kind: PromptKind, cap: usize) -> Option<String> {
-    if !with_state(|s| s.ipc.as_ref().is_some_and(ipc::Server::has_pending)).unwrap_or(false) {
-        return None;
-    }
+    let mut req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
     // A breakpoint acknowledged after the last idle tick binds before the
     // request runs (see `service_debugger`).
     service_debugger();
-    let mut req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
     // A CRLF file's lines arrive with their `\r`, which R rejects as an
     // invalid token.
     if req.code.contains("\r\n") {
