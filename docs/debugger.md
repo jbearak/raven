@@ -24,6 +24,8 @@ To attach before anything stops, run Raven: Start R Debugging. You need this to 
 
 F5 with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger; the session ends when the file has run. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script. Add `"consoleSocket"` to run it in a console you started yourself (`raven console --ipc DIR/s --dap DIR/d`; `consoleSocket` is the `--ipc` path). Stop ends the run, including one waiting at a `readline()` or `menu()` prompt, and returns R to the `>` prompt. On Windows, one exception: if the prompt comes from code running in the background (a `later` or `httpuv` callback) and you've started typing an answer, Stop takes effect when you press Enter.
 
+A launch with a `preLaunchTask` waits for the task before it starts. If the task takes longer than 10 seconds and R stops in the debugger meanwhile, that stop gets a session of its own. When the task finishes, Raven doesn't start the launch over that session: it tells you the launch wasn't started and its `program` didn't run. Start it again once R is back at the prompt.
+
 ## What you can do while stopped
 
 | Action | How |

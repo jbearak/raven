@@ -9,34 +9,136 @@
 //!
 //! Access control: Unix sockets are created mode 0600; named pipes get a DACL
 //! that admits only the pipe's owner (and SYSTEM), and refuse remote clients.
+//!
+//! One listener per path: a console given a path another console is
+//! listening on fails to bind and leaves that console's socket alone. On
+//! Windows the pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`; on Unix
+//! the listener holds a lock on a file beside the socket (`lock_endpoint`),
+//! which also tells a live socket from one a killed console left behind.
 
 pub use imp::{Listener, Stream};
 
 #[cfg(unix)]
 mod imp {
+    use std::fs::File;
     use std::io;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::Path;
 
     pub type Stream = std::os::unix::net::UnixStream;
 
-    pub struct Listener(UnixListener);
+    pub struct Listener {
+        socket: UnixListener,
+        /// Held while this console listens; see [`lock_endpoint`].
+        _lock: File,
+    }
+
+    /// Whether a socket is at `path` (one left by a console that is gone, if
+    /// the caller holds the endpoint's lock). Anything else there is the
+    /// user's: `--ipc`/`--dap` are public options, and a mistyped path must
+    /// never delete an ordinary file.
+    fn socket_at(path: &Path) -> io::Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_socket() => Ok(true),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "path exists and is not a socket",
+            )),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Take the lock that says "a console is listening on `path`": an
+    /// exclusive lock on the file `<path>.lock`, held for as long as the
+    /// returned file is open.
+    ///
+    /// A socket's own directory entry can't say whether its listener is
+    /// alive, and connecting to find out would disturb a live console (the
+    /// DAP server treats every connection as its client). The lock can: the
+    /// kernel drops it when the console exits, however it exits, so a socket
+    /// whose lock is free is stale and may be replaced, and one whose lock
+    /// is held is refused (`AddrInUse`) and left alone.
+    ///
+    /// * The lock file is never removed (two consoles locking different
+    ///   files of the same name would both win) and never written to.
+    /// * It is a POSIX record lock (`fcntl`), not `flock`: a record lock
+    ///   belongs to the process and is not inherited across `fork`, so a
+    ///   child R forked (`parallel::mclapply`) that outlives a killed
+    ///   console doesn't keep the endpoint locked. The price: record locks
+    ///   don't conflict within one process (`--ipc` and `--dap` given the
+    ///   same path replace each other, as before), and the process loses
+    ///   the lock if it closes any other descriptor for the lock file (R
+    ///   code in this console reading `<path>.lock`).
+    /// * Only consoles that take the lock are protected from each other: a
+    ///   console that predates it replaces the socket regardless.
+    /// * A filesystem that says it can't lock gives no protection, as
+    ///   before. Any other failure to take the lock fails the bind.
+    fn lock_endpoint(path: &Path) -> io::Result<File> {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        // Never through a symlink, and never blocking on a FIFO: anything
+        // but a regular file here is not ours to open.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&name)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the socket's lock path exists and is not a regular file",
+            ));
+        }
+        // SAFETY: `flock` is plain data; zeroed is a valid value (and, with
+        // `l_start` and `l_len` both 0, means the whole file).
+        let mut whole: libc::flock = unsafe { std::mem::zeroed() };
+        whole.l_type = libc::F_WRLCK as libc::c_short;
+        whole.l_whence = libc::SEEK_SET as libc::c_short;
+        loop {
+            // SAFETY: an open descriptor and a valid `flock`.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &whole) } != -1 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            let code = err.raw_os_error().unwrap_or(0);
+            if code == libc::EINTR {
+                continue;
+            }
+            // Held by another process (POSIX allows either errno).
+            if code == libc::EAGAIN || code == libc::EACCES {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "another raven console is listening here",
+                ));
+            }
+            // The filesystem doesn't do record locks: carry on unprotected.
+            // (Two of these are one number on Linux, hence no `match`.)
+            if [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code) {
+                break;
+            }
+            // Anything else (a full lock table, say) leaves it unknown
+            // whether a console is listening; don't touch its socket.
+            return Err(err);
+        }
+        Ok(file)
+    }
 
     impl Listener {
-        /// Listen on `path`, owner-only from the start.
+        /// Listen on `path`, owner-only from the start. Fails with
+        /// `AddrInUse`, touching nothing, while another console listens
+        /// there (see [`lock_endpoint`]).
         pub fn bind(path: &Path) -> io::Result<Listener> {
-            // Replace only a stale socket: `--ipc`/`--dap` are public
-            // options, and a mistyped path must never delete an ordinary
-            // file.
-            if let Ok(meta) = std::fs::symlink_metadata(path) {
-                use std::os::unix::fs::FileTypeExt;
-                if !meta.file_type().is_socket() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "path exists and is not a socket",
-                    ));
-                }
+            // Before the lock file is created: a mistyped path gains no
+            // `.lock` beside the file it names.
+            socket_at(path)?;
+            let lock = lock_endpoint(path)?;
+            // Under the lock, a socket here has no listener.
+            if socket_at(path)? {
                 let _ = std::fs::remove_file(path);
             }
             // No window where the umask's mode applies. Runs at startup,
@@ -46,14 +148,17 @@ mod imp {
             let bound = UnixListener::bind(path);
             // SAFETY: as above.
             unsafe { libc::umask(old) };
-            let listener = bound?;
+            let socket = bound?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            Ok(Listener(listener))
+            Ok(Listener {
+                socket,
+                _lock: lock,
+            })
         }
 
         /// Connections as they arrive (failed accepts are skipped).
         pub fn incoming(&self) -> impl Iterator<Item = Stream> + '_ {
-            self.0.incoming().flatten()
+            self.socket.incoming().flatten()
         }
     }
 }
@@ -429,5 +534,104 @@ mod tests {
             pipe_name(std::path::Path::new(r"\\.\pipe\mine")),
             r"\\.\pipe\mine"
         );
+    }
+
+    /// A short scratch directory (macOS caps Unix socket paths at 104 bytes).
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!("/tmp/rvsock-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Set for the child process `bind_in_another_process` starts.
+    #[cfg(unix)]
+    const CONTENDER_PATH: &str = "RAVEN_TEST_CONTENDER_SOCKET";
+
+    /// Not a test of its own: run in a child process, it binds the path its
+    /// parent named and reports how that went.
+    #[cfg(unix)]
+    #[test]
+    fn contender_process() {
+        let Some(path) = std::env::var_os(CONTENDER_PATH) else {
+            return;
+        };
+        match Listener::bind(std::path::Path::new(&path)) {
+            Ok(_) => println!("contender: bound"),
+            Err(e) => println!("contender: {:?}", e.kind()),
+        }
+    }
+
+    /// How a `Listener::bind(path)` in another process ends: `bound`, or
+    /// the error's kind.
+    #[cfg(unix)]
+    fn bind_in_another_process(path: &std::path::Path) -> String {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "console::local_socket::tests::contender_process"])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CONTENDER_PATH, path)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .find_map(|l| l.split("contender: ").nth(1))
+            .unwrap_or_else(|| panic!("the contender reported nothing:\n{text}"))
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_process_cannot_take_a_live_listeners_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("live");
+        let path = dir.join("s");
+        let first = Listener::bind(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(bind_in_another_process(&path), "AddrInUse");
+        // The refused process left the socket alone: it is the same file,
+        // and still reaches the first listener.
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let mut client = Stream::connect(&path).unwrap();
+        let mut served = first.incoming().next().unwrap();
+        client.write_all(b"x").unwrap();
+        let mut byte = [0u8; 1];
+        served.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        // Once the listener is gone its socket is stale (the file is still
+        // there) and the next process replaces it.
+        drop(served);
+        drop(first);
+        assert!(path.exists());
+        assert_eq!(bind_in_another_process(&path), "bound");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_a_socket_is_refused_and_gains_no_lock_file() {
+        let dir = scratch("file");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "mine").unwrap();
+        let err = Listener::bind(&path).err().expect("bound over a file");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        assert!(!dir.join("notes.txt.lock").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_path_that_is_a_symlink_is_refused_untouched() {
+        let dir = scratch("link");
+        let path = dir.join("s");
+        let target = dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, dir.join("s.lock")).unwrap();
+        assert!(Listener::bind(&path).is_err());
+        // Neither followed (the target was not created) nor bound past.
+        assert!(!target.exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

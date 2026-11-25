@@ -21,12 +21,74 @@ const bps: Bp[] = [];
 const change_listeners: Array<() => void> = [];
 const close_listeners: Array<(t: unknown) => void> = [];
 const start_listeners: Array<(s: unknown) => void> = [];
+/** Every session `host_launch` started. */
+const start_sessions: HostSession[] = [];
 let tracker_factory: { createDebugAdapterTracker(s: unknown): { onDidSendMessage(m: unknown): void } } | null = null;
 /** Every `startDebugging` call's configuration. */
 const started: Array<{ consoleSocket?: string }> = [];
 /** Configuration providers by registration order. */
-const config_providers: Array<{ resolveDebugConfiguration(...a: unknown[]): unknown }> = [];
+const config_providers: Array<{
+    resolveDebugConfiguration(...a: unknown[]): unknown;
+    resolveDebugConfigurationWithSubstitutedVariables?(...a: unknown[]): unknown;
+}> = [];
 const error_messages: string[] = [];
+const warning_messages: string[] = [];
+const terminate_listeners: Array<(s: unknown) => void> = [];
+let descriptor_factory: { createDebugAdapterDescriptor(s: unknown): unknown } | null = null;
+/** The console (IPC socket) of every debug adapter descriptor issued. */
+const descriptors: string[] = [];
+/**
+ * `startDebugging` goes through `host_launch`, as VS Code's does, instead of
+ * only recording the call (the `the host's launch sequence` tests).
+ */
+let play_host = false;
+
+type LaunchConfig = Record<string, unknown> & { consoleSocket?: string };
+type HostSession = { type: string; id: string; configuration: LaunchConfig };
+let host_sessions = 0;
+
+/**
+ * What VS Code does with a debug configuration, in its order
+ * (`createSession` and `doCreateSession` in VS Code's
+ * src/vs/workbench/contrib/debug/browser/debugService.ts; lines of 1.82.0,
+ * the oldest VS Code this extension supports, and the order is the same on
+ * main):
+ *
+ * 1. `resolveDebugConfiguration` (line 475), and variable substitution;
+ * 2. the configuration's `preLaunchTask` (line 491), here `task`: when it
+ *    fails the launch ends, and no provider hears of it;
+ * 3. `resolveDebugConfigurationWithSubstitutedVariables` (line 496), where
+ *    a provider that returns nothing ends the launch quietly;
+ * 4. the session: the adapter descriptor, the adapter's handshake (here
+ *    `adapter_ms`), then `onDidStartDebugSession`.
+ *
+ * Resolves to the session, or `undefined` when the launch ended first.
+ */
+async function host_launch(
+    config: LaunchConfig,
+    { task = Promise.resolve(true), adapter_ms = 0 }: { task?: Promise<boolean>; adapter_ms?: number } = {},
+): Promise<HostSession | undefined> {
+    const provider = config_providers[0];
+    const resolved = await provider.resolveDebugConfiguration(undefined, config) as LaunchConfig | undefined;
+    if (!resolved) return undefined;
+    if (!(await task)) return undefined;
+    const cfg = provider.resolveDebugConfigurationWithSubstitutedVariables
+        ? await provider.resolveDebugConfigurationWithSubstitutedVariables(undefined, resolved) as LaunchConfig | undefined
+        : resolved;
+    if (!cfg) return undefined;
+    const session: HostSession = { type: 'raven-r', id: `host${++host_sessions}`, configuration: cfg };
+    descriptor_factory!.createDebugAdapterDescriptor(session);
+    descriptors.push(String(cfg.consoleSocket));
+    if (adapter_ms > 0) await new Promise((r) => setTimeout(r, adapter_ms));
+    start_sessions.push(session);
+    for (const l of start_listeners) l(session);
+    return session;
+}
+
+/** The console ended `session` (`terminated`), and VS Code has torn it down. */
+function host_end(session: HostSession): void {
+    for (const l of terminate_listeners) l(session);
+}
 /** Open documents (`workspace.textDocuments`). */
 const text_documents: Array<{ uri: { fsPath: string }; isDirty: boolean; save(): Promise<boolean> }> = [];
 
@@ -62,16 +124,20 @@ mock.module('vscode', () => ({
             config_providers.push(p);
             return disposable();
         },
-        registerDebugAdapterDescriptorFactory: disposable,
+        registerDebugAdapterDescriptorFactory: (_t: string, f: typeof descriptor_factory) => {
+            descriptor_factory = f;
+            return disposable();
+        },
         registerDebugAdapterTrackerFactory: (_t: string, f: typeof tracker_factory) => {
             tracker_factory = f;
             return disposable();
         },
         onDidChangeBreakpoints: (cb: () => void) => { change_listeners.push(cb); return disposable(); },
         onDidStartDebugSession: (cb: (s: unknown) => void) => { start_listeners.push(cb); return disposable(); },
-        onDidTerminateDebugSession: disposable,
+        onDidTerminateDebugSession: (cb: (s: unknown) => void) => { terminate_listeners.push(cb); return disposable(); },
         startDebugging: async (_f: unknown, config: { consoleSocket?: string }) => {
             started.push(config);
+            if (play_host) return (await host_launch(config)) !== undefined;
             // VS Code takes a moment to start a session.
             await new Promise((r) => setTimeout(r, 50));
             return true;
@@ -85,7 +151,7 @@ mock.module('vscode', () => ({
         onDidCloseTerminal: (cb: (t: unknown) => void) => { close_listeners.push(cb); return disposable(); },
         showInformationMessage: async () => undefined,
         showErrorMessage: async (m: string) => { error_messages.push(m); return undefined; },
-        showWarningMessage: async () => undefined,
+        showWarningMessage: async (m: string) => { warning_messages.push(m); return undefined; },
     },
     workspace: {
         workspaceFolders: undefined,
@@ -94,7 +160,12 @@ mock.module('vscode', () => ({
     },
 }));
 
-const { register_debugger, register_debugger_unavailable, _set_launch_timeouts_for_test } = await import('../../editors/vscode/src/debugger/index');
+const {
+    register_debugger,
+    register_debugger_unavailable,
+    _set_launch_timeouts_for_test,
+    _set_mirror_gate_for_test,
+} = await import('../../editors/vscode/src/debugger/index');
 const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
 
 // --------------------------------------------------------------- fake console
@@ -117,6 +188,10 @@ class FakeConsole {
     mirrors = 0;
     /** Awaited before a mirror is answered `not-ready` or `unavailable`. */
     before_refusal?: (n: number) => Promise<void>;
+    /** How long an accepted mirror takes to apply (R is busy). */
+    apply_delay_ms = 0;
+    /** Never acknowledge `subscribe` (a console that has hung). */
+    silent_subscribe = false;
     private subscribers: net.Socket[] = [];
     private server: net.Server;
     constructor(readonly socket: string) {
@@ -152,6 +227,7 @@ class FakeConsole {
     private handle(sock: net.Socket, msg: Wire): void {
         switch (msg.op) {
             case 'subscribe':
+                if (this.silent_subscribe) return;
                 this.reply(sock, msg.id, 'ok');
                 this.subscribers.push(sock);
                 return;
@@ -172,6 +248,7 @@ class FakeConsole {
                 // acts on a summary before the reply is caught).
                 if (this.ok_first) this.reply(sock, msg.id, 'ok');
                 void (async () => {
+                    if (this.apply_delay_ms > 0) await new Promise((r) => setTimeout(r, this.apply_delay_ms));
                     for (const [p, list] of Object.entries(files)) {
                         await new Promise((r) => setTimeout(r, 30));
                         let key = p;
@@ -590,6 +667,93 @@ describe('a console whose debugger is not running yet, or never will', () => {
     }, 30_000);
 });
 
+describe("the bound on how long a new console's first send is held", () => {
+    /** Register a console whose send gate lasts `gate_ms`. */
+    function attach_gated(sock: string, gate_ms: number): object {
+        _set_mirror_gate_for_test(gate_ms);
+        try {
+            return attach(sock);
+        } finally {
+            _set_mirror_gate_for_test(15_000);
+        }
+    }
+
+    test('a mirror still being applied when the time is up arms its breakpoints before the send', async () => {
+        const { con, sock } = await console_at();
+        // R is still starting; the debugger starts just before the gate's
+        // time is up, and R takes a while to apply the mirror that follows.
+        con.mirror_mode = 'not-ready';
+        const start = Date.now();
+        con.before_refusal = async () => {
+            if (con.mirror_mode !== 'ok' && Date.now() - start > 700) {
+                con.mirror_mode = 'ok';
+                con.apply_delay_ms = 500;
+                con.push({ event: 'ready' });
+            }
+        };
+        set_breakpoints([line_bp(a_r, 2)]);
+        const terminal = attach_gated(sock, 1_000);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [2] });
+        // Held past the gate's own time, and released when the mirror
+        // landed rather than at the extended deadline (2 s).
+        const waited = Date.now() - start;
+        expect(waited).toBeGreaterThan(1_050);
+        expect(waited).toBeLessThan(1_900);
+        detach(terminal);
+    });
+
+    test('a mirror that never lands holds the send for one extension only', async () => {
+        const { con, sock } = await console_at();
+        // Every answer is a slow `not-ready`: the first mirror is still
+        // retrying at the deadline, and at the extended one.
+        con.mirror_mode = 'not-ready';
+        con.before_refusal = () => settle(300);
+        set_breakpoints([line_bp(a_r, 2)]);
+        const start = Date.now();
+        const terminal = attach_gated(sock, 600);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        const waited = Date.now() - start;
+        expect(waited).toBeGreaterThanOrEqual(1_150);
+        expect(waited).toBeLessThan(1_800);
+        detach(terminal);
+    });
+
+    test('with no mirror on its way the send goes when the time is up', async () => {
+        const { con, sock } = await console_at();
+        // The console never acknowledges the subscription, so no mirror is
+        // ever sent.
+        con.silent_subscribe = true;
+        set_breakpoints([line_bp(a_r, 2)]);
+        const start = Date.now();
+        const terminal = attach_gated(sock, 600);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        const waited = Date.now() - start;
+        expect(waited).toBeGreaterThanOrEqual(550);
+        expect(waited).toBeLessThan(1_100);
+        expect(con.mirrors).toBe(0);
+        detach(terminal);
+    });
+
+    test('closing the console releases a held send at once', async () => {
+        const { con, sock } = await console_at();
+        con.mirror_mode = 'not-ready';
+        set_breakpoints([line_bp(a_r, 2)]);
+        const terminal = attach(sock);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await settle(300);
+        expect(con.executes.length).toBe(0);
+        // A Perch terminal closing only detaches: the console lives on and
+        // takes the send.
+        for (const l of close_listeners) l(terminal);
+        await until(() => con.executes.length === 1, 2_000);
+        detach(terminal);
+    });
+});
+
 describe('auto-attach', () => {
     test('a stop heard twice (replayed on subscribe and pushed) starts one session', async () => {
         const { con, sock } = await console_at();
@@ -602,6 +766,38 @@ describe('auto-attach', () => {
         con.push({ event: 'stopped', reason: 'breakpoint' });
         await settle(300);
         expect(started.filter((c) => c.consoleSocket === sock).length - before).toBe(1);
+    });
+});
+
+describe('a stop heard while its console\'s session is being torn down', () => {
+    test('is dropped when R leaves it before the teardown finishes', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        play_host = true;
+        try {
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await until(() => start_sessions.some((s) => s.configuration.consoleSocket === sock), 3_000);
+            const session = start_sessions.find((s) => s.configuration.consoleSocket === sock)!;
+            // The console ends the session; VS Code is tearing it down
+            // when R stops again, and the user types `c` at `Browse>`.
+            tracker_factory!.createDebugAdapterTracker(session).onDidSendMessage({ type: 'event', event: 'terminated' });
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            con.push({ event: 'running' });
+            await settle(200);
+            const before = started.filter((c) => c.consoleSocket === sock).length;
+            host_end(session as HostSession);
+            await settle(300);
+            expect(started.filter((c) => c.consoleSocket === sock).length - before).toBe(0);
+            // A stop still there when the teardown finishes attaches.
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await until(() => started.filter((c) => c.consoleSocket === sock).length - before === 1, 2_000);
+        } finally {
+            play_host = false;
+        }
     });
 });
 
@@ -832,14 +1028,231 @@ describe('an explicit launch', () => {
             );
             con.push({ event: 'stopped', reason: 'breakpoint' });
             await settle(100);
+            // The user typed `c` at `Browse>`: the console says the stop is
+            // over as R resumes, long before R is back at its prompt.
             con.push({ event: 'running' });
             expect(await resolving).toBeUndefined();
             await settle(300);
             expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            // The next stop is a new one and attaches as usual.
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await until(() => started.some((c) => c.consoleSocket === sock), 2_000);
         } finally {
             _set_launch_timeouts_for_test(10_000, 10_000);
         }
     });
+});
+
+describe("the host's launch sequence: a launch whose preLaunchTask outlasts its claim", () => {
+    /** A console with a terminal here and a DAP socket; claims last `claim_ms`. */
+    async function ready_console(): Promise<{ con: FakeConsole; sock: string; terminal: object }> {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        const terminal = attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        return { con, sock, terminal };
+    }
+    /** A `preLaunchTask` the test finishes. */
+    function slow_task(): { task: Promise<boolean>; finish(ok: boolean): void } {
+        let finish: (ok: boolean) => void = () => undefined;
+        const task = new Promise<boolean>((r) => { finish = r; });
+        return { task, finish };
+    }
+    const issued = (sock: string) => descriptors.filter((d) => d === sock).length;
+    const explicit = (sock: string, name: string): LaunchConfig =>
+        ({ type: 'raven-r', request: 'launch', name, program: '/w/prog.R', consoleSocket: sock });
+    /** With VS Code's sequence played and a 300 ms claim. */
+    async function hosted(body: () => Promise<void>): Promise<void> {
+        play_host = true;
+        _set_launch_timeouts_for_test(300, 10_000);
+        try {
+            await body();
+        } finally {
+            play_host = false;
+            _set_launch_timeouts_for_test(10_000, 10_000);
+        }
+    }
+
+    test('a stop that attached while the task ran keeps the console; the launch is refused and says so', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        // Held for the launch while its claim lasts, then attached.
+        await settle(100);
+        expect(issued(sock)).toBe(0);
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        const warned = warning_messages.length;
+        finish(true);
+        expect(await launch).toBeUndefined();
+        expect(issued(sock)).toBe(1);
+        expect(warning_messages.slice(warned).join()).toContain('"Slow build" was not started, and its program did not run');
+    }));
+
+    test("closing the console's terminal while the task runs (a Perch console lives on) changes nothing", () => hosted(async () => {
+        const { con, sock, terminal } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        // The session showing the stop is still there.
+        detach(terminal);
+        finish(true);
+        expect(await launch).toBeUndefined();
+        expect(issued(sock)).toBe(1);
+    }));
+
+    test('a launch that finds a session another launch started replaces it, as before', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        // The stop's session ends, and the user starts a session by hand.
+        host_end([...start_sessions].reverse().find((s) => s.configuration.consoleSocket === sock)!);
+        // (A mark of the extension's own, written into launch.json, is not
+        // taken for an automatic attach's.)
+        const by_hand = await host_launch(
+            { type: 'raven-r', request: 'launch', name: 'R console', consoleSocket: sock, ravenAutoAttach: 1e9 },
+        );
+        expect(by_hand).toBeDefined();
+        finish(true);
+        const session = await launch;
+        expect(session).toBeDefined();
+        expect(issued(sock)).toBe(3);
+        host_end(by_hand!);
+        host_end(session!);
+    }));
+
+    test('a launch whose task finishes within its claim gets the console, and the stop is its to show', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Quick build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await settle(100);
+        finish(true);
+        expect(await launch).toBeDefined();
+        await settle(600);
+        expect(issued(sock)).toBe(1);
+    }));
+
+    test('a stop reported after the task, before the launch\'s session has started, is left to that session', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        // The claim made when the launch resolved has run out by the time
+        // the task finishes; the adapter's handshake then takes 150 ms.
+        const launch = host_launch(explicit(sock, 'Slow build'), { task, adapter_ms: 150 });
+        await settle(500);
+        finish(true);
+        await until(() => issued(sock) === 1, 2_000);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        expect(await launch).toBeDefined();
+        await settle(600);
+        expect(issued(sock)).toBe(1);
+    }));
+
+    test('a launch whose task fails is never heard from again, and the stop it held attaches', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Broken build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        finish(false);
+        expect(await launch).toBeUndefined();
+        expect(issued(sock)).toBe(0);
+        await until(() => issued(sock) === 1, 3_000);
+    }));
+
+    test('a stop that attached and ended while the task ran does not refuse the launch', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        // The user continued; R reached the prompt and the session ended.
+        const attached = [...start_sessions].reverse().find((s) => s.configuration.consoleSocket === sock)!;
+        host_end(attached);
+        finish(true);
+        const session = await launch;
+        expect(session).toBeDefined();
+        expect(issued(sock)).toBe(2);
+        host_end(session!);
+    }));
+
+    test('a session the console has ended, still being torn down, does not refuse the launch', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(sock, 'Slow build'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        const attached = [...start_sessions].reverse().find((s) => s.configuration.consoleSocket === sock)!;
+        tracker_factory!.createDebugAdapterTracker(attached).onDidSendMessage({ type: 'event', event: 'terminated' });
+        finish(true);
+        const session = await launch;
+        expect(session).toBeDefined();
+        host_end(attached);
+        host_end(session!);
+    }));
+
+    test("another console's stop attaching does not refuse the launch", () => hosted(async () => {
+        const a = await ready_console();
+        const b = await ready_console();
+        const { task, finish } = slow_task();
+        const launch = host_launch(explicit(a.sock, 'Slow build'), { task });
+        await settle(100);
+        b.con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(b.sock) === 1, 3_000);
+        await settle(400);
+        finish(true);
+        expect(await launch).toBeDefined();
+        expect(issued(a.sock)).toBe(1);
+    }));
+
+    test('a launch started while a session already shows a stop replaces it, as before', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        expect(await host_launch(explicit(sock, 'Run it now'))).toBeDefined();
+        expect(issued(sock)).toBe(2);
+    }));
+
+    test('a restart that re-resolves an edited configuration is not refused by its own session', () => hosted(async () => {
+        const { con, sock } = await ready_console();
+        const { task, finish } = slow_task();
+        // The launch resolves, then a stop attaches (so the console's
+        // attach count has moved on since) and ends; the launch starts.
+        const launch = host_launch(explicit(sock, 'Edited'), { task });
+        await settle(100);
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => issued(sock) === 1, 3_000);
+        await settle(100);
+        host_end([...start_sessions].reverse().find((s) => s.configuration.consoleSocket === sock)!);
+        finish(true);
+        const session = await launch;
+        expect(session).toBeDefined();
+        // Restart with launch.json edited: VS Code resolves the
+        // configuration again and calls the second hook, while the session
+        // is still this console's (debugService.ts `restartSession`, lines
+        // 783-787 of 1.82.0).
+        const provider = config_providers[0];
+        const again = await provider.resolveDebugConfiguration(undefined, explicit(sock, 'Edited'));
+        expect(await provider.resolveDebugConfigurationWithSubstitutedVariables!(undefined, again)).toBeDefined();
+        host_end(session!);
+    }));
 });
 
 describe('with the R console turned off', () => {
