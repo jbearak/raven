@@ -12,6 +12,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -428,4 +429,51 @@ describe('computeFilteredIndices — setIn on UNSHIPPED large-dictionary factor'
         expect(Array.from(out!)).toEqual([0, 5, 20, 25, 40, 45]);
         await r.close();
     });
+});
+
+// The native pickers write a year past 9999 unsigned (`10000-01-01`),
+// which `Date.parse` reads in the host's zone or not at all (issue #893).
+// Each host zone gets its own process: `bun test` runs in UTC, where the
+// bare date happened to come out right.
+describe('dateBoundMs — a bound as the date pickers write it', () => {
+    const d = { name: 'd', arrowType: 'Date32<DAY>' };
+    const t = (zone: string) => ({ name: `t ${zone}`, arrowType: `Timestamp<MICROSECOND, ${zone}>`, timeZone: zone });
+    const cases: [string, { name: string }, string][] = [
+        ['10000-01-01', d, '+010000-01-01T00:00:00.000Z'],
+        ['100000-01-01', d, '+100000-01-01T00:00:00.000Z'],
+        ['10000-01-01T00:00', t('UTC'), '+010000-01-01T00:00:00.000Z'],
+        ['100000-01-01T00:00', t('UTC'), '+100000-01-01T00:00:00.000Z'],
+        ['10000-01-01T00:00', t('Asia/Kolkata'), '9999-12-31T18:30:00.000Z'],
+        ['100000-01-01T00:00:30.25', t('Asia/Kolkata'), '+099999-12-31T18:30:30.250Z'],
+        ['10000-07-01T00:00', t('America/New_York'), '+010000-07-01T04:00:00.000Z'],
+        ['10000-01-01T05:30+05:30', t('America/New_York'), '+010000-01-01T00:00:00.000Z'],
+        ['10000-01-01T00:00Z', t('Asia/Kolkata'), '+010000-01-01T00:00:00.000Z'],
+        // A bare date on a date-time column is UTC midnight, as before.
+        ['10000-01-01', t('Asia/Kolkata'), '+010000-01-01T00:00:00.000Z'],
+        // The last day a `Date` holds, and the first it does not.
+        ['275760-09-13', d, '+275760-09-13T00:00:00.000Z'],
+        ['275760-09-14', d, 'NaN'],
+        ['275760-09-13T00:00', t('America/New_York'), 'NaN'],
+        // Spellings that already parsed keep their instants.
+        ['0000-01-01', d, '0000-01-01T00:00:00.000Z'],
+        ['0099-01-01', d, '0099-01-01T00:00:00.000Z'],
+        ['0999-12-31T00:00', t('UTC'), '0999-12-31T00:00:00.000Z'],
+        ['9999-12-31', d, '9999-12-31T00:00:00.000Z'],
+        ['9999-12-31T23:59', t('UTC'), '9999-12-31T23:59:00.000Z'],
+        ['+010000-01-01', d, '+010000-01-01T00:00:00.000Z'],
+        ['-000001-01-01', d, '-000001-01-01T00:00:00.000Z'],
+        ['-000001-01-01T00:00', t('UTC'), '-000001-01-01T00:00:00.000Z'],
+        // Seven digits is past what a `Date` holds.
+        ['1000000-01-01', d, 'NaN'],
+    ];
+    const script = `import { dateBoundMs } from ${JSON.stringify(join(HERE, '../../editors/vscode/src/data-viewer/filter.ts'))};
+const iso = (ms) => Number.isFinite(ms) ? new Date(ms).toISOString() : 'NaN';
+console.log(JSON.stringify(${JSON.stringify(cases)}.map(([s, col]) => [s, col.name, iso(dateBoundMs(s, col))])));`;
+    for (const tz of ['America/New_York', 'UTC']) {
+        test(`host zone ${tz}`, () => {
+            const r = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env: { ...process.env, TZ: tz } });
+            expect(r.stderr).toBe('');
+            expect(JSON.parse(r.stdout)).toEqual(cases.map(([s, col, want]) => [s, col.name, want]));
+        });
+    }
 });
