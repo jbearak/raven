@@ -251,6 +251,17 @@ describe('generateRCode', () => {
         expect(code).toContain('big <= bit64::as.integer64("2")');
     });
 
+    test('integer64 sort keys: base R orders by bit64 dense rank; dplyr and data.table by the column', () => {
+        const columns = [col('g', 'Int32', { typeTag: '<int>' }), col('big', 'Int64', { typeTag: '<integer64>' })];
+        const sort = { keys: [{ columnIndex: 0, direction: 'asc' as const }, { columnIndex: 1, direction: 'desc' as const }], labelsOnWhenSorted: true };
+        const base = gen({ columns, sort }, 'base');
+        const code = 'code' in base ? base.code : base.error;
+        expect(code).toContain('# Requires bit64');
+        expect(code).toContain('order(g, replace(bit64::keypos(big), bit64::is.na.integer64(big), NA), decreasing = c(FALSE, TRUE), method = "radix")');
+        expect('code' in gen({ columns, sort }) && gen({ columns, sort }).code).toContain('arrange(g, desc(big))');
+        expect('code' in gen({ columns, sort }, 'data.table') && gen({ columns, sort }, 'data.table').code).toContain('order(g, -big)');
+    });
+
     test('a non-number bound (an Inf saved as null) matches nothing, missing rows by includeMissing', () => {
         const r = gen({
             filter: { entries: [

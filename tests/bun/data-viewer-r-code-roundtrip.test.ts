@@ -320,7 +320,9 @@ type EdgeCase = {
     refuse?: CodeFlavor[];
 };
 
-function edgeSuite(title: string, frameR: string, objects: string[], cases: EdgeCase[]): void {
+/** `preamble` is R run before the cases, after dplyr and data.table load
+ *  (e.g. attaching bit64). */
+function edgeSuite(title: string, frameR: string, objects: string[], cases: EdgeCase[], preamble = ''): void {
     describe.skipIf(!READY)(title, () => {
         const results = new Map<string, string>();
         const want = new Map<string, string>();
@@ -337,6 +339,7 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
                 'suppressPackageStartupMessages({ library(dplyr); library(data.table) })',
                 `df <- readRDS(${JSON.stringify(rds)})`,
                 'dtobj <- data.table::as.data.table(df)',
+                preamble,
             ];
             for (const c of cases) {
                 const entries: FilterEntry[] = (c.filters ?? []).map((f, k) => ({
@@ -480,6 +483,26 @@ df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
         // -2^63 is bit64's NA: it must not select the missing row.
         { name: 'neg in -2^63', filters: [{ ci: 4, p: { kind: 'setIn', values: ['-9223372036854775808'] } }] },
     ]);
+
+// Sorting integer64: negatives, NA and values past 2^53, as the first key
+// and as a second key with the other direction. Base R's order() reads an
+// integer64 as its raw bits until bit64 is attached, and once it is
+// attached refuses more than one key; the base R code sorts by
+// bit64::keypos() instead.
+const I64_SORT_FRAME = `df <- data.frame(id = 1:7, g = c(1L, 2L, 1L, 2L, 1L, 2L, 1L))
+df$big <- bit64::as.integer64(c("-1", "5", "-3", "9007199254740993", "9007199254740992", NA, NA))`;
+const I64_SORT: EdgeCase[] = [
+    { name: 'big asc', sort: [{ ci: 2, dir: 'asc' }] },
+    { name: 'big desc', sort: [{ ci: 2, dir: 'desc' }] },
+    { name: 'g asc, big desc', sort: [{ ci: 1, dir: 'asc' }, { ci: 2, dir: 'desc' }] },
+    { name: 'big asc, g desc', sort: [{ ci: 2, dir: 'asc' }, { ci: 1, dir: 'desc' }] },
+    // rank.integer64() aborts R on a key that is all NA.
+    { name: 'big missing only, sorted by big', filters: [{ ci: 2, p: { kind: 'isEmpty' } }], sort: [{ ci: 2, dir: 'asc' }] },
+];
+edgeSuite('Copy as R code round trip: integer64 sort keys, bit64 not attached (real R)',
+    I64_SORT_FRAME, ['df', 'dtobj'], I64_SORT);
+edgeSuite('Copy as R code round trip: integer64 sort keys, bit64 attached (real R)',
+    I64_SORT_FRAME, ['df', 'dtobj'], I64_SORT, 'suppressPackageStartupMessages(library(bit64))');
 
 // Comparisons alone, in a session where nothing has loaded bit64 yet:
 // the operators dispatch to bit64 only once it is loaded, which

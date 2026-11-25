@@ -1918,9 +1918,10 @@ export function App({
             colIndices = copyColumns(display, selection.columns.toArray(), withRowNames);
             includeHeader = true;
         } else if (selection.rows.length > 0) {
-            const rows = selection.rows.toArray();
-            rowStart = Math.max(0, Math.min(...rows));
-            rowEnd = Math.min(effectiveNrow, Math.max(...rows) + 1);
+            // Bounds from the compact ranges: a Shift-click over a
+            // million rows would overflow the stack spread into Math.min.
+            rowStart = Math.max(0, selection.rows.first()!);
+            rowEnd = Math.min(effectiveNrow, selection.rows.last()! + 1);
             colIndices = allCopyColumns(display, withRowNames);
         } else if (selection.current) {
             const range = selection.current.range;
@@ -2849,9 +2850,10 @@ export function App({
             rows = { start: 0, end: effectiveNrow };
             cols = gridSelection.columns.toArray().filter(d => sourceAt(display, d) !== undefined);
         } else if (gridSelection.rows.length > 0) {
-            const rs = gridSelection.rows.toArray();
-            rows = { start: Math.min(...rs), end: Math.max(...rs) + 1 };
-            if (rows.end - rows.start !== rs.length) return `${(rs.length * visibleCols.length).toLocaleString('en-US')} cells`;
+            // Read the compact ranges, never every index (see copySelection).
+            const count = gridSelection.rows.length;
+            rows = { start: gridSelection.rows.first()!, end: gridSelection.rows.last()! + 1 };
+            if (rows.end - rows.start !== count) return `${(count * visibleCols.length).toLocaleString('en-US')} cells`;
             cols = visibleCols.map((_, i) => i + 1);
         }
         if (!rows) return '';

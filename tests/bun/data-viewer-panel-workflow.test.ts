@@ -270,6 +270,33 @@ describe('refresh', () => {
         expect(infos[0]).toContain('no View() expression');
     });
 
+    test('a titled view of an expression past 256 bytes re-runs with its title; an untitled one with its cut name', async () => {
+        const expr = `subset(tiny, ${'x > 1 & '.repeat(40)}TRUE)`;
+        expect(Buffer.byteLength(expr, 'utf8')).toBeGreaterThan(256);
+        const titled = await setup({ source: { expression: expr, sourceKind: 'data.frame', sessionId: 'live' }, title: 'Results' });
+        const gen = await ready(titled.wv);
+        modalAnswer = 'Re-run';
+        titled.wv.deliver({ type: 'refresh', panelGeneration: gen });
+        await flush();
+        expect(sent).toEqual([`View(${expr}, title = "Results")`]);
+        // Untitled, R named the panel after the expression cut to 256
+        // bytes; passing that name back as the title lands in the panel.
+        sent = [];
+        const cut = `${expr.slice(0, 253)}\u2026`;
+        const untitled = await setup({ source: { expression: expr, sourceKind: 'data.frame', sessionId: 'live' }, title: cut });
+        const gen2 = await ready(untitled.wv);
+        untitled.wv.deliver({ type: 'refresh', panelGeneration: gen2 });
+        await flush();
+        expect(sent).toEqual([`View(${expr}, title = "${cut}")`]);
+        // Titled with the whole expression: R doesn't cut a title.
+        sent = [];
+        const same = await setup({ source: { expression: expr, sourceKind: 'data.frame', sessionId: 'live' }, title: expr });
+        const gen3 = await ready(same.wv);
+        same.wv.deliver({ type: 'refresh', panelGeneration: gen3 });
+        await flush();
+        expect(sent).toEqual([`View(${expr}, title = ${JSON.stringify(expr)})`]);
+    });
+
     test('after the R session that made the view ends, it explains instead of asking', async () => {
         const { wv } = await setup({ source: { expression: 'tiny', sourceKind: 'data.frame', sessionId: 'ended' } });
         const gen = await ready(wv);
