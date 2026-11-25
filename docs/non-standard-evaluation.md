@@ -46,7 +46,7 @@ select(mtcars, starts_with("c"), mpg)
 
 ## What Raven checks
 
-Raven doesn't silence a whole call because the function uses NSE. It works out which function is called and applies an argument policy:
+Raven doesn't silence a whole call because the function uses NSE. It works out which function is called, within the [limits below](#limitations), and applies an argument policy:
 
 - Standard-evaluation arguments are checked normally.
 - Captured, data-masked, and tidy-selected arguments are not.
@@ -142,6 +142,19 @@ Three rules keep a declaration file from making diagnostics worse:
 
 A declaration takes effect once the package is installed and Raven has loaded it, because Raven reads the file from the installed package. Policies aren't yet stored in `.raven/packages.json`, so a CI run that relies on [`raven packages freeze`](package-database.md) instead of an installed library doesn't see them.
 
+<details markdown="1">
+<summary>Which package's declaration applies to a call</summary>
+
+A bare call such as `gen(...)` or `a %where% b` names a function, not a package. Raven applies a package's declaration when the code around the call brings that package in: a `library()`, `require()`, or `loadNamespace()` call, a `NAMESPACE` `import()` or `importFrom()` or a `DESCRIPTION` `Depends:` entry in the package you're developing, or a binding such as `gen <- dtatools::gen`. It doesn't work out which function R finds first. In three cases that can hide an error R raises at the call:
+
+- **A later package masks the declaring one.** After `library(dtatools)` and then `library(other)`, where both export `gen`, R calls `other::gen`. If that function evaluates an argument that dtatools's `gen` captures, R stops on an undefined name there. Raven still applies dtatools's declaration and skips the argument. R's choice depends on which package was attached first, on `library()` arguments such as `exclude`, and on packages attached by code Raven doesn't read.
+- **The package is loaded but not attached.** After `loadNamespace("dtatools")` alone, R can't find `gen` and stops. Raven counts a loaded package's exports as available, so it reports neither `gen` nor the arguments its declaration covers. That reads a script correctly when it attaches the namespace somewhere Raven can't follow, such as `attachNamespace()` or a helper function.
+- **The file rebinds the name further down.** When `gen <- dtatools::gen` is the file's last top-level binding of `gen`, and Raven has loaded dtatools (a `library(dtatools)` in another checked file is enough), Raven applies dtatools's declaration to the `gen(...)` calls above that line too. A call there that reaches a different `gen` can stop on an argument Raven skips. Some calls written above the binding do run after it, from a function body or a loop.
+
+To have the arguments checked, name the function at the call: `other::gen(...)`, or for an operator `` other::`%where%`(a, b) ``. To keep the infix form, bind the operator above the calls with `` `%where%` <- other::`%where%` ``, and don't bind it again at top level further down.
+
+</details>
+
 ### Declaring data.table-style `[` semantics
 
 Raven treats `[` on a data.table specially: `d[, mean(x), by = grp]` quotes `x` and `grp`, so they aren't undefined variables (see [`undefined-variable`](diagnostics.md#undefined-variables)). A package whose own container uses that bracket notation can declare it with an optional `[subset]` table in the same file:
@@ -218,7 +231,8 @@ An `x[...]` that isn't on the left of the operator keeps its ordinary meaning. A
 <details markdown="1">
 <summary>When an operator declaration applies</summary>
 
-- An infix operator can't be written `pkg::op`, so Raven applies a declaration only where the call reaches the package's operator: the package is attached at that point through a `library()` or `require()` call above it (in the file or in a file that sources it), `Imports:`, `importFrom`, or its own sources, or the file binds `` `:=` <- datakit::`:=` ``. A `library()` call further down doesn't count for a top-level call above it; a function body sees the packages the file attaches anywhere, as it does for the package's functions. A `pkg::` reference to another of the package's functions doesn't count either, because it doesn't put the operator on the search path.
+- An infix operator can't be written `pkg::op`, so Raven applies a declaration only where the call can reach the package's operator: the package is brought in at that point through a `library()`, `require()`, or `loadNamespace()` call above it (in the file or in a file that sources it), a `NAMESPACE` `import()` of the package or `importFrom()` of the operator, a `DESCRIPTION` `Depends:` entry, or its own sources, or the file binds `` `:=` <- datakit::`:=` ``. A `library()` call further down doesn't count for a top-level call above it; a function body sees the packages the file attaches anywhere, as it does for the package's functions. A `pkg::` reference to another of the package's functions doesn't count either, because it doesn't put the operator on the search path.
+- When a second attached package exports the same operator, Raven doesn't work out which of the two R calls. See [which package's declaration applies](#declaring-nse-from-a-package).
 - A definition of `` `:=` `` that the call reaches first shadows every package's declaration, as it shadows the package's operator in R: one at the file's top level, in an enclosing function, or in a sourced file. Raven's lookup is a little stricter than R's. A binding of `` `:=` `` in an enclosing function or a sourced file counts as a shadow even when it isn't a function (`` `:=` <- 1 ``), which R skips. A top-level one is skipped, as in R. It also counts an enclosing function's later definition as a shadow for a closure the function calls before making it. In both cases Raven checks the operator's arguments as ordinary code.
 - Function names in the masked positional indices and the value are still checked, because a column can't be called: in `d[, avg] := maen(income)`, `income` is a column but `maen` is reported. Names inside a call that doesn't evaluate its argument, such as `quote(foo())`, stay unchecked, and named indices listed in `masked_arguments` stay fully masked, so `.` in `by = .(g, h)` isn't checked. Inside data.table's `[` and dplyr verbs, Raven still skips call heads too.
 - An `[[operator]]` entry and a `[[function]]` entry may name the same operator. The `[[function]]` policy applies when the left side doesn't match the form.
@@ -247,6 +261,7 @@ See the [settings reference](settings-reference.md) for allowed values and `rave
 - Raven's built-in policy table covers common, slow-moving packages, but it isn't exhaustive, and finding which package a function comes from depends on package metadata. A helper Raven doesn't know can still cause a false positive until you add `# raven: nse` or Raven learns its policy. See [What the built-in table covers](#what-the-built-in-table-covers).
 - Some code is too dynamic to classify. After `fn <- get_function()`, Raven sees `fn(typo)` but not whether `fn` treats `typo` as a variable or as captured code. In such cases Raven may skip argument diagnostics rather than guess.
 - Names created at runtime, `attach()`, package loads built at runtime, and computed data or column names may still need declarations or local suppressions.
+- Raven applies a [package's declaration](#declaring-nse-from-a-package) to a bare call without working out which function R finds first. When a later package masks the declaring one, the package is loaded but never attached, or the file binds the name further down, Raven can miss an error R raises at that call.
 - In projects where data.table, or any package that [declares data.table-style `[` semantics](#declaring-datatable-style--semantics), is detectably in play, an unresolved object inside `[` can be treated as data.table-like. This avoids many false positives but can miss a real undefined index in ambiguous code.
 - A `[` call with a `:=` argument is treated as NSE no matter which package is in play or what the object is, because no base `[` method evaluates `:=`. That covers both `d[, col := value, by = grp]` and the functional `` `:=`(...) `` spelling, but only when `:=` is the argument itself, not nested in another expression. Packages that adopt data.table's bracket notation get this without a declaration. The cost is that a typo elsewhere in the same call (`d[typo, y := 1]`) goes unreported.
 
