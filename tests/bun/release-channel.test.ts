@@ -153,10 +153,18 @@ describe("release workflows check the tag before building or publishing", () => 
   for (const script of ["check-release-tag.sh", "release-channel.sh"]) {
     copyFileSync(path.join(repoRoot, "scripts", script), path.join(repo, "scripts", script));
   }
+  // Under a git hook the suite inherits GIT_DIR, GIT_INDEX_FILE and the like,
+  // which would point the scratch repository's commands at the caller's.
+  const localGitVars = spawnSync("git", ["rev-parse", "--local-env-vars"], { encoding: "utf8" }).stdout.split("\n");
+  const scratchEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !localGitVars.includes(name)));
   function git(...args: string[]): void {
     const identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"];
     const signing = ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"];
-    const result = spawnSync("git", [...identity, ...signing, ...args], { cwd: repo, encoding: "utf8" });
+    const result = spawnSync("git", [...identity, ...signing, ...args], {
+      cwd: repo,
+      encoding: "utf8",
+      env: scratchEnv,
+    });
     if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
   }
   git("init", "-q");
@@ -181,7 +189,7 @@ describe("release workflows check the tag before building or publishing", () => 
     const result = spawnSync("bash", ["-e", script], {
       cwd: repo,
       encoding: "utf8",
-      env: { ...process.env, ...env, GITHUB_OUTPUT: output },
+      env: { ...scratchEnv, ...env, GITHUB_OUTPUT: output },
     });
     return { passed: result.status === 0, output: readFileSync(output, "utf8") };
   }
