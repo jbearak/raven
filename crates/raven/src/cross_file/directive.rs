@@ -106,6 +106,64 @@ pub(crate) fn comment_region_outside_strings_for_parity_test(line: &str) -> Opti
     comment_region_outside_strings(line)
 }
 
+/// `text` with every string (and backticked name) that spans lines blanked to
+/// `_`, line breaks kept; `text` itself when it has none or holds no marker.
+/// `root` is the tree parsed from `text`.
+///
+/// The directive scan and the lint track's `# nolint` reader go line by line
+/// and track quotes within one line only. On a later line of a multi-line
+/// string, a `#` reads to them as a comment, and a real comment after the
+/// closing quote reads as string (issue #886). Scanning this view gives them
+/// R's comments: it has the same length, lines and comment text, and the
+/// filler is code, so a marker after a closing quote isn't on its own line.
+///
+/// A string the parser couldn't close, or one inside a syntax error, is left
+/// as it is: while a quote is half typed, markers keep their old reading.
+pub(crate) fn mask_multiline_strings<'a>(
+    text: &'a str,
+    root: tree_sitter::Node<'_>,
+) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    // Every `# raven:` / `@lsp-` directive holds one of the first two, and
+    // every lintr marker `nolint` in some case.
+    let nolint = || {
+        text.as_bytes()
+            .windows(6)
+            .any(|window| window.eq_ignore_ascii_case(b"nolint"))
+    };
+    if !text.contains("raven:") && !text.contains("@lsp-") && !nolint() {
+        return Cow::Borrowed(text);
+    }
+    let mut spans = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.start_position().row == node.end_position().row {
+            continue;
+        }
+        if matches!(node.kind(), "string" | "identifier") {
+            if !node.has_error() {
+                spans.push(node.byte_range());
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut bytes = text.as_bytes().to_vec();
+    for span in spans {
+        for byte in &mut bytes[span] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b'_';
+            }
+        }
+    }
+    // Whole tokens were overwritten with ASCII, so the text is still UTF-8.
+    Cow::Owned(String::from_utf8(bytes).expect("strings replaced by ASCII"))
+}
+
 /// Map the flavor capture (`ignore` | `expect`) into a [`SuppressionFlavor`].
 /// Defaults to [`SuppressionFlavor::Ignore`] when absent or unrecognized.
 fn parse_flavor(raw: Option<&str>) -> SuppressionFlavor {
@@ -1448,6 +1506,69 @@ pub fn is_line_ignored(metadata: &CrossFileMetadata, line: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn masked(text: &str) -> std::borrow::Cow<'_, str> {
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(text, None)).unwrap();
+        mask_multiline_strings(text, tree.root_node())
+    }
+
+    /// A multi-line string, raw string or backticked name is blanked with its
+    /// line breaks kept; everything else, comments included, is untouched.
+    #[test]
+    fn mask_blanks_multiline_strings_only() {
+        assert_eq!(
+            masked("x <- \"a\n# raven: ignore-end\nb\" # nolint\ny <- \"# nolint\"\n"),
+            "x <- __\n___________________\n__ # nolint\ny <- \"# nolint\"\n"
+        );
+        assert_eq!(
+            masked("x <- r\"(a\r\n# nolint end)\"\n`b\n# nolint` <- 1\n"),
+            "x <- ____\r\n______________\n__\n_________ <- 1\n"
+        );
+        // lintr markers are read in any case.
+        assert_eq!(
+            masked("x <- \"\n# NOLINT END\n\"\n"),
+            "x <- _\n____________\n_\n"
+        );
+        // Same bytes per line, whatever the string holds.
+        let text = "x <- 'é\n# nolint end 😀'\n";
+        assert_eq!(masked(text).len(), text.len());
+    }
+
+    /// No marker, no multi-line string, or a string the parser couldn't
+    /// close: the text is scanned as it is.
+    #[test]
+    fn mask_leaves_other_text_alone() {
+        use std::borrow::Cow;
+        for text in [
+            "x <- \"a\nb\"\n",
+            "x <- \"# nolint\" # nolint\n",
+            "# raven: ignore-start\nx <- \"abc\n# raven: ignore-end\n",
+        ] {
+            assert!(matches!(masked(text), Cow::Borrowed(_)), "{text:?}");
+        }
+    }
+
+    /// A marker spelled inside a multi-line string isn't a directive: the
+    /// block runs to the real end marker (issue #886).
+    #[test]
+    fn metadata_ignores_markers_inside_multiline_strings() {
+        let text = "# raven: ignore-start\nx <- \"hello\n# raven: ignore-end\nworld\"\n\
+                    print(T)\n# raven: ignore-end\nprint(T)\n";
+        let ranges = |meta: CrossFileMetadata| -> Vec<(u32, u32)> {
+            meta.ignored_ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect()
+        };
+        assert_eq!(ranges(crate::cross_file::extract_metadata(text)), [(0, 5)]);
+        // The line-by-line scan alone ends the block at the string's line.
+        assert_eq!(ranges(parse_directives(text)), [(0, 2)]);
+
+        // Any directive, not only suppressions.
+        let text = "x <- \"\n# raven: source gone.R\n\"\n";
+        assert!(crate::cross_file::extract_metadata(text).sources.is_empty());
+        assert_eq!(parse_directives(text).sources.len(), 1);
+    }
 
     /// The scan reports every directive with the spelling as written, and
     /// says which ones Raven ignores where they stand; `parse_directives`

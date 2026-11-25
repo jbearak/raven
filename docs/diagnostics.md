@@ -162,7 +162,7 @@ Raven also honors lintr's markers, for style lints and the [`mixed-logical`](#mi
 
 Notes:
 
-- A marker inside a string literal (`x <- "# nolint"`) is not a marker.
+- A marker inside a string literal (`x <- "# nolint"`) is not a marker. That includes a line of a string that spans several lines: a `# nolint end` or `# raven: ignore-end` there closes nothing.
 - Typos such as `# nolinter` or `# @lsp-ignored` are not recognized. Raven would rather show the finding than silently swallow it.
 - A same-line marker inside a commented-code line, as in `# x <- 1 # nolint`, works. Raven only treats the inner marker as one when the text between the outer `#` and the inner `# nolint` parses as R, so the same marker inside prose is left alone.
 - An `expect` whose selector names only codes that can't be suppressed is not reported as unused.
@@ -488,6 +488,8 @@ Where it can, Raven gives a specific message rather than the generic "R code cou
 | `` Missing opening `{` `` / `` Missing opening `(` `` / `` Missing opening `[` `` / `` Missing opening `[[` `` | A closer with no opener (`}` at top level, `)` after a complete expression). A run of stray closers (`}}}`) gets one diagnostic. |
 | `In R, 'else' must appear on the same line as the closing '}' of the if block` | `else` on its own line after `if (cond) { body }`. R treats the `if` as complete, so the `else` is unexpected. |
 | ``'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line`` | `else` anywhere R rejects a bare `else`: `else { 1 }` at the top of a file, inside `{ … }`, `(else)`, `else \|> f()`, or as a function argument or assignment value |
+| ``Unexpected expression: R needs a newline or `;` between two expressions on one line`` | Two expressions on one line with only spaces between them (`x <- 1 y <- 2`, `f(1) g(2)`, `{ a b }`). The range is the second expression's first token. Reported only when the file has no other parse error. |
+| ``Malformed number `0x`: a hexadecimal number needs digits after `0x` `` / ``Malformed number `0x1.p`: a hexadecimal exponent needs digits after `p` `` | A hexadecimal number with no digits (`0x`, `0xg`) or with a `p` exponent that has none (`0x1p`, `0x1.p`). Reported only when the file has no other parse error. |
 | `R code could not be parsed here` | A parse error that matches none of the patterns above |
 
 The mismatched-brackets message also covers a wrong closer typed right after an unclosed opener: `f(}` gives one `` Mismatched brackets: `(` opened here; close with `)` not `}`. `` diagnostic, not two.

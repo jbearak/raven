@@ -763,6 +763,49 @@ fn nolint_blocks_pair_with_raven_block_markers() {
     assert_eq!(end["target"], lines(0, 2, 12));
 }
 
+/// A block marker spelled inside a multi-line string is no comment and pairs
+/// with nothing: the real markers pair around it, whichever family the
+/// spelling belongs to (issue #886).
+#[test]
+fn block_markers_inside_a_multiline_string_pair_with_nothing() {
+    for (start, fake, end) in [
+        ("# nolint start", "# nolint end", "# nolint end"),
+        ("# nolint start", "# raven: ignore-end", "# nolint end"),
+        (
+            "# raven: ignore-start",
+            "# nolint end",
+            "# raven: ignore-end",
+        ),
+        (
+            "# raven: ignore-start",
+            "# raven: ignore-end",
+            "# raven: ignore-end",
+        ),
+    ] {
+        let text = format!("{start}\nx <- \"hello\n{fake}\nworld\"\nprint(T)\n{end}\nprint(T)\n");
+        let all = directives(&text);
+        assert_eq!(all.len(), 2, "{start:?}/{fake:?}: {all:?}");
+        let target = lines(0, 5, end.len() as u32);
+        for (comment, directive) in &all {
+            assert_eq!(directive["honored"], true, "{start:?}/{fake:?}: {comment}");
+            assert_eq!(directive["target"], target, "{start:?}/{fake:?}: {comment}");
+        }
+    }
+}
+
+/// A marker in a real comment after a multi-line string's closing quote is
+/// read as the trailing comment it is.
+#[test]
+fn marker_after_a_multiline_strings_closing_quote() {
+    let all = directives("x <- \"a\nb\" # nolint\ny <- \"c\nd\" # raven: ignore-start\n");
+    let nolint = directive(&all, "# nolint");
+    assert_eq!(nolint["honored"], true);
+    assert_eq!(nolint["target"], lines(1, 1, 11));
+    let start = directive(&all, "# raven: ignore-start");
+    assert_eq!(start["honored"], false);
+    assert_eq!(start["reason"], "not_own_line");
+}
+
 #[test]
 fn unread_and_unknown_directives_are_reported() {
     let text = "\

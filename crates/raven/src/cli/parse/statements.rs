@@ -121,7 +121,11 @@ pub(crate) fn build_document_body(
     let builder = Builder {
         text,
         lines,
-        directives: super::directives::directives_by_comment(&parse_text, lines, &comments),
+        directives: super::directives::directives_by_comment(
+            &crate::cross_file::directive::mask_multiline_strings(&parse_text, root),
+            lines,
+            &comments,
+        ),
         error_spans,
         // The original text: the scope counts lines by `\n` alone.
         resolutions: super::resolve::resolve_tree(root, text, names),

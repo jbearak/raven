@@ -876,6 +876,22 @@ fn build_indexed_state_reporting(
         &state.box_search_context(),
         Some(&mut scan),
     );
+    // A derivation that passes a directory down expands a file's batches
+    // again from that directory, so report the failures of the expansion each
+    // file ended with, not the scan's (issue #886).
+    scan.failed_list_files_batches = entries
+        .iter()
+        .flat_map(|(uri, entry)| {
+            entry
+                .metadata
+                .list_files_batch_failures
+                .iter()
+                .map(|failure| (uri.clone(), failure.clone()))
+        })
+        .collect();
+    scan.failed_list_files_batches.sort_by(|(a, x), (b, y)| {
+        (a.as_str(), x.line, x.column).cmp(&(b.as_str(), y.line, y.column))
+    });
     // Preserve package text before bounded index admission can evict helpers.
     // Rope clones share their storage. Materialize and hash only evicted files
     // below; shared package hydration already supplies every resident file.

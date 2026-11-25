@@ -47,7 +47,17 @@ pub(crate) struct Suppressions {
 }
 
 impl Suppressions {
-    /// Parse `# nolint` / `# raven:` / `# @lsp-ignore` markers out of `text`.
+    /// The markers in the comments of `text`, whose tree is `root`. Unlike
+    /// [`Self::from_text`], this doesn't read a marker spelled inside a
+    /// multi-line string, and does read one after its closing quote.
+    pub(crate) fn from_tree(text: &str, root: tree_sitter::Node<'_>) -> Self {
+        Self::from_text(&crate::cross_file::directive::mask_multiline_strings(
+            text, root,
+        ))
+    }
+
+    /// Parse `# nolint` / `# raven:` / `# @lsp-ignore` markers out of `text`,
+    /// line by line. Use [`Self::from_tree`] when the text has a tree.
     pub(crate) fn from_text(text: &str) -> Self {
         let mut suppressed: HashMap<u32, LineSuppression> = HashMap::new();
         let mut in_block = false;
@@ -449,6 +459,62 @@ mod tests {
             let s = Suppressions::from_text(&format!("{marker}\ny = 2\n"));
             assert!(!s.is_suppressed(1), "{marker:?} must not suppress line 1");
         }
+    }
+
+    fn from_tree(text: &str) -> Suppressions {
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(text, None)).unwrap();
+        Suppressions::from_tree(text, tree.root_node())
+    }
+
+    /// A block marker spelled inside a multi-line string doesn't close (or
+    /// open) a block, whichever family it is (issue #886).
+    #[test]
+    fn markers_inside_multiline_strings_are_not_markers() {
+        for (start, fake, end) in [
+            ("# nolint start", "# nolint end", "# nolint end"),
+            ("# nolint start", "# raven: ignore-end", "# nolint end"),
+            (
+                "# raven: ignore-start",
+                "# nolint end",
+                "# raven: ignore-end",
+            ),
+            (
+                "# raven: ignore-start",
+                "# raven: ignore-end",
+                "# raven: ignore-end",
+            ),
+        ] {
+            let text =
+                format!("{start}\nx <- \"hello\n{fake}\nworld\"\nprint(T)\n{end}\nprint(T)\n");
+            let s = from_tree(&text);
+            for line in 0..=5 {
+                assert!(s.is_suppressed(line), "{start:?}/{fake:?}: line {line}");
+            }
+            assert!(!s.is_suppressed(6), "{start:?}/{fake:?}");
+            // The line-by-line reader alone ends the block inside the string.
+            assert!(!Suppressions::from_text(&text).is_suppressed(4));
+        }
+        let s = from_tree("# NOLINT START\nx = \"\n# NOLINT END\n\"\ny = 1\n");
+        assert!(
+            s.is_suppressed(4),
+            "uppercase markers are read the same way"
+        );
+        let s = from_tree("x <- \"\n# nolint start\n\"\ny = 1\n");
+        assert!(!s.is_suppressed(3));
+        let s = from_tree("x <- r\"(\n# nolint\n)\"\n");
+        assert!(!s.is_suppressed(1));
+    }
+
+    /// A real comment after a multi-line string's closing quote is read, and
+    /// a block marker there isn't on its own line.
+    #[test]
+    fn markers_after_a_multiline_strings_closing_quote() {
+        let s = from_tree("x = \"a\nb\" # nolint\ny = 2\n");
+        assert!(s.is_suppressed(1));
+        assert!(!s.is_suppressed(0));
+        assert!(!s.is_suppressed(2));
+        let s = from_tree("x = \"a\nb\" # raven: ignore-start\ny = 2\n");
+        assert!(!s.is_suppressed(2));
     }
 
     #[test]

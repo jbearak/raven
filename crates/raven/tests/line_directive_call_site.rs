@@ -214,3 +214,160 @@ fn working_directory_applies_to_both_sides() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, "unresolved-source-path");
 }
+
+/// The file `raven parse` resolves each `from_*()` call statement of `m.R` to
+/// (`None` when it isn't a workspace file), by the statement's text.
+fn probe_files(root: &Path) -> Vec<(String, Option<String>)> {
+    let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+        .args(["parse", "--workspace"])
+        .arg(root)
+        .arg("m.R")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    document["statements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|statement| {
+            let text = statement["text"].as_str().unwrap();
+            text.starts_with("from_").then(|| {
+                (
+                    text.to_owned(),
+                    statement["expression"]["resolution"]["path"]
+                        .as_str()
+                        .map(str::to_owned),
+                )
+            })
+        })
+        .collect()
+}
+
+fn probe(call: &str, file: &str) -> (String, Option<String>) {
+    (call.to_owned(), Some(file.to_owned()))
+}
+
+// The tests below pin what already works when a `source()` call, forward
+// directives and backward directives share one call site. An attempt to give
+// two directives on one line a file each (issue #886, item 3) broke each of
+// them in turn; a second attempt has to keep them.
+
+/// A backward directive can sit on a call that names another file: `a.R`
+/// says the `source("c.R")` call in `m.R` runs it too (through a path `c.R`
+/// computes). The call lends `a.R`.
+#[test]
+fn backward_directive_on_a_call_to_another_file_lends() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "m.R", "source(\"c.R\")\nfrom_a()\nfrom_c()\n");
+    write(
+        dir.path(),
+        "c.R",
+        "from_c <- function() 3\np <- paste0(\"a\", \".R\")\nsource(p)\n",
+    );
+    write(
+        dir.path(),
+        "a.R",
+        "# raven: sourced-by m.R match='source(\"c.R\")'\nfrom_a <- function() 1\n",
+    );
+    assert_eq!(diagnostics(dir.path()), []);
+}
+
+/// Two directives name the line of a `source("b.R")` call that a backward
+/// directive in `a.R` also matches. What `b.R` sources is still in scope.
+#[test]
+fn covered_call_with_a_backward_edge_from_a_directive_target() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: source b.R line=3\n# raven: source a.R line=3\nsource(\"b.R\")\nfrom_deep()\n",
+    );
+    write(
+        dir.path(),
+        "a.R",
+        "# raven: sourced-by m.R match='source(\"b.R\")'\nfrom_a <- function() 1\n",
+    );
+    write(dir.path(), "b.R", "source(\"deep.R\")\n");
+    write(dir.path(), "deep.R", "from_deep <- function() 1\n");
+
+    assert_eq!(diagnostics(dir.path()), []);
+    assert_eq!(probe_files(dir.path()), [probe("from_deep()", "deep.R")]);
+}
+
+/// The same with the backward directive in a third file: `c.R` says the
+/// `source("a.R")` call runs it. Both `a.R` and `c.R` are lent.
+#[test]
+fn covered_call_with_a_backward_edge_from_a_third_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: source a.R line=3\n# raven: source b.R line=3\nsource(\"a.R\")\n\
+         from_a()\nfrom_c()\n",
+    );
+    write(
+        dir.path(),
+        "a.R",
+        "from_a <- function() 1\np <- paste0(\"c\", \".R\")\nsource(p)\n",
+    );
+    write(dir.path(), "b.R", "from_b <- function() 2\n");
+    write(
+        dir.path(),
+        "c.R",
+        "# raven: sourced-by m.R match='source(\"a.R\")'\nfrom_c <- function() 3\n",
+    );
+
+    assert_eq!(diagnostics(dir.path()), []);
+    assert_eq!(
+        probe_files(dir.path()),
+        [probe("from_a()", "a.R"), probe("from_c()", "c.R")]
+    );
+}
+
+/// Both directives' files define the same name, and R runs the one the call
+/// names last: `a.R` sources `b.R`, then redefines it. The call resolves to
+/// `a.R`'s definition.
+#[test]
+fn same_name_in_both_directive_targets_resolves_to_the_calls_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: source a.R line=3\n# raven: source b.R line=3\n\
+         if (TRUE) source(\"a.R\")\nfrom_shared()\n",
+    );
+    write(
+        dir.path(),
+        "a.R",
+        "source(\"b.R\")\nfrom_shared <- function() \"a\"\n",
+    );
+    write(dir.path(), "b.R", "from_shared <- function() \"b\"\n");
+    assert_eq!(probe_files(dir.path()), [probe("from_shared()", "a.R")]);
+
+    // Two calls on the line, the later one to `a.R`.
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: source a.R line=3\n# raven: source b.R line=3\n  \
+         source(\"./b.R\"); source(\"a.R\")\nfrom_shared()\n",
+    );
+    write(dir.path(), "a.R", "from_shared <- function() \"a\"\n");
+    assert_eq!(probe_files(dir.path()), [probe("from_shared()", "a.R")]);
+}
+
+/// The calls the directives stand for are inside a function, and `a.R`
+/// assigns with `<<-`, so its definition is global after the function runs.
+#[test]
+fn directives_for_calls_inside_a_function_lend_a_global_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.R",
+        "# raven: source a.R line=4\n# raven: source b.R line=4\nload_helpers <- function() {\n  \
+         source(\"./b.R\"); source(\"a.R\", local = TRUE)\n}\nload_helpers()\nfrom_a()\n",
+    );
+    write(dir.path(), "a.R", "from_a <<- function() \"a\"\n");
+    write(dir.path(), "b.R", "from_b <- function() \"b\"\n");
+    assert_eq!(probe_files(dir.path()), [probe("from_a()", "a.R")]);
+}

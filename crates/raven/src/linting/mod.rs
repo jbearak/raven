@@ -140,7 +140,7 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
         return Vec::new();
     }
 
-    let suppressions = nolint::Suppressions::from_text(text);
+    let suppressions = nolint::Suppressions::from_tree(text, tree_root);
     run_lints_with(text, tree_root, config, suppressions, None)
 }
 
@@ -157,7 +157,7 @@ pub(crate) fn run_lints_with_producer_policy(
         return Vec::new();
     }
 
-    let suppressions = nolint::Suppressions::from_text(text);
+    let suppressions = nolint::Suppressions::from_tree(text, tree_root);
     run_lints_with(text, tree_root, config, suppressions, producer_policy)
 }
 
@@ -313,7 +313,7 @@ pub fn run_semantic_checks(
     if mixed_logical_severity.is_none() && condition_assignment_severity.is_none() {
         return Vec::new();
     }
-    let suppressions = nolint::Suppressions::from_text(text);
+    let suppressions = nolint::Suppressions::from_tree(text, root);
     run_semantic_checks_with(
         text,
         root,
@@ -414,7 +414,7 @@ pub fn suppressed_lint_pairs(
     mixed_logical_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
     condition_assignment_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
 ) -> Vec<(u32, String)> {
-    let suppressions = nolint::Suppressions::from_text(text);
+    let suppressions = nolint::Suppressions::from_tree(text, tree_root);
     let raw = run_lints_raw(text, tree_root, config)
         .into_iter()
         .chain(run_semantic_checks_raw(

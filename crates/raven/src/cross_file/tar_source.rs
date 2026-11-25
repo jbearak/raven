@@ -560,7 +560,8 @@ pub fn expand_tar_source_requests_with_exclusions(
     result
 }
 
-/// Replace the derived tar portion of `metadata` with `expansion`.
+/// Replace the derived tar portion of `metadata` with `expansion`, failed
+/// `list.files()` batches included.
 ///
 /// Syntax-derived requests and ordinary/directive sources are preserved.
 pub fn apply_tar_source_expansion(metadata: &mut CrossFileMetadata, expansion: TarSourceExpansion) {
@@ -570,6 +571,7 @@ pub fn apply_tar_source_expansion(metadata: &mut CrossFileMetadata, expansion: T
     metadata.sources.extend(expansion.sources);
     metadata.tar_source_expansion_watch_paths = expansion.watch_paths;
     metadata.source_batch_exclusion_patterns = expansion.exclusion_patterns;
+    metadata.list_files_batch_failures = expansion.list_files_failures;
     metadata.application_working_directory = expansion
         .application_working_directory
         .map(|path| path.to_string_lossy().into_owned());
@@ -618,11 +620,11 @@ pub fn finalize_source_batches_reporting_failures(
     workspace_root: Option<&Url>,
     exclusions: &CompiledWorkspaceExclusions,
 ) -> FinalizedSourceBatches {
-    let mut expansion =
+    let expansion =
         expand_tar_source_requests_with_exclusions(metadata, uri, workspace_root, exclusions);
     let finalized = FinalizedSourceBatches {
         selected_shiny_entry: expansion.selected_shiny_entry.clone(),
-        list_files_failures: std::mem::take(&mut expansion.list_files_failures),
+        list_files_failures: expansion.list_files_failures.clone(),
     };
     apply_tar_source_expansion(metadata, expansion);
     finalized
@@ -674,7 +676,7 @@ pub fn reuse_tar_source_expansion(
             .as_ref()
             .map(PathBuf::from),
         selected_shiny_entry: None,
-        list_files_failures: Vec::new(),
+        list_files_failures: previous.list_files_batch_failures.clone(),
     };
     apply_tar_source_expansion(metadata, expansion);
     true

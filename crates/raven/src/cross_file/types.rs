@@ -263,6 +263,13 @@ pub struct CrossFileMetadata {
     /// otherwise entries, helpers, or disable markers may remain stale.
     #[serde(default)]
     pub source_batch_exclusion_patterns: Vec<String>,
+    /// The `list.files()` source batches that failed closed in the last
+    /// filesystem expansion, so they contributed no members to `sources`.
+    ///
+    /// Installed and reused with the members of the same expansion, so
+    /// `raven graph` reports the expansion the graph was built from.
+    #[serde(skip)]
+    pub list_files_batch_failures: Vec<super::tar_source::ListFilesBatchFailure>,
     /// Implicit Shiny application context derived during filesystem enrichment.
     ///
     /// This is retained even for candidate files in an incomplete layout so the
