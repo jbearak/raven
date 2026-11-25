@@ -2665,15 +2665,25 @@ impl Subscriber {
     }
 
     /// The next pushed event named `name`, skipping others; `None` once
-    /// nothing arrives for `wait`.
+    /// nothing arrives for `wait`. A closed or broken subscription fails
+    /// the test rather than passing for a quiet one.
     fn event(&mut self, name: &str, wait: Duration) -> Option<Value> {
         self.reader.get_ref().set_read_timeout(Some(wait)).unwrap();
         let mut line = String::new();
         loop {
             line.clear();
             match self.reader.read_line(&mut line) {
-                Ok(n) if n > 0 => {}
-                _ => return None,
+                Ok(0) => panic!("the console closed the subscription"),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return None;
+                }
+                Err(e) => panic!("reading the subscription: {e}"),
             }
             let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
             if v["event"] == name {
@@ -2712,7 +2722,17 @@ fn a_subscriber_hears_when_the_debugger_starts_after_slow_profiles() {
     }
     let dir = scratch();
     let profile = dir.join("slow.R");
-    std::fs::write(&profile, "Sys.sleep(3)\n").unwrap();
+    // The profile runs until the test has seen `not-ready` (bounded, so a
+    // failed test doesn't leave R waiting).
+    let go = dir.join("go");
+    std::fs::write(
+        &profile,
+        format!(
+            "for (i in 1:600) {{ if (file.exists({:?})) break; Sys.sleep(0.05) }}\n",
+            go.to_str().unwrap()
+        ),
+    )
+    .unwrap();
     let c = Console::launch(
         &[("R_PROFILE_USER", profile.to_str().unwrap())],
         DapArg::Socket,
@@ -2728,6 +2748,7 @@ fn a_subscriber_hears_when_the_debugger_starts_after_slow_profiles() {
     let mirror = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {}});
     // R is still running the profile.
     assert_eq!(ipc_request(&c, &mirror), "not-ready");
+    std::fs::write(&go, "").unwrap();
     assert!(
         sub.event("ready", TIMEOUT).is_some(),
         "no ready event:\n{}",
@@ -2749,6 +2770,12 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
         std::thread::sleep(Duration::from_millis(50));
     }
     c.send("fb_target <- function() 1", None);
+    // Errors stop only in code from a file.
+    let e = c.write_file(
+        "err.R",
+        "err_target <- function() stop(toupper('filter stayed off'))\n",
+    );
+    c.send(&std::fs::read_to_string(&e).unwrap(), Some(&e));
     let fifo = c.dir.join("stall.R");
     assert!(
         Command::new("mkfifo")
@@ -2810,6 +2837,23 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
             "the older mirror re-armed a removed function breakpoint:\n{text}"
         );
         if text.contains("RAN PAST FB_TARGET") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Nor the exception filter it carried: the error returns to the prompt.
+    c.send("err_target()", None);
+    c.send("cat(toupper('back at the prompt'), '\\n')", None);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let text = c.text();
+        assert!(
+            !text.contains("Browse["),
+            "the older mirror re-armed a removed exception filter:\n{text}"
+        );
+        if text.contains("BACK AT THE PROMPT") {
+            assert!(text.contains("FILTER STAYED OFF"), "{text}");
             break;
         }
         assert!(Instant::now() < deadline, "{text}");

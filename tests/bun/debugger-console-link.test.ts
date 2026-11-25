@@ -113,6 +113,10 @@ class FakeConsole {
      * debugger can't start (`unavailable`).
      */
     mirror_mode: 'ok' | 'not-ready' | 'unavailable' = 'ok';
+    /** Mirror requests received so far. */
+    mirrors = 0;
+    /** Awaited before a mirror is answered `not-ready` or `unavailable`. */
+    before_refusal?: (n: number) => Promise<void>;
     private subscribers: net.Socket[] = [];
     private server: net.Server;
     constructor(readonly socket: string) {
@@ -152,9 +156,14 @@ class FakeConsole {
                 this.subscribers.push(sock);
                 return;
             case 'breakpoints': {
+                const n = ++this.mirrors;
                 if (this.mirror_mode !== 'ok') {
-                    this.reply(sock, msg.id, this.mirror_mode);
-                    sock.end();
+                    const status = this.mirror_mode;
+                    void (async () => {
+                        await this.before_refusal?.(n);
+                        this.reply(sock, msg.id, status);
+                        sock.end();
+                    })();
                     return;
                 }
                 const files = (msg.files ?? {}) as Record<string, Array<{ line: number }>>;
@@ -557,6 +566,27 @@ describe('a console whose debugger is not running yet, or never will', () => {
         await until(() => con.files.size === 1);
         expect([...con.files]).toEqual([[real(a_r), [2]]]);
     }, 30_000);
+
+    test('the debugger starting during the last retry still arms breakpoints before sends', async () => {
+        const { con, sock } = await console_at();
+        con.mirror_mode = 'not-ready';
+        // The link's first mirror makes 41 attempts. During the round trip
+        // of the last one, R finishes its profiles and the debugger starts.
+        con.before_refusal = async (n) => {
+            if (n !== 41) return;
+            con.mirror_mode = 'ok';
+            con.push({ event: 'ready' });
+            await settle(50);
+        };
+        set_breakpoints([line_bp(a_r, 2)]);
+        attach(sock);
+        const start = Date.now();
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 20_000);
+        // Well inside the 15 s backstop, which would also release sends.
+        expect(Date.now() - start).toBeLessThan(13_000);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [2] });
+    }, 30_000);
 });
 
 describe('auto-attach', () => {
@@ -750,6 +780,35 @@ describe('an explicit launch', () => {
             saved_a(true);
             expect(await a).toMatchObject({ consoleSocket: sock });
             for (const l of start_listeners) l({ type: 'raven-r', id: 'a', configuration: { consoleSocket: sock } });
+            await settle(300);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+        } finally {
+            text_documents.length = 0;
+        }
+    });
+
+    test("a launch with an empty consoleSocket holds back stops until it has chosen", async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        const program = path.join(root, 'empty-socket.R');
+        let saved: (ok: boolean) => void = () => undefined;
+        text_documents.push({ uri: { fsPath: program }, isDirty: true, save: () => new Promise((r) => { saved = r; }) });
+        try {
+            // `""` is no console: resolution picks one (this one) after the save.
+            const resolving = config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'Source R file', program, consoleSocket: '' },
+            );
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await settle(300);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            saved(true);
+            expect(await resolving).toMatchObject({ consoleSocket: sock });
+            for (const l of start_listeners) l({ type: 'raven-r', id: 'empty', configuration: { consoleSocket: sock } });
             await settle(300);
             expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
         } finally {

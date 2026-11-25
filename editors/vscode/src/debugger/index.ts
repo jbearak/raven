@@ -461,8 +461,10 @@ class ConsoleLink {
                 this.mirror();
             }
             if (!applied) {
-                // No summary will follow; don't hold sends for one.
-                this.mirrored_once();
+                // No summary will follow; don't hold sends for one. A
+                // replacement mirror started above (the debugger became
+                // ready meanwhile) releases them itself.
+                if (!this.in_flight) this.mirrored_once();
             } else if (this.heard) {
                 this.applied = true;
                 this.reconcile();
@@ -643,7 +645,8 @@ async function inspect_last_error(): Promise<void> {
 
 const configuration_provider: vscode.DebugConfigurationProvider = {
     async resolveDebugConfiguration(_folder, config) {
-        const given: unknown = config.consoleSocket;
+        // `""` means no console given, as in `resolve_configuration`.
+        const given: unknown = config.consoleSocket || undefined;
         if (typeof given === 'string' && attaching.has(given)) return resolve_configuration(config);
         // Until it knows its console, a launch holds back every stop; then
         // only its console's.
