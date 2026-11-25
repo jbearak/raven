@@ -11968,7 +11968,8 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 }
 
 /// The syntax errors Raven reports for an R file: the parser's recovery
-/// errors, an `else` R can't attach, and chained comparisons, in that order.
+/// errors, an `else` R can't attach, chained comparisons, and expressions with
+/// no separator between them, in that order.
 /// `raven check` and `raven parse`'s `errors` list both come from here, so
 /// their codes and messages agree.
 pub(crate) fn r_syntax_diagnostics(root: Node, text: &str) -> Vec<Diagnostic> {
@@ -11976,8 +11977,11 @@ pub(crate) fn r_syntax_diagnostics(root: Node, text: &str) -> Vec<Diagnostic> {
     collect_syntax_errors(root, text, &mut diagnostics);
     collect_else_newline_errors(root, text, &mut diagnostics);
     collect_chained_comparison_errors(root, text, &mut diagnostics);
+    juxtaposition::collect_juxtaposed_expression_errors(root, text, &mut diagnostics);
     diagnostics
 }
+
+mod juxtaposition;
 
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
     let mut state = CollectState::default();
