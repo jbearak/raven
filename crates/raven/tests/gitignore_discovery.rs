@@ -144,10 +144,10 @@ fn lint_unreadable_directory_is_an_operator_error() {
 }
 
 /// A symlink whose target sits behind a directory that can't be searched, and
-/// a directory that lists its names but can't be searched (mode 0444), hide
-/// no R file `raven lint` would read: the run lints the rest and exits as
-/// usual, without a walk error. Only a directory that can't be listed at all
-/// (above) is an operator error for lint.
+/// a directory that lists its names but can't be searched (mode 0444), are
+/// skipped by `raven lint` as on main: the run lints the rest and exits as
+/// usual, without a walk error. A directory that can't be listed at all
+/// (above) is still an operator error.
 #[cfg(unix)]
 #[test]
 fn lint_unsearchable_entries_are_skipped_without_an_operator_error() {

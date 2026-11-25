@@ -13681,11 +13681,13 @@ pub(crate) fn collect_files_matching_for_discovery_with_errors(
 
 /// [`collect_files_matching_for_discovery_with_errors`], also reporting each
 /// entry whose type can't be read for lack of permission, which the walk
-/// otherwise skips as "not a directory": a symlink whose target sits behind a
-/// directory that can't be searched (named by the link), and a directory that
-/// lists its names but can't be searched, such as mode 0444 (named once).
-/// Only `raven parse` and the scan behind `raven graph` ask for these; the
-/// files found are the same either way.
+/// otherwise treats as a non-directory (still subject to `accept`): a symlink
+/// whose target sits behind a directory that can't be searched (named by the
+/// link), and a directory that lists its names but can't be searched, such as
+/// mode 0444 (named once).
+/// `raven parse` and the workspace scan ask for these; of the commands on
+/// that scan, only `raven graph` reports them (`raven check` and the editor
+/// ignore walk errors). The files found are the same either way.
 pub(crate) fn collect_files_matching_for_discovery_with_entry_errors(
     dir: &Path,
     out: &mut Vec<PathBuf>,
@@ -13794,7 +13796,7 @@ fn collect_files_matching_inner(
         // whose type can't be read for lack of permission is a walk error,
         // unless it would be pruned as a directory anyway: a symlink whose
         // target can't be reached is named itself; a directory that lists its
-        // names but denies access to them (mode 0400) is named once. A
+        // names but denies access to them (mode 0400 or 0444) is named once. A
         // dangling symlink (not found) is just no directory.
         let is_dir = match fs::metadata(&path) {
             Ok(metadata) => metadata.is_dir(),
