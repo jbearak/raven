@@ -1523,6 +1523,72 @@ fn child_global_net_effects(
     net.into_iter().collect()
 }
 
+/// The calling-frame bindings a child run by a `CurrentFrame` `source()` inside
+/// a `local()` block keeps although its own global removals named them.
+///
+/// The child's resolution treats its top level as the global environment, so
+/// `x <- 2; rm(x, envir = .GlobalEnv)` leaves no `x` in its scope. Run in a
+/// block, though, `x <- 2` binds in the block and the removal acts on the
+/// global environment only. This replays the child's top-level timeline for
+/// each globally removed name, ignoring global-destination events, and returns
+/// the names a frame `Def` still binds at the end.
+///
+/// Only the child's own top-level events count; sources nested inside the
+/// child are not followed, as in [`child_global_net_effects`]. A definition
+/// from the queried file itself (a source cycle) is skipped.
+fn child_frame_bindings_surviving_global_removals(
+    child: &ScopeArtifacts,
+    queried_uri: &Url,
+) -> Vec<(Arc<str>, ScopedSymbol)> {
+    let mut frame: indexmap::IndexMap<&str, Option<&ScopedSymbol>> = indexmap::IndexMap::new();
+    for effect in &child.global_effects {
+        if let GlobalEffect::Removal { symbols, .. } = effect {
+            for name in symbols {
+                frame.insert(name.as_str(), None);
+            }
+        }
+    }
+    if frame.is_empty() {
+        return Vec::new();
+    }
+    let escapes = |line: u32, column: u32| child.escaping_effect_anchors.contains(&(line, column));
+    for event in &child.timeline {
+        match event {
+            ScopeEvent::Def {
+                line,
+                column,
+                symbol,
+                function_scope: None,
+                ..
+            } if !escapes(*line, *column) => {
+                if let Some(binding) = frame.get_mut(symbol.name.as_ref()) {
+                    *binding = Some(symbol);
+                }
+            }
+            ScopeEvent::Removal {
+                line,
+                column,
+                symbols,
+                function_scope: None,
+                ..
+            } if !escapes(*line, *column) => {
+                for name in symbols {
+                    if let Some(binding) = frame.get_mut(name.as_str()) {
+                        *binding = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    frame
+        .into_values()
+        .flatten()
+        .filter(|symbol| symbol.source_uri != *queried_uri)
+        .map(|symbol| (symbol.name.clone(), symbol.clone()))
+        .collect()
+}
+
 /// The packages a child's top-level `library()`-style calls attach before
 /// `anchor`, in order, each gated on its `requires_attached` package against
 /// `attached` plus the attaches before it. A bare `data(stem)` in the child
@@ -3888,7 +3954,7 @@ fn collect_definitions(
     {
         // With `local = FALSE` (the default) the variable is created in the
         // global environment, even from inside a `local()` block.
-        if text_connection_targets_global(node, line_index) {
+        if text_connection_targets_global(node, line_index, capture_bindings) {
             mark_global_destination(artifacts, &symbol);
         }
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -5114,9 +5180,14 @@ fn data_call_targets_global(
 }
 
 /// Whether a write-mode `textConnection()` creates its variable in the global
-/// environment, which R does unless `local` is `TRUE`. A `local` value that
-/// isn't a `TRUE`/`FALSE` literal keeps the current-frame model.
-fn text_connection_targets_global(node: Node, line_index: &LineIndex) -> bool {
+/// environment, which R does unless `local` is `TRUE`. `FALSE` and an
+/// unshadowed `F` count as false, as for `source(local =)`; any other `local`
+/// value keeps the current-frame model.
+fn text_connection_targets_global(
+    node: Node,
+    line_index: &LineIndex,
+    capture_bindings: &mut LazyStaticBindings,
+) -> bool {
     const FORMALS: [&str; 5] = ["object", "open", "local", "name", "encoding"];
     let Some(arguments) = node.child_by_field_name("arguments") else {
         return false;
@@ -5132,7 +5203,19 @@ fn text_connection_targets_global(node: Node, line_index: &LineIndex) -> bool {
     match matched[2] {
         None | Some(super::binding::CallActual::Missing) => true,
         Some(super::binding::CallActual::Value(value)) => {
-            node_text(value, line_index.text).trim() == "FALSE"
+            match node_text(value, line_index.text).trim() {
+                "FALSE" => true,
+                "F" => {
+                    let bindings = capture_bindings.get();
+                    let deferred_use = !bindings.is_source_ordered_at(node);
+                    !bindings.named_alias_may_shadow_assuming_base_assign_at(
+                        "F",
+                        node,
+                        deferred_use,
+                    )
+                }
+                _ => false,
+            }
         }
     }
 }
@@ -7910,6 +7993,29 @@ struct SourceBatchBoundary {
     kind: super::types::SourceBatchKind,
 }
 
+/// The innermost `local()` body in `edge`'s parent that holds its call site,
+/// or `None` when the call is outside every such body (or has no call site).
+/// Used by `parent_prefix_at` to keep calls from different `local()` frames
+/// as distinct invocations.
+fn innermost_local_block<F>(
+    edge: &super::dependency::DependencyEdge,
+    get_artifacts: &F,
+) -> Option<FunctionScopeInterval>
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+{
+    let position = Position::new(edge.call_site_line?, edge.call_site_column?);
+    let artifacts = get_artifacts(&edge.from)?;
+    if artifacts.immediate_function_scopes.is_empty() {
+        return None;
+    }
+    let tree = &artifacts.function_scope_tree;
+    tree.query_point(position)
+        .into_iter()
+        .filter(|interval| tree.is_immediate(interval))
+        .max_by_key(|interval| interval.start)
+}
+
 /// STEP 1 of `scope_at_position_with_graph_recursive`: collect parent (backward)
 /// contributions for `uri` at the given query position.
 ///
@@ -7998,13 +8104,19 @@ where
     // subsumes earlier ones. Function-scoped CurrentFrame calls may belong to
     // unrelated invocation frames, so retain each distinct call site. Across
     // classes, combining a later prefix or package barrier with another call
-    // would invent an environment that never existed.
+    // would invent an environment that never existed. A CurrentFrame call in
+    // a `local()` body runs in that block's frame, so it does not subsume a
+    // call in another block (or at top level): the earlier block's bindings
+    // are gone by the later call. Other calls run outside the block's frame,
+    // so the block doesn't distinguish them.
     #[derive(PartialEq, Eq, Hash)]
     struct ParentInvocationKey {
         parent: Url,
         declared_only: bool,
         package_barrier: bool,
         function_invocation: Option<(u32, u32)>,
+        /// Innermost `local()` body holding the call site, if any.
+        local_block: Option<FunctionScopeInterval>,
         /// Tar members sharing one call site are distinct executions. Keeping
         /// the ordinal here prevents the ordinary same-parent substitution
         /// rule from collapsing their lazy sibling cutoffs.
@@ -8027,11 +8139,15 @@ where
             edge.call_site_line.unwrap_or(u32::MAX),
             edge.call_site_column.unwrap_or(u32::MAX),
         ));
+        let local_block = (edge.locality == super::types::SourceLocality::CurrentFrame)
+            .then(|| innermost_local_block(edge, get_artifacts))
+            .flatten();
         let key = ParentInvocationKey {
             parent: edge.from.clone(),
             declared_only: inheritance_class,
             package_barrier,
             function_invocation,
+            local_block,
             tar_source_ordinal: edge.tar_source_ordinal,
             source_batch_kind: edge.source_batch_kind,
         };
@@ -8074,6 +8190,22 @@ where
             }
         }
     }
+    // Visit each parent's retained calls in call-site order. The shared
+    // `visited` map admits a parent again only at a strictly later position,
+    // so a later call visited first (a replacement keeps the replaced call's
+    // slot) would hide an earlier `local()` block call.
+    let mut parent_rank: HashMap<&Url, usize> = HashMap::new();
+    for edge in &parent_edges {
+        let rank = parent_rank.len();
+        parent_rank.entry(&edge.from).or_insert(rank);
+    }
+    parent_edges.sort_by_key(|edge| {
+        (
+            parent_rank[&edge.from],
+            edge.call_site_line.unwrap_or(u32::MAX),
+            edge.call_site_column.unwrap_or(u32::MAX),
+        )
+    });
 
     for edge in parent_edges {
         // Get call site position for filtering
@@ -9727,7 +9859,7 @@ where
                         return scope;
                     }
 
-                    let child_scope = if isolate_forward_source_visits {
+                    let mut child_scope = if isolate_forward_source_visits {
                         // Keep the cycle guard path-local for real
                         // forward source execution. The current path's
                         // visits must still be visible to the child so
@@ -9870,6 +10002,17 @@ where
                                 visibility,
                                 data_alias_provider,
                             );
+                            // In a block, the child's own bindings outlive
+                            // those removals, which its scope applied.
+                            if effective_function_scope.is_some() {
+                                for (name, symbol) in child_frame_bindings_surviving_global_removals(
+                                    &child_artifacts,
+                                    uri,
+                                ) {
+                                    child_scope.removed_names.remove(&name);
+                                    child_scope.symbols.entry(name).or_insert(symbol);
+                                }
+                            }
                         }
                         let child_parent_prefix_symbol_names =
                             child_scope.parent_prefix_symbol_names.clone();
@@ -11223,11 +11366,12 @@ where
                 // A CurrentFrame source at top level or in a top-level
                 // `local()` block brings the child's global assignments into
                 // the global frame, whatever else it contributes.
-                if current_frame_source_reaches_global(
+                let reaches_global = current_frame_source_reaches_global(
                     source,
                     function_scope,
                     &self.artifacts.function_scope_tree,
-                ) {
+                );
+                if reaches_global {
                     let effects =
                         self.current_frame_global_effects(*src_line, *src_col, source, || {
                             self.attached_packages_so_far()
@@ -11270,6 +11414,19 @@ where
                 // borrow: we clone the small-ish struct so the merge can
                 // borrow `self` mutably for `pick_frame_mut`.
                 let contrib = self.source_contributions[&key].clone();
+                let surviving = if reaches_global
+                    && function_scope.is_some()
+                    && self.resolution_depth + 1 < self.max_depth
+                {
+                    self.forward_child_uri(*src_line, *src_col, source)
+                        .and_then(|child_uri| (self.get_artifacts)(&child_uri))
+                        .map(|child| {
+                            child_frame_bindings_surviving_global_removals(&child, self.queried_uri)
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     frame
                         .named_search_path
@@ -11285,6 +11442,12 @@ where
                     // (Local Defs in the same frame override sources via
                     // their own Def event, which always overwrites.)
                     for (name, symbol) in contrib.symbols {
+                        frame.removed_names.remove(&name);
+                        frame.symbols.entry(name).or_insert(symbol);
+                    }
+                    // In a block, the child's own bindings outlive its global
+                    // removals, which its contribution applied.
+                    for (name, symbol) in surviving {
                         frame.removed_names.remove(&name);
                         frame.symbols.entry(name).or_insert(symbol);
                     }
@@ -14597,6 +14760,30 @@ mod tests {
         }
     }
 
+    /// `textConnection(local = F)` writes to the global environment like
+    /// `local = FALSE`, unless `F` is rebound.
+    #[test]
+    fn text_connection_local_f_alias_targets_global() {
+        for (code, defined_after) in [
+            (
+                "local({ tc <- textConnection(\"out\", \"w\", local = F) })\n",
+                true,
+            ),
+            (
+                "F <- TRUE\nlocal({ tc <- textConnection(\"out\", \"w\", local = F) })\n",
+                false,
+            ),
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert_eq!(
+                scope.symbols.contains_key("out"),
+                defined_after,
+                "{code}: {artifacts:?}"
+            );
+        }
+    }
+
     /// The names a file's [`ScopeArtifacts::global_effects`] define, in order.
     fn global_effect_defs(artifacts: &ScopeArtifacts) -> Vec<&str> {
         artifacts
@@ -15735,6 +15922,213 @@ g <- function() {
         );
         assert!(scope.symbols.contains_key("from_f"), "{scope:?}");
         assert!(scope.symbols.contains_key("from_g"), "{scope:?}");
+    }
+
+    /// Two `local()` blocks that source the same child with `local = TRUE`
+    /// are distinct frames: the later call must not subsume the earlier one,
+    /// so the child sees the bindings of both blocks. A default `source()` in
+    /// a block runs in the global environment, so a later top-level call still
+    /// subsumes it and the block's bindings stay out of the child. A block
+    /// call between two top-level calls is not hidden by the later one.
+    #[test]
+    fn same_parent_local_block_invocations_keep_distinct_frames() {
+        let current_frame = r#"local({
+  first_val <- 1
+  source("child.R", local = TRUE)
+})
+local({
+  second_val <- 2
+  source("child.R", local = TRUE)
+})
+"#;
+        let global = r#"local({
+  only_local <- 1
+  source("child.R")
+})
+source("child.R")
+"#;
+        // The later top-level call replaces the earlier one; the block call
+        // between them must still be visited.
+        let between_top_level = r#"source("child.R", local = TRUE)
+local({
+  inner_only <- 1
+  source("child.R", local = TRUE)
+})
+source("child.R", local = TRUE)
+"#;
+        for (parent_code, name, visible) in [
+            (current_frame, "first_val", true),
+            (current_frame, "second_val", true),
+            (global, "only_local", false),
+            (between_top_level, "inner_only", true),
+        ] {
+            assert_same_parent_child_prefix(parent_code, name, visible);
+        }
+    }
+
+    fn assert_same_parent_child_prefix(parent_code: &str, name: &str, visible: bool) {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let root = Url::parse("file:///project").unwrap();
+        let child_code = "child <- 1\n";
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let parent_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+            Some(&parent_meta),
+        ));
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| (uri == &parent_uri).then(|| Arc::new(parent_meta.clone()));
+        let base_exports = HashSet::new();
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &child_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .unwrap();
+        stream.advance_to(1, 0);
+        assert_eq!(
+            scope.symbols.contains_key(name),
+            visible,
+            "recursive {name}"
+        );
+        assert_eq!(stream.is_visible(name), visible, "stream {name}");
+    }
+
+    /// A child sourced with `local = TRUE` into a `local()` block keeps its
+    /// own binding of a name it then removes from the global environment: the
+    /// removal acts on the global binding only. After the block, the name is
+    /// gone (the caller's global was removed, the block's binding went with
+    /// the block).
+    #[test]
+    fn local_block_source_keeps_child_binding_removed_from_global() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let root = Url::parse("file:///project").unwrap();
+        let parent_code = "xx <- 1\n\
+                           local({\n  source(\"child.R\", local = TRUE)\n  print(xx)\n})\n\
+                           print(xx)\n";
+        let child_code = "xx <- 2\nbase::rm(xx, envir = .GlobalEnv)\n";
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let parent_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+            Some(&parent_meta),
+        ));
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| (uri == &parent_uri).then(|| Arc::new(parent_meta.clone()));
+        let base_exports = HashSet::new();
+        // (line, column, visible): inside the block after the call, then
+        // after the block.
+        for (line, column, visible) in [(3, 8, true), (5, 6, false)] {
+            let scope = scope_at_position_with_graph(
+                &parent_uri,
+                line,
+                column,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &parent_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .unwrap();
+            stream.advance_to(line, column);
+            assert_eq!(
+                scope.symbols.contains_key("xx"),
+                visible,
+                "recursive at ({line}, {column})"
+            );
+            assert_eq!(
+                stream.is_visible("xx"),
+                visible,
+                "stream at ({line}, {column})"
+            );
+        }
     }
 
     /// Issue #479 knob 1: a `# raven: standalone` callee is resolved in
