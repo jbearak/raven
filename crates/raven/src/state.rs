@@ -12590,10 +12590,11 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 ///
 /// For a closed parent the old set comes from its index entry, which may hold
 /// a directory a forward parent passed on in the last workspace derivation,
-/// while the new set comes from disk metadata, which carries only what its
-/// backward directives give it. Such a parent can then queue a refresh that
-/// changes nothing, or miss one; that is the documented limit of a closed
-/// intermediate file keeping its old directory until it is re-indexed.
+/// while the new set comes from disk metadata, whose inherited directory
+/// comes only from its backward directives. Such a parent can then queue a
+/// refresh that changes nothing, or miss one; that is the documented limit of
+/// a closed intermediate file keeping its old directory until it is
+/// re-indexed.
 fn forward_child_proposals(
     children: Vec<(Url, bool)>,
     metadata: Option<&crate::cross_file::CrossFileMetadata>,
