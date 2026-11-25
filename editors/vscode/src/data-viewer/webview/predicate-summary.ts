@@ -30,12 +30,17 @@ export function summarizePredicate(p: FilterPredicate, col: ColumnSchema): strin
         case 'isEmpty': return `${n} is empty`;
         case 'isNotEmpty': return `${n} is not empty`;
         case 'numCompare': return `${n} ${numOp(p.op)} ${b(p.value)}`;
-        case 'numBetween':
+        case 'numBetween': {
             if (p.upperInclusive !== undefined && p.upperInclusive !== p.inclusive) {
-                // A histogram brush: half-open interval notation.
-                return `${n} ∈ ${p.inclusive ? '[' : '('}${short(p.lo)}, ${short(p.hi)}${p.upperInclusive ? ']' : ')'}`;
+                // A histogram brush: half-open interval notation. Its
+                // bounds can be edited afterwards, so on an Int64 / Uint64
+                // column a whole number keeps every digit here too.
+                const edge = (x: NumBound): string =>
+                    (int64 && typeof x === 'number' && Number.isInteger(x) ? b(x) : short(x));
+                return `${n} ∈ ${p.inclusive ? '[' : '('}${edge(p.lo)}, ${edge(p.hi)}${p.upperInclusive ? ']' : ')'}`;
             }
             return p.inclusive ? `${n} ${b(p.lo)}–${b(p.hi)}` : `${n} (${b(p.lo)}, ${b(p.hi)})`;
+        }
         case 'numNotBetween':
             return p.inclusive ? `${n} not in ${b(p.lo)}–${b(p.hi)}` : `${n} not in (${b(p.lo)}, ${b(p.hi)})`;
         case 'setIn': return `${n} ∈ {${summarizeSet(mapSetValues(p.values, col))}}`;

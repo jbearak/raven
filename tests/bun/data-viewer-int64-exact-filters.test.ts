@@ -156,6 +156,9 @@ describe('integer64 comparison and range filters are exact', () => {
         expect(await rows(0, { kind: 'setIn', values: ['9007199254740993', 3] })).toEqual([1, 5]);
         expect(await rows(0, { kind: 'setNotIn', values: ['-007'] })).toEqual([0, 1, 2, 5]);
         expect(await rows(0, { kind: 'setIn', values: ['abc', '2.5'] })).toEqual([]);
+        // An unsigned value past bit64's range is still found (row 0 of `u`).
+        expect(await rows(2, { kind: 'setIn', values: ['18446744073709551615'] })).toEqual([0]);
+        expect(await rows(2, { kind: 'setNotIn', values: ['018446744073709551615', 7] })).toEqual([1, 2, 5]);
     });
 
     test('an unsigned column compares past 2^63', async () => {
@@ -253,6 +256,11 @@ describe('reopening the popover keeps a numeric integer64 bound exact', () => {
             .toBe('big -1000000000000000128–1000000000000000128');
         expect(summarizePredicate({ kind: 'numNotBetween', lo: 3, hi: 1000000000000000128, inclusive: false }, big))
             .toBe('big not in (3, 1000000000000000128)');
+        // A brushed range whose bounds were then edited stays half-open.
+        expect(summarizePredicate({ kind: 'numBetween', lo: 1000000000000000128, hi: 1000000000000000256, inclusive: true, upperInclusive: false }, big))
+            .toBe('big ∈ [1000000000000000128, 1000000000000000256)');
+        expect(summarizePredicate({ kind: 'numBetween', lo: 2.3333333333, hi: '9007199254740993', inclusive: true, upperInclusive: false }, big))
+            .toBe('big ∈ [2.33333, 9007199254740993)');
         // Another column keeps the double's own spelling.
         expect(summarizePredicate({ kind: 'numCompare', op: '=', value: 2.5 }, { ...big, arrowType: 'Float64', isInteger: false }))
             .toBe('big = 2.5');

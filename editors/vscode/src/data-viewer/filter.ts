@@ -356,8 +356,12 @@ async function acceptorFor(
             // Int64/UInt64, labelled or not: exact, on the integer each
             // value names (Value Counts counts on the bigint and sends
             // values a double can't hold as text; a value edited to
-            // `007` is 7, as in the code Copy as R code writes).
-            const want = new Set(predicate.values.map(int64SetKey).filter(k => k !== undefined));
+            // `007` is 7, as in the code Copy as R code writes). bit64's
+            // range limits labelled codes, as before; an unlabelled column
+            // matches any value the file holds (an unsigned one past 2^63).
+            const want = new Set(predicate.values
+                .map(v => (isNumericLabelled ? int64SetKey(v) : setValueInteger(v)?.toString()))
+                .filter(k => k !== undefined));
             const values = await loadString(reader, columnIndex, signal);
             return predicate.kind === 'setIn'
                 ? (i) => want.has(values[i])
@@ -511,14 +515,20 @@ function intervalTest({ lo, hi }: IntInterval): (v: bigint) => boolean {
     return () => true;
 }
 
-/** A set-filter value as an Int64 column's decimal text, or undefined
- *  when it can't equal any integer (or isn't a value at all: a `null`
- *  from a lossy transport must match nothing, not 0). */
+/** The integer a set-filter value names, or undefined when it names
+ *  none (or isn't a value at all: a `null` from a lossy transport must
+ *  match nothing, not 0). */
+function setValueInteger(v: unknown): bigint | undefined {
+    if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
+    if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) return BigInt(v.trim());
+    return undefined;
+}
+
+/** A set-filter value as an integer64's decimal text, or undefined when
+ *  no integer64 can equal it. */
 export function int64SetKey(v: unknown): string | undefined {
-    let b: bigint | undefined;
-    if (typeof v === 'number' && Number.isInteger(v)) b = BigInt(v);
-    else if (typeof v === 'string' && /^-?[0-9]+$/.test(v.trim())) b = BigInt(v.trim());
-    // No column value lies outside ±(2^63 − 1): -2^63 is bit64's NA, and
+    const b = setValueInteger(v);
+    // No integer64 lies outside ±(2^63 − 1): -2^63 is bit64's NA, and
     // as.integer64() turns it (or anything further out) into NA, which
     // would match the missing rows in R.
     if (b === undefined || b > INT64_MAX || b < -INT64_MAX) return undefined;
