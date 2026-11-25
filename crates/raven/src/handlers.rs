@@ -9486,9 +9486,8 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // emit a false "used before available" that the undefined-variable
             // collector already suppresses. Resolved lazily here — only at the
             // rare would-fire point, not per usage — so the streaming fast path
-            // stays cheap. Only a `UseScope` is kept of it, for the
-            // undefined-variable collector to read at this same use (see
-            // `PassScopes`).
+            // stays cheap. What is kept of it, the undefined-variable
+            // collector reads at this same use (see `PassScopes`).
             // Position-awareness AND the load_all out-of-root sentinel gate both
             // come for free from `get_scope`'s `ScopeContributions`.
             if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
