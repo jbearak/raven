@@ -2985,6 +2985,55 @@ fn a_second_console_on_live_sockets_is_refused_and_stale_sockets_are_replaced() 
     assert_eq!(d.req("threads", json!({}))["success"], true);
 }
 
+/// A resume ends the stop for subscribers at once, not when R next reaches
+/// the top-level prompt: a window holding the stop back for a launch that is
+/// still resolving must not attach to it after the user typed `c`, however
+/// long the resumed code runs.
+#[test]
+fn a_resume_tells_subscribers_the_stop_is_over_while_r_runs_on() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let deadline = Instant::now() + TIMEOUT;
+    while c.ipc_status("breakpoints") != "ok" {
+        assert!(Instant::now() < deadline, "debugger never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut sub = Subscriber::connect(&c);
+    // After each stop R waits (bounded) for a file the test creates, so
+    // "R is still running" is certain when the event is checked.
+    let (go1, go2) = (c.dir.join("go1"), c.dir.join("go2"));
+    c.send(
+        &format!(
+            "(function() {{ hold <- function(f) for (i in 1:600) {{ if (file.exists(f)) break; Sys.sleep(0.05) }}; \
+             browser(); hold({go1:?}); browser(); hold({go2:?}); cat(toupper('ran to the end'), '\\n') }})()"
+        ),
+        None,
+    );
+    assert!(sub.event("stopped", TIMEOUT).is_some(), "{}", c.text());
+    // Typed at `Browse>`.
+    c.type_line("c");
+    assert!(
+        sub.event("running", Duration::from_secs(5)).is_some(),
+        "no `running` while R ran on after a typed `c`:\n{}",
+        c.text()
+    );
+    std::fs::write(&go1, "").unwrap();
+    // The next stop is announced after it; a debug session continues it.
+    assert!(sub.event("stopped", TIMEOUT).is_some(), "{}", c.text());
+    let mut d = Dap::open(&c.dir, true);
+    d.event("stopped", 0);
+    d.req("continue", json!({"threadId": 1}));
+    assert!(
+        sub.event("running", Duration::from_secs(5)).is_some(),
+        "no `running` while R ran on after Continue:\n{}",
+        c.text()
+    );
+    std::fs::write(&go2, "").unwrap();
+    c.expect("RAN TO THE END");
+}
+
 /// The value an evaluate in the Debug Console prints, at the top frame.
 fn repl_value(d: &mut Dap, expr: &str) -> String {
     let st = d.req("stackTrace", json!({"threadId": 1}));

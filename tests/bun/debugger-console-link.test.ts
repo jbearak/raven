@@ -832,10 +832,15 @@ describe('an explicit launch', () => {
             );
             con.push({ event: 'stopped', reason: 'breakpoint' });
             await settle(100);
+            // The user typed `c` at `Browse>`: the console says the stop is
+            // over as R resumes, long before R is back at its prompt.
             con.push({ event: 'running' });
             expect(await resolving).toBeUndefined();
             await settle(300);
             expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            // The next stop is a new one and attaches as usual.
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await until(() => started.some((c) => c.consoleSocket === sock), 2_000);
         } finally {
             _set_launch_timeouts_for_test(10_000, 10_000);
         }

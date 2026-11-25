@@ -1118,7 +1118,8 @@ fn notify_breakpoints(changed: Vec<(String, LineBp)>) {
 
 /// Push an event to every `subscribe`d control connection. The writes
 /// happen on a thread of their own: an extension host that stops reading
-/// must never block the R thread.
+/// must never block the R thread. Only queues, taking no lock but the
+/// queue's, so it may be called with [`Shared`] locked.
 fn push_control(event: Value) {
     static TX: OnceLock<Mutex<mpsc::Sender<String>>> = OnceLock::new();
     let Some(h) = handle() else { return };
@@ -2094,7 +2095,12 @@ fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
 /// asked for one (checked when the break flag interrupts the editor).
 pub fn take_resume() -> Option<String> {
     let h = handle()?;
-    let mut cmd = lock(h).resume.take()?;
+    let mut cmd = {
+        let mut s = lock(h);
+        let cmd = s.resume.take()?;
+        leave_stop(&mut s);
+        cmd
+    };
     // Inspecting the last error, there is nothing to step through.
     if with_r(|r| r.inspecting).unwrap_or(false) {
         cmd = "c".into();
@@ -2110,6 +2116,24 @@ pub fn take_resume() -> Option<String> {
     Some(cmd)
 }
 
+/// R is about to be fed a resume command: the stop it reported is over.
+/// Forgets the stop and tells the control connections (`running`), so an
+/// editor still deciding whether to attach to that stop drops it now, not
+/// when R next reaches the top-level prompt (the code R resumes into may run
+/// for a long time, or stop again first).
+///
+/// Called with the lock held, by whoever consumes the resume, and the event
+/// is queued under it: control events about a stop are queued in the order
+/// the stop's state changed, so a `running` is never overtaken by the
+/// `stopped` it ends.
+fn leave_stop(s: &mut Shared) {
+    if s.stop.take().is_some() {
+        push_control(json!({"event": "running"}));
+    }
+}
+
+/// A resume command (`cmd`) is being fed to R's browser; the caller has
+/// already ended the stop ([`leave_stop`]).
 fn note_resume(cmd: &str) {
     if call_helper("on_resume", &[cmd]).as_deref() == Some("ok") && cmd == "s" {
         with_r(|r| r.jit_off = true);
@@ -2119,10 +2143,6 @@ fn note_resume(cmd: &str) {
         r.last_user_resume = Some(cmd.to_string());
         r.pending_hit = None;
     });
-    // Running again: nothing to show until the next stop.
-    if let Some(h) = handle() {
-        lock(h).stop = None;
-    }
     if let Some(out) = outbox() {
         out.event(
             "continued",
@@ -2146,7 +2166,9 @@ pub fn on_user_line(text: &str) -> Option<String> {
     if matches!(t, "n" | "s" | "f" | "c" | "cont" | "Q") {
         let cmd = if t == "cont" { "c" } else { t };
         if let Some(h) = handle() {
-            lock(h).resume = None;
+            let mut s = lock(h);
+            s.resume = None;
+            leave_stop(&mut s);
         }
         note_resume(cmd);
     }

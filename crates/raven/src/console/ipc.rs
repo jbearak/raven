@@ -37,6 +37,12 @@
 //! an editor that connects (or reconnects to a persistent console) after the
 //! stop still attaches.
 //!
+//! `{"event":"running"}` says the last `stopped` is over: R was given a
+//! command that leaves the stop (Continue or a step, from the debug session
+//! or typed at `Browse>`), or is back at the top-level prompt with nothing
+//! more of the submission to run. It does not mean R is idle; after a step
+//! the next `stopped` follows.
+//!
 //! A `breakpoints` mirror is answered `not-ready` while R is starting (the
 //! console pushes `ready` once the debugger runs) and `unavailable` when the
 //! debugger will never run in this console; a client should stop resending
