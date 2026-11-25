@@ -9,6 +9,7 @@ import {
     write_profile_file,
 } from '../../editors/vscode/src/plot/r-bootstrap-profile';
 import { RSessionServer, type RSessionEvent } from '../../editors/vscode/src/r-session-server';
+import { rString } from '../../editors/vscode/src/data-viewer/r-code';
 
 const R_BIN = process.env.RAVEN_TEST_R_BIN ?? 'R';
 
@@ -699,6 +700,26 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
             expect(b.body.expression).toBe('`a+b`');
             // The panel title stays the readable name.
             expect(b.body.panelName).toBe('a+b');
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'an untitled expression past 256 bytes: its cut name passed back as the title names the same panel',
+        async () => {
+            // A two-byte character straddles the 256-byte cut.
+            const setup = 'df <- data.frame(a = 1)';
+            const call = `View(subset(df, nchar("${'é'.repeat(150)}") > 0))`;
+            const first = await viewDataBody(`${setup}; ${call}; Sys.sleep(0.2)`);
+            const name = String(first.body.panelName);
+            expect(name.endsWith('\u2026')).toBe(true);
+            expect(Buffer.byteLength(name, 'utf8')).toBeLessThanOrEqual(256);
+            // What Refresh sends (DataViewerPanel.refreshCall).
+            const again = await viewDataBody(
+                `${setup}; View(${String(first.body.expression)}, title = ${rString(name)}); Sys.sleep(0.2)`,
+            );
+            expect(again.body.panelName).toBe(name);
+            expect(again.body.expression).toBe(first.body.expression);
         },
         30_000,
     );

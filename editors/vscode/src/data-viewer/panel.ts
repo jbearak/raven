@@ -750,14 +750,13 @@ export class DataViewerPanel {
     }
 
     /** The `View()` call Refresh re-runs: the expression, with the panel
-     *  title when it differs (so the re-run lands in this panel). */
+     *  title whenever it differs, so the re-run lands in this panel. That
+     *  includes an untitled view of an expression past 256 bytes, whose
+     *  panel name is the expression cut short: R takes a title as is. */
     refreshCall(): string | undefined {
         const expr = this.source.expression;
         if (!expr) return undefined;
-        // Without a title, View() names the panel after the expression
-        // (truncated past 256 bytes), so a re-run lands here either way.
-        const untitled = expr === this.panelName || Buffer.byteLength(expr, 'utf8') > 256;
-        return untitled ? `View(${expr})` : `View(${expr}, title = ${rString(this.panelName)})`;
+        return expr === this.panelName ? `View(${expr})` : `View(${expr}, title = ${rString(this.panelName)})`;
     }
 
     /** Show the `View()` call and ask before re-running it in the R
