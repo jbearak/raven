@@ -20582,6 +20582,7 @@ impl LanguageServer for Backend {
                 },
             )
             .await;
+            self.refresh_open_children_after_parent_change().await;
             let source_committed = receipt.committed();
             if !deferred_config_publish.is_empty() {
                 if source_committed {
@@ -20635,6 +20636,7 @@ impl LanguageServer for Backend {
                 },
             )
             .await;
+            self.refresh_open_children_after_parent_change().await;
             if receipt.committed() {
                 if sysdata_fallback_watcher_event {
                     schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self))
@@ -20665,6 +20667,7 @@ impl LanguageServer for Backend {
             let traversal_truncation = self.traversal_truncation.clone();
             let routing_tasks = self.routing_tasks.clone();
             let spawn_owner = routing_tasks.clone();
+            let backend = self.clone();
             if !spawn_owner.spawn_root(async move {
                 run_watched_resync_batch_owned(
                     state_arc.clone(),
@@ -20686,6 +20689,7 @@ impl LanguageServer for Backend {
                     },
                 )
                 .await;
+                backend.refresh_open_children_after_parent_change().await;
                 if sysdata_fallback_watcher_event {
                     schedule_current_sysdata_fallback(PackageSeedTaskHandles {
                         state: state_arc,
@@ -20721,6 +20725,7 @@ impl LanguageServer for Backend {
                 },
             )
             .await;
+            self.refresh_open_children_after_parent_change().await;
             if sysdata_fallback_watcher_event {
                 schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self)).await;
             }
@@ -40312,6 +40317,115 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|edge| edge.to == old_helper_uri)
         );
+    }
+
+    /// A closed parent's `# raven: cd` edited on disk reaches an open child it
+    /// sources: the watched-file commit queues the child, and the handler
+    /// re-derives it, so the child's `source("helper.R")` follows the new
+    /// directory. Deleting the parent takes the directory away again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_closed_parent_cd_change_rederives_open_forward_child() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().canonicalize().unwrap();
+        for dir in ["old", "new", "scripts"] {
+            fs::create_dir(root_path.join(dir)).unwrap();
+        }
+        let main_path = root_path.join("main.R");
+        fs::write(
+            &main_path,
+            "# raven: cd old\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(root_path.join("scripts/child.R"), "source(\"helper.R\")\n").unwrap();
+        fs::write(root_path.join("old/helper.R"), "h <- 1\n").unwrap();
+        fs::write(root_path.join("new/helper.R"), "h2 <- 1\n").unwrap();
+
+        let root = Url::from_file_path(&root_path).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let child_uri = Url::from_file_path(root_path.join("scripts/child.R")).unwrap();
+        let new_helper_uri = Url::from_file_path(root_path.join("new/helper.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.index_workspace = true;
+            state.advance_workspace_scan_generation();
+        }
+        run_workspace_scan_transaction(&backend.state)
+            .await
+            .expect_committed();
+        open_doc(backend, &child_uri, "r", 1, "source(\"helper.R\")\n").await;
+        let child_wd = || async {
+            backend
+                .state
+                .read()
+                .await
+                .get_enriched_metadata(&child_uri)
+                .and_then(|metadata| metadata.inherited_working_directory.clone())
+        };
+        let wd = |dir: &str| Some(root_path.join(dir).to_string_lossy().into_owned());
+        assert_eq!(child_wd().await, wd("old"), "precondition");
+
+        fs::write(
+            &main_path,
+            "# raven: cd new\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: main_uri,
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child_wd().await != wd("new") && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(child_wd().await, wd("new"));
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|edge| edge.to == new_helper_uri),
+            "the open child's source() follows the parent's new directory"
+        );
+        drop(state);
+
+        // Deleting the parent takes its directory away from the child.
+        fs::remove_file(&main_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&main_path).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child_wd().await.is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(child_wd().await, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
