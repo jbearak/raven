@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { copyFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { hash01, writeArrowFixture } from './_helpers/arrow-fixture-writer';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX_SRC = (n: string) =>
@@ -144,14 +145,14 @@ type PanelTestContext = {
 /** Set up a DataViewerPanel against the tiny fixture. Registers
  *  failure-safe cleanups (reader close + fake-panel dispose) with
  *  afterEach so a thrown assertion still releases resources. */
-async function setupPanel(settingsOverride?: Partial<typeof TEST_SETTINGS>): Promise<PanelTestContext> {
+async function setupPanel(settingsOverride?: Partial<typeof TEST_SETTINGS>, fixturePath?: string): Promise<PanelTestContext> {
     const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
     const kv = new MemKV();
     const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
     const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
     const sortStore = new sortMod.SortStateStore(kv as any, 100);
     const filterStore = new filterMod.FilterStateStore(kv as any, 100);
-    const tempPath = tempCopyOf('tiny.arrow');
+    const tempPath = fixturePath ?? tempCopyOf('tiny.arrow');
     const reader = await arrowMod.ArrowSliceReader.open(tempPath);
     pendingCleanups.push(() => reader.close().catch(() => undefined));
     const panel = await panelMod.DataViewerPanel.create(
@@ -845,5 +846,66 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         await flush();
         const stored = await sortStore.load('tiny', init.schemaHash);
         expect(stored).toBeUndefined();
+    });
+});
+
+// A column summarized before it is sorted has sampled quartiles (`≈`).
+// The sort leaves the column's key with the scan worker, which gives
+// exact ones; the webview never asks again for a profile it holds, so the
+// host must send the replacement on its own.
+describe('DataViewerPanel: a sort replaces sampled quartiles the webview holds', () => {
+    const NROW = 150_000; // past the 100,000-value reservoir
+    const value = (i: number) => hash01(i, 1) * 100;
+
+    async function open() {
+        const path = join(mkdtempSync(join(tmpdir(), 'raven-panel-quartiles-')), 'q.arrow');
+        writeArrowFixture(path, {
+            nrow: NROW,
+            columns: [
+                { name: 'x', kind: 'dbl', gen: value },
+                { name: 'y', kind: 'dbl', gen: i => hash01(i, 2) },
+            ],
+        });
+        const { fakeWebview } = await setupPanel(undefined, path);
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const gen = (fakeWebview.posted.find(m => m.type === 'init') as any).panelGeneration as number;
+        const quantilesOf = (ci: number) => fakeWebview.posted
+            .filter(m => m.type === 'profiles')
+            .flatMap(m => m.updates as [number, any][])
+            .filter(([c, s]) => c === ci && s?.state === 'ready')
+            .map(([, s]) => s.profile.quantiles);
+        const until = async (done: () => boolean) => {
+            for (let i = 0; i < 400 && !done(); i++) await new Promise(r => setTimeout(r, 10));
+            expect(done()).toBe(true);
+        };
+        return { fakeWebview, gen, quantilesOf, until };
+    }
+
+    test('sorting a summarized column posts its exact quartiles, unasked', async () => {
+        const { fakeWebview, gen, quantilesOf, until } = await open();
+        fakeWebview.deliverFromWebview({ type: 'setProfileInterest', panelGeneration: gen, columns: [0, 1] });
+        await until(() => quantilesOf(0).length === 1 && quantilesOf(1).length === 1);
+        expect(quantilesOf(0)[0].exact).toBe(false);
+        // The webview holds both profiles and asks for nothing more.
+        fakeWebview.deliverFromWebview({ type: 'setProfileInterest', panelGeneration: gen, columns: [] });
+        await flush();
+
+        fakeWebview.deliverFromWebview({
+            type: 'setSort', panelGeneration: gen, requestId: 1,
+            keys: [{ columnIndex: 0, direction: 'asc' }], labelsOn: true, formatOn: true, digits: 3,
+        });
+        await until(() => quantilesOf(0).length === 2);
+
+        const sorted = Float64Array.from({ length: NROW }, (_, i) => value(i)).sort();
+        const q = (p: number) => {
+            const h = (NROW - 1) * p, l = Math.floor(h);
+            return sorted[l] + (h - l) * (sorted[l + 1] - sorted[l]);
+        };
+        expect(quantilesOf(0)[1]).toEqual({ p25: q(0.25), p50: q(0.5), p75: q(0.75), exact: true });
+        // The column that wasn't sorted keeps its sampled quartiles.
+        await flush();
+        expect(quantilesOf(1)).toHaveLength(1);
+        expect(quantilesOf(1)[0].exact).toBe(false);
     });
 });

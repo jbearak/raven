@@ -1756,6 +1756,9 @@ export class DataViewerPanel {
         this.mirroredDesc = desc;
         this.sort = desc.spec.sort;
         this.filter = desc.spec.filter;
+        // The scan worker now holds each sorted column's key, which gives
+        // exact quartiles where the profile had sampled ones.
+        for (const k of desc.spec.sort.keys) this.profileScheduler?.refresh(k.columnIndex);
         if (fromHost) return;
         this.permutation = desc.spec.sort.keys.length > 0 ? desc.perm : undefined;
         this.filteredIndices = desc.spec.filter.entries.some(e => e.enabled) ? desc.perm : undefined;

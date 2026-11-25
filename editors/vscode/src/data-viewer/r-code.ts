@@ -56,7 +56,9 @@
 import type { ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState, SortState, StringOrder } from './messages';
 import { keyKind } from './sort';
-import { int64Intervals, int64SetKey, isInt64Type, isNumberLike, numBoundValue, type IntInterval } from './filter';
+import {
+    dateBoundMs, int64Intervals, int64SetKey, isInt64Type, isNumberLike, numBoundValue, type IntInterval,
+} from './filter';
 
 export type CodeFlavor = 'dplyr' | 'base' | 'data.table';
 
@@ -788,7 +790,7 @@ function numericSet(x: string, values: readonly (string | number)[]): string {
 }
 
 /** Date and date-time comparisons, in the instants the engine compares
- *  (`Date.parse` of the typed ISO string). */
+ *  (`dateBoundMs` of the typed ISO string). */
 function dateCode(
     col: ColumnSchema,
     x: string,
@@ -796,13 +798,21 @@ function dateCode(
 ): { code: string; trueOnNA: boolean } {
     const isTs = col.arrowType.startsWith('Timestamp');
     const isos = p.kind === 'dateCompare' ? [p.value] : [p.lo, p.hi];
-    const ms = isos.map(s => Date.parse(s));
+    const ms = isos.map(s => dateBoundMs(s, col));
     // An unparseable bound matches nothing in the engine.
     if (ms.some(v => !Number.isFinite(v))) return { code: 'FALSE', trueOnNA: false };
     const wholeDays = !isTs && ms.every(v => v % 86_400_000 === 0);
     const lhs = isTs || wholeDays ? x : `as.POSIXct(${x})`;
     const lit = (v: number): string => {
         const iso = new Date(v).toISOString();
+        // A year outside 0000 to 9999 is `+010000-…` or `-000001-…` in
+        // ISO 8601, which R reads as neither a date nor a date-time, so
+        // the value is counted from the epoch instead.
+        if (/^[+-]/.test(iso)) {
+            return wholeDays
+                ? `as.Date(${rNumber(v / 86_400_000)}, origin = "1970-01-01")`
+                : `as.POSIXct(${rNumber(v / 1000)}, origin = "1970-01-01", tz = "UTC")`;
+        }
         if (wholeDays) return `as.Date(${rString(iso.slice(0, 10))})`;
         const frac = iso.slice(19, 23) === '.000' ? '' : iso.slice(19, 23);
         return `as.POSIXct(${rString(`${iso.slice(0, 10)} ${iso.slice(11, 19)}${frac}`)}, tz = "UTC")`;
@@ -1157,6 +1167,10 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         }
         if (hidden.names) body.push(`select(-${rVector(hidden.names.map(rName))})`);
         else if (hidden.positions) body.push(`select(-${rVector(hidden.positions.map(String))})`);
+        // The view is the flat table. On a grouped or rowwise tibble
+        // select() keeps the grouping columns, hidden or not, so the
+        // grouping goes first (a no-op on any other data frame).
+        if (hidden.positions) body.unshift('ungroup()');
         if (body.length === 0) head = src0;
         const lines = header(ctx, ['', 'library(dplyr)', '']);
         lines.push(body.length === 0 ? head : `${head} |>\n  ${body.join(' |>\n  ')}`);
