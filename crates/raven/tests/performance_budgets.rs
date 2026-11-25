@@ -822,3 +822,74 @@ fn budget_diagnostics_2000_term_chain() {
         .unwrap();
     assert_within_budget("diagnostics_2000_term_chain", elapsed, 5000);
 }
+
+// ---------------------------------------------------------------------------
+// Deep pipeline indentation budgets (issue #906)
+// ---------------------------------------------------------------------------
+
+/// `r <- x |>` followed by `steps` lines of `  f() |>`: one pipeline step per
+/// line, which parses as a tree `steps` levels deep whose every level starts on
+/// the assignment's row.
+fn pipeline_one_step_per_line(steps: usize) -> String {
+    format!(
+        "x <- 1\nf <- function(v) v\nr <- x{}\n",
+        " |>\n  f()".repeat(steps)
+    )
+}
+
+/// Run `f` on a thread with the analysis stack. A tree this deep overflows a
+/// test thread's 2 MiB.
+fn on_analysis_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(raven::analysis_stack::stack_size())
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// Enter on the first continuation line of a 2100-step pipeline. Every
+/// operator of the chain starts on the assignment's row, so the indentation
+/// change collector visits all 2100 for a request about rows 2 and 3. It used
+/// to climb to the root from each of them with repeated `Node::parent` calls,
+/// which is cubic in the number of steps: this took 30 seconds and held up
+/// every later request. It now skips the operators whose change begins below
+/// the requested rows and takes about 2 ms.
+#[test]
+fn budget_enter_in_2100_step_pipeline() {
+    use raven::indentation::{IndentationConfig, on_type_indentation};
+
+    let source = pipeline_one_step_per_line(2100);
+    let elapsed = on_analysis_stack(move || {
+        let tree = make_r_parser().parse(&source, None).unwrap();
+        let config = IndentationConfig::default();
+        let enter = || on_type_indentation(&tree, &source, Position::new(3, 0), &config);
+        // The column under `x`, the start of the chain. A request that gave up
+        // would be fast too, so the answer is part of the budget.
+        assert_eq!(enter(), Some(5));
+        median_of_3(|| assert_eq!(enter(), Some(5)))
+    });
+    assert_within_budget("enter_in_2100_step_pipeline", elapsed, 50);
+}
+
+/// The lint pass over the same pipeline. It collects the indentation change of
+/// every operator, so it runs the two ancestor climbs 2100 times each. With
+/// repeated `Node::parent` calls that took 30 seconds; with one root descent
+/// per climb (`parser_pool::ancestors`) it takes well under a second.
+#[test]
+fn budget_lint_2100_step_pipeline() {
+    use raven::linting::{LintConfig, run_lints};
+
+    let source = pipeline_one_step_per_line(2100);
+    let elapsed = on_analysis_stack(move || {
+        let tree = make_r_parser().parse(&source, None).unwrap();
+        let mut config = LintConfig::default();
+        config.enabled = true;
+        let start = Instant::now();
+        let found = run_lints(&source, tree.root_node(), &config);
+        let elapsed = start.elapsed();
+        assert_eq!(found, vec![], "the pipeline is lint-clean");
+        elapsed
+    });
+    assert_within_budget("lint_2100_step_pipeline", elapsed, 5000);
+}
