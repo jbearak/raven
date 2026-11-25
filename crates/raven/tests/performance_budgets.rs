@@ -881,7 +881,12 @@ fn budget_enter_in_2100_step_pipeline() {
 fn budget_lint_2100_step_pipeline() {
     use raven::linting::{LintConfig, run_lints};
 
-    let source = pipeline_one_step_per_line(2100);
+    // The last step sits at column 3, which neither continuation style accepts.
+    // A pass that skipped the pipeline would be fast too, so the one diagnostic
+    // it must report is part of the budget.
+    let mut source = pipeline_one_step_per_line(2100);
+    assert!(source.ends_with("\n  f()\n"));
+    source.insert(source.len() - "  f()\n".len(), ' ');
     let elapsed = on_analysis_stack(move || {
         let tree = make_r_parser().parse(&source, None).unwrap();
         let mut config = LintConfig::default();
@@ -889,7 +894,14 @@ fn budget_lint_2100_step_pipeline() {
         let start = Instant::now();
         let found = run_lints(&source, tree.root_node(), &config);
         let elapsed = start.elapsed();
-        assert_eq!(found, vec![], "the pipeline is lint-clean");
+        let found: Vec<(u32, &str)> = found
+            .iter()
+            .map(|diagnostic| (diagnostic.range.start.line, diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(2102, "Indentation should be 2 or 5 spaces, not 3.")]
+        );
         elapsed
     });
     assert_within_budget("lint_2100_step_pipeline", elapsed, 5000);
