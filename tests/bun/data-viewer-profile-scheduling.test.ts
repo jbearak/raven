@@ -166,6 +166,16 @@ describe('ProfileScheduler.refresh: a sort made exact quartiles available', () =
         expect(runs.length).toBe(2);
     });
 
+    test('a refresh that comes back still sampled is not posted again', async () => {
+        // The sort key couldn't give quartiles (an integer64 column, say).
+        const { s, runs, posted } = await holding(sampled(0));
+        s.refresh(0);
+        runs[1].resolve(sampled(0));
+        await tick();
+        expect(posted).toEqual([]);
+        expect(s.cached(0)).toEqual({ state: 'ready', profile: sampled(0) });
+    });
+
     test('an exact, failed or unknown profile is left alone', async () => {
         const { s, runs } = await holding(exact(0));
         s.refresh(0);
@@ -248,6 +258,22 @@ describe('quartiles after a sort', () => {
         // A sort on another column leaves a sampled profile sampled.
         const other = await engine.profile(1, signal());
         expect(other.quantiles?.exact).toBe(false);
+        await engine.dispose();
+        await reader.close();
+    });
+
+    test('the exact quartiles of a cached profile wait at the priority gate like a scan', async () => {
+        const reader = await ArrowSliceReader.open(PATH);
+        const engine = new LocalEngine(reader);
+        await engine.profile(0, signal());
+        await sortBy(engine, 0);
+        engine.priority[0] = 1; // a viewport read in flight
+        let done = false;
+        const p = engine.profile(0, signal()).then(r => { done = true; return r; });
+        await new Promise(r => setTimeout(r, 30));
+        expect(done).toBe(false);
+        engine.priority[0] = 0;
+        expect((await p).quantiles?.exact).toBe(true);
         await engine.dispose();
         await reader.close();
     });

@@ -289,7 +289,13 @@ export class ScanCore {
      *  scan was still running when the sort finished. */
     async profile(columnIndex: number, signal?: AbortSignal): Promise<ColumnProfile> {
         const hit = this.profiles.get(columnIndex);
-        if (hit) return this.withExactQuartiles(hit);
+        if (hit) {
+            // Selecting from the key is a pass over every row: like a
+            // scan, it waits for higher-priority work and honors a cancel.
+            if (hit.quantiles?.exact === false) await this.pauseFor(signal)();
+            throwIfAborted(signal);
+            return this.withExactQuartiles(hit);
+        }
         const col = this.reader.schema.columns[columnIndex];
         const r = await computeProfile(this.reader, columnIndex, {
             signal,

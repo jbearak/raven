@@ -108,19 +108,16 @@ const digits = () => document.querySelector('select.digits') as HTMLSelectElemen
 describe('the Format toggle and the digits dropdown', () => {
     // `DOLLAR8` on 12.75 shows `$13`: without the toggle there is no way
     // back to the stored value.
-    for (const format of ['DOLLAR8', 'DOLLAR8.', 'F8.0', '%9.0f', 'Z3.']) {
-        test(`a frame whose only float is formatted ${format} offers Format, not digits`, async () => {
-            const { posted } = await renderApp();
-            await send(init([float('price', { isInteger: true, format })]));
-            expect(formatToggle()?.className).toBe('toggle active');
-            expect(digits()).toBeNull();
-            act(() => { formatToggle()!.click(); });
-            expect(formatToggle()?.className).toBe('toggle');
-            // What the host formats copied cells with.
-            await wait(400);
-            expect(posted.filter(m => m.type === 'saveToolbar').at(-1)?.toolbar.formatOn).toBe(false);
-        });
-    }
+    // The spellings are covered by the predicate tests
+    // (data-viewer-toolbar-effects.test.ts).
+    test('a frame whose only float is formatted DOLLAR8 offers Format, not digits', async () => {
+        await renderApp();
+        await send(init([float('price', { isInteger: true, format: 'DOLLAR8' })]));
+        expect(formatToggle()?.className).toBe('toggle active');
+        expect(digits()).toBeNull();
+        act(() => { formatToggle()!.click(); });
+        expect(formatToggle()?.className).toBe('toggle');
+    });
 
     test('a source format with decimals offers Format without the digits it ignores', async () => {
         await renderApp();

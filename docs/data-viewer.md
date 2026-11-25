@@ -112,7 +112,7 @@ On by default in new panels. When on, non-integer numeric columns are rounded to
 
 When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps it), Format uses it instead of the dropdown. Raven honors Stata `%w.df`, `%w.dfc` (with thousands separators), and `%w.dg` (significant digits), and SPSS and SAS `Fw.d`, `COMMAw.d`, `DOLLARw.d` (with a `$`), and `Zw.` (zero-padded). SPSS `PCTw.d` adds a `%` to the value as stored (25 shows as `25.00%`). SAS `PERCENTw.d` multiplies by 100 and shows negatives in parentheses (0.25 shows as `25.00%`, -0.25 as `(25.00%)`); `PERCENTNw.d` uses a minus sign instead. The width and `.d` can be left out, as `haven::read_xpt()` writes them (`PERCENT8`, `DOLLAR`); a format without `.d` shows no decimals. Other formats fall back to the dropdown.
 
-A format describes how to show a column, not what it holds: a column formatted for whole numbers (`%9.0f`, `F8.0`, `DOLLAR8`) can still hold `12.75`, which then shows, and copies, rounded (`13`, `$13`). Turn Format off to see and copy the stored value. Filters and sorts always use the stored value.
+A format describes how to show a column, not what it holds: a column formatted for whole numbers (`%9.0f`, `F8.0`, `DOLLAR8`) can still hold `12.75`, which then shows, and copies, rounded (`13`, `$13`). Turn Format off to see and copy the stored value. Toggling Format doesn't change filter results or sort order.
 
 ### Dates and times
 
@@ -262,6 +262,8 @@ For numeric `between` and `not between`, the editor shows a histogram of the col
 
 For factor columns, the editor shows a searchable checklist of levels when the levels are available to the panel; columns with very many levels fall back to a free-text value list. For labelled numeric columns, the editor defaults to a searchable checklist of the labelled values, each shown as label plus code, and also offers the numeric predicates in the condition dropdown.
 
+A date-time you type in a filter is read in the time zone the column is shown in (the one in its type line), so `09:00` matches the cells that show `09:00`.
+
 `matches regex` uses JavaScript regular-expression syntax, not PCRE or R regex syntax. A Case sensitive toggle controls whether all character predicates match case-sensitively.
 
 Use `is empty` to keep rows where a column is missing, and `is not empty` to keep only rows where it isn't.
@@ -354,7 +356,7 @@ Distinct counts leave out `NA` and `NaN`, as `length(unique(x[!is.na(x)]))` does
 Most numbers in a summary are exact. On very large or very varied columns, a few are estimated so the summary stays fast, and every estimate starts with `≈`:
 
 - Counts of NA and NaN, minimum, maximum, mean, standard deviation, and the histogram are always exact.
-- Percentiles are exact up to 100,000 values. Beyond that they come from a random sample of 100,000 values until you sort the column in this panel. Sorting a number column by its values makes its percentiles exact, and an open summary updates in place. The sample stays for a `bit64::integer64` column, for a labelled column sorted by its labels, and for a column where millions of rows share one value.
+- Percentiles are exact up to 100,000 values. Beyond that they come from a random sample of 100,000 values until you sort the column in this panel. Sorting a number column by its values makes its percentiles exact, and an open summary updates in place. The sample stays for a `bit64::integer64` column, for a labelled column sorted by its labels, and for a column with millions of values packed closely around a quartile.
 - Distinct counts are exact for factors, and for other columns up to 100,000 distinct values. Beyond that they're estimated, usually within 1 to 2%.
 - Most-common values have exact counts up to 100,000 distinct values. Beyond that, each count shows how far off it can be, as `≈ 4,210 ± 12`. When those margins mean two values could be in either order, the list says "approximate order".
 

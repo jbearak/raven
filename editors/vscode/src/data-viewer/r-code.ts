@@ -56,7 +56,9 @@
 import type { ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState, SortState, StringOrder } from './messages';
 import { keyKind } from './sort';
-import { int64Intervals, int64SetKey, isInt64Type, isNumberLike, numBoundValue, type IntInterval } from './filter';
+import {
+    dateBoundMs, int64Intervals, int64SetKey, isInt64Type, isNumberLike, numBoundValue, type IntInterval,
+} from './filter';
 
 export type CodeFlavor = 'dplyr' | 'base' | 'data.table';
 
@@ -788,7 +790,7 @@ function numericSet(x: string, values: readonly (string | number)[]): string {
 }
 
 /** Date and date-time comparisons, in the instants the engine compares
- *  (`Date.parse` of the typed ISO string). */
+ *  (`dateBoundMs` of the typed ISO string). */
 function dateCode(
     col: ColumnSchema,
     x: string,
@@ -796,7 +798,7 @@ function dateCode(
 ): { code: string; trueOnNA: boolean } {
     const isTs = col.arrowType.startsWith('Timestamp');
     const isos = p.kind === 'dateCompare' ? [p.value] : [p.lo, p.hi];
-    const ms = isos.map(s => Date.parse(s));
+    const ms = isos.map(s => dateBoundMs(s, col));
     // An unparseable bound matches nothing in the engine.
     if (ms.some(v => !Number.isFinite(v))) return { code: 'FALSE', trueOnNA: false };
     const wholeDays = !isTs && ms.every(v => v % 86_400_000 === 0);

@@ -50,6 +50,7 @@ import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterPredicate, FilterState } from './messages';
 import { iterateBatches } from './batch-iter';
 import { throwIfAborted, yieldToEventLoop } from './abort';
+import { zonedTimeToMs } from './display-format';
 
 export type FilterContext = {
     labelsOn: boolean;
@@ -281,9 +282,10 @@ async function acceptorFor(
         // days and a microsecond Timestamp stores bigint microseconds,
         // but `get` gives ms for both (fractional below a millisecond).
         const values = await loadNumeric(reader, columnIndex, signal);
+        const bound = (iso: string): number => dateBoundMs(iso, schema);
         switch (predicate.kind) {
             case 'dateCompare': {
-                const v = Date.parse(predicate.value);
+                const v = bound(predicate.value);
                 // Unparseable ISO -> no-match, mirroring the invalid-regex
                 // fallback. Without this guard `!=` would keep every row,
                 // since `x !== NaN` is always true.
@@ -298,13 +300,13 @@ async function acceptorFor(
                 }
             }
             case 'dateBetween': {
-                const lo = Date.parse(predicate.lo), hi = Date.parse(predicate.hi);
+                const lo = bound(predicate.lo), hi = bound(predicate.hi);
                 return predicate.inclusive
                     ? (i) => values[i] >= lo && values[i] <= hi
                     : (i) => values[i] > lo && values[i] < hi;
             }
             case 'dateNotBetween': {
-                const lo = Date.parse(predicate.lo), hi = Date.parse(predicate.hi);
+                const lo = bound(predicate.lo), hi = bound(predicate.hi);
                 return predicate.inclusive
                     ? (i) => values[i] < lo || values[i] > hi
                     : (i) => values[i] <= lo || values[i] >= hi;
@@ -371,6 +373,24 @@ async function acceptorFor(
 
     const _exhaustive: never = predicate;
     throw new Error(`filter: unhandled predicate ${(_exhaustive as { kind: string }).kind}`);
+}
+
+/**
+ * A date filter's bound as milliseconds since the epoch (NaN when it
+ * doesn't parse), shared with Copy as R code (`r-code.ts`) so the two
+ * compare the same instant. On a Timestamp column a date-time without an
+ * offset, which is what the popover's `datetime-local` input gives, is a
+ * wall-clock time in the zone the grid shows the column in, not in the
+ * extension host's zone. Everything else is `Date.parse`: an explicit
+ * offset is honored, and a bare date is UTC midnight (what a Date column
+ * stores).
+ */
+export function dateBoundMs(iso: string, col: ColumnSchema): number {
+    const t = iso.indexOf('T');
+    if (col.arrowType.startsWith('Timestamp') && t > 0 && !/[zZ+-]/.test(iso.slice(t))) {
+        return zonedTimeToMs(iso, col.timeZone ?? 'UTC');
+    }
+    return Date.parse(iso);
 }
 
 /** An Arrow Int64 / Uint64 column (a `bit64::integer64` in R). */

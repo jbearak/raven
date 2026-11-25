@@ -463,10 +463,12 @@ edgeSuite('Copy as R code round trip: grouped and rowwise tibbles (real R)',
 
 // Date-times: the engine and the code compare the same instants. `t`
 // holds 2023-12-31, 2024-01-01, half a second later, NA and 2024-01-02
-// (UTC); a half second is exact in a double and in microseconds.
+// (UTC); a half second is exact in a double and in microseconds. `k` is
+// shown in Asia/Kolkata and starts at that zone's 2024-01-01 00:00.
 edgeSuite('Copy as R code round trip: date-times (real R)',
     `df <- data.frame(id = 1:5)
-df$t <- as.POSIXct(c(1703980800, 1704067200, 1704067200.5, NA, 1704153600), origin = "1970-01-01", tz = "UTC")`,
+df$t <- as.POSIXct(c(1703980800, 1704067200, 1704067200.5, NA, 1704153600), origin = "1970-01-01", tz = "UTC")
+df$k <- as.POSIXct(c(1704047400, 1704067200, 1704067200.5, NA, 1704153600), origin = "1970-01-01", tz = "Asia/Kolkata")`,
     ['df', 'dtobj'],
     [
         { name: 't = midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00:00Z' } }], rows: [2] },
@@ -475,6 +477,11 @@ df$t <- as.POSIXct(c(1703980800, 1704067200, 1704067200.5, NA, 1704153600), orig
         { name: 't < midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<', value: '2024-01-01T00:00:00Z' } }], rows: [1] },
         { name: 't <= half past', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<=', value: '2024-01-01T00:00:00.500Z' } }], rows: [1, 2, 3] },
         { name: 't between, with an offset', filters: [{ ci: 1, p: { kind: 'dateBetween', lo: '2024-01-01T01:00:00+01:00', hi: '2024-01-02T00:00:00Z', inclusive: true } }], rows: [2, 3, 5] },
+        // No offset, as the popover's input gives it: a time in the zone
+        // the column is shown in. Midnight in Kolkata is 18:30 UTC.
+        { name: 't = midnight, as typed', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00' } }], rows: [2] },
+        { name: 'k = midnight in its zone, as typed', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00' } }], rows: [1] },
+        { name: 'k >= 05:30 in its zone, as typed', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '>=', value: '2024-01-01T05:30' } }], rows: [2, 3, 5] },
         { name: 't not between, or missing', filters: [{ ci: 1, p: { kind: 'dateNotBetween', lo: '2024-01-01T00:00:00Z', hi: '2024-01-01T00:00:01Z', inclusive: true }, includeMissing: true }], rows: [1, 4, 5] },
     ]);
 

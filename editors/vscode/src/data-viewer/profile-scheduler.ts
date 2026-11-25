@@ -140,7 +140,9 @@ export class ProfileScheduler {
         void this.run(columnIndex, abort.signal).then(
             profile => {
                 if (refresh) this.stale.delete(columnIndex);
-                this.finish(columnIndex, abort, { state: 'ready', profile }, refresh);
+                // A refresh that is still sampled (the sort key can't give
+                // quartiles) is what the client already shows.
+                this.finish(columnIndex, abort, { state: 'ready', profile }, refresh && profile.quantiles?.exact === true);
             },
             err => {
                 if (refresh) {
@@ -165,13 +167,13 @@ export class ProfileScheduler {
     }
 
     private finish(
-        columnIndex: number, abort: AbortController, state: ProfileState | undefined, refresh = false,
+        columnIndex: number, abort: AbortController, state: ProfileState | undefined, unprompted = false,
     ): void {
         if (this.running?.abort === abort) this.running = undefined;
         if (this.disposed) return;
         if (state) {
             this.results.set(columnIndex, state);
-            if (refresh || this.announced.delete(columnIndex) || this.wanted.includes(columnIndex)) {
+            if (unprompted || this.announced.delete(columnIndex) || this.wanted.includes(columnIndex)) {
                 this.post([[columnIndex, state]]);
             }
         }

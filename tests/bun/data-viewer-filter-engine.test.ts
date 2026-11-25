@@ -352,11 +352,11 @@ describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..0
 describe('computeFilteredIndices — date-time predicates on a microsecond Timestamp', () => {
     // Rows: 2023-12-31, 2024-01-01, 2024-01-01 00:00:00.5, 2024-01-02 (UTC).
     const MICROS = [1703980800000000n, 1704067200000000n, 1704067200500000n, 1704153600000000n];
-    async function rows(predicate: FilterEntry['predicate']): Promise<number[]> {
+    async function rows(predicate: FilterEntry['predicate'], micros = MICROS, zone = 'UTC'): Promise<number[]> {
         const dir = mkdtempSync(join(tmpdir(), 'raven-dv-ts-filter-'));
         try {
-            const type = new TimestampMicrosecond('UTC');
-            const t = makeVector(makeData({ type, length: MICROS.length, data: BigInt64Array.from(MICROS) }));
+            const type = new TimestampMicrosecond(zone);
+            const t = makeVector(makeData({ type, length: micros.length, data: BigInt64Array.from(micros) }));
             const path = join(dir, 'ts.arrow');
             writeFileSync(path, tableToIPC(new Table({ t }), 'file'));
             const r = await ArrowSliceReader.open(path);
@@ -370,6 +370,20 @@ describe('computeFilteredIndices — date-time predicates on a microsecond Times
         }
     }
     const MIDNIGHT = '2024-01-01T00:00:00Z';
+    // What the popover's datetime-local input gives: no offset. It is the
+    // time the grid shows, so it is read in the column's zone, whatever
+    // zone this process runs in.
+    test('a bound without an offset is a time in the zone the column is shown in', async () => {
+        const typed = { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00' } as const;
+        expect(await rows(typed)).toEqual([1]);
+        // 2024-01-01 00:00 in Kolkata (UTC+05:30) is 2023-12-31 18:30 UTC.
+        const kolkata = [1704047400000000n, 1704067200000000n];
+        expect(await rows(typed, kolkata, 'Asia/Kolkata')).toEqual([0]);
+        expect(await rows({ kind: 'dateBetween', lo: '2024-01-01T00:00', hi: '2024-01-01T05:30', inclusive: true }, kolkata, 'Asia/Kolkata'))
+            .toEqual([0, 1]);
+        // An explicit offset is still an instant.
+        expect(await rows({ kind: 'dateCompare', op: '=', value: MIDNIGHT }, kolkata, 'Asia/Kolkata')).toEqual([1]);
+    });
     test('each comparison keeps the rows on its side of the instant', async () => {
         expect(await rows({ kind: 'dateCompare', op: '=', value: MIDNIGHT })).toEqual([1]);
         expect(await rows({ kind: 'dateCompare', op: '!=', value: MIDNIGHT })).toEqual([0, 2, 3]);
