@@ -1,5 +1,5 @@
 {
-    // Used by src/test/debugger-prelaunch.test.ts: a preLaunchTask that
+    // Used by src/test/debugger_prelaunch.test.ts: a preLaunchTask that
     // runs until the test releases it (or 90 s have passed), then leaves a
     // file behind so the test knows it ran to its end.
     "version": "2.0.0",

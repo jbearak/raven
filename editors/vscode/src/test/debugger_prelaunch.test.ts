@@ -28,6 +28,9 @@ declare const suiteTeardown: Mocha.HookFunction;
  * (`target/debug/raven`) when there is one, else the binary bundled with
  * the extension (CI); skipped without either, without R with a shared libR,
  * and on Windows (the task is a `/bin/sh` loop).
+ *
+ * Named to sort after debugger.test.ts, whose first test must run before
+ * any debug session has. Leaves behind only what was there before it ran.
  */
 const DEBUG_BUILD = path.resolve(__dirname, '..', '..', '..', '..', 'target', 'debug', 'raven');
 const BUNDLED = path.resolve(__dirname, '..', '..', 'bin', 'raven');
@@ -74,15 +77,20 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
     const sent: Array<{ type?: string; event?: string; body?: Record<string, unknown> }> = [];
     const disposables: vscode.Disposable[] = [];
     let sessions_started = 0;
+    /** What this suite added or changed, for `suiteTeardown` to undo. */
+    const breakpoints: vscode.Breakpoint[] = [];
+    let terminals_before: readonly vscode.Terminal[] = [];
+    let set_server_path = false;
 
     suiteSetup(async () => {
         await activate();
         fs.rmSync(task_release, { force: true });
         fs.rmSync(task_done, { force: true });
-        if (fs.existsSync(DEBUG_BUILD)) {
-            await vscode.workspace
-                .getConfiguration('raven')
-                .update('server.path', DEBUG_BUILD, vscode.ConfigurationTarget.Global);
+        terminals_before = [...vscode.window.terminals];
+        const config = vscode.workspace.getConfiguration('raven');
+        if (fs.existsSync(DEBUG_BUILD) && config.inspect('server.path')?.globalValue === undefined) {
+            await config.update('server.path', DEBUG_BUILD, vscode.ConfigurationTarget.Global);
+            set_server_path = true;
         }
         disposables.push(
             vscode.debug.registerDebugAdapterTrackerFactory('raven-r', {
@@ -101,11 +109,15 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
         await sleep(500);
         fs.rmSync(task_release, { force: true });
         fs.rmSync(task_done, { force: true });
-        vscode.debug.removeBreakpoints(vscode.debug.breakpoints);
-        for (const t of vscode.window.terminals) t.dispose();
-        await vscode.workspace
-            .getConfiguration('raven')
-            .update('server.path', undefined, vscode.ConfigurationTarget.Global);
+        vscode.debug.removeBreakpoints(breakpoints);
+        // The console this suite opened may be stopped in the debugger if
+        // the test failed; one that was already open is left alone.
+        for (const t of vscode.window.terminals) if (!terminals_before.includes(t)) t.dispose();
+        if (set_server_path) {
+            await vscode.workspace
+                .getConfiguration('raven')
+                .update('server.path', undefined, vscode.ConfigurationTarget.Global);
+        }
     });
 
     test('the stop that attached while the task ran keeps the console; the launch does not start', async () => {
@@ -114,9 +126,10 @@ suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', funct
         const program = path.join(dir, 'prog.R');
         const program_ran = path.join(dir, 'program-ran');
         fs.writeFileSync(program, `file.create(${JSON.stringify(program_ran)})\n`);
-        vscode.debug.addBreakpoints([
+        breakpoints.push(
             new vscode.SourceBreakpoint(new vscode.Location(vscode.Uri.file(file), new vscode.Position(2, 0))),
-        ]);
+        );
+        vscode.debug.addBreakpoints(breakpoints);
         // Define the function, which opens the console the launch will use.
         const editor = await open_at(file, 0);
         editor.selection = new vscode.Selection(0, 0, 3, 1);
