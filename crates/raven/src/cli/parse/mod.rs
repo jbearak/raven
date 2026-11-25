@@ -300,10 +300,22 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> (Ve
 /// canonical root but its canonical form is (an absolute path through an
 /// alias of the root, such as macOS's `/var` for `/private/var`) is the
 /// canonical form used.
+///
+/// A `..` after a symlinked directory (`alias/../data.R`) leaves the link's
+/// target, not the link, so collapsing it lexically can name another file than
+/// the one the OS opens. When the two name different existing files, the file
+/// the OS opens is used, in canonical form.
 fn requested_path(file: &Path, root: &Path) -> PathBuf {
     let absolute = absolute_path(root, file);
-    let lexical =
-        crate::cross_file::path_resolve::normalize_path_public(&absolute).unwrap_or(absolute);
+    let lexical = crate::cross_file::path_resolve::normalize_path_public(&absolute)
+        .unwrap_or_else(|| absolute.clone());
+    if let (Ok(opened), Ok(collapsed)) = (
+        std::fs::canonicalize(&absolute),
+        std::fs::canonicalize(&lexical),
+    ) && opened != collapsed
+    {
+        return opened;
+    }
     if lexical.starts_with(root) {
         return lexical;
     }

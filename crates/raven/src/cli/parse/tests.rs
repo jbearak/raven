@@ -1243,6 +1243,31 @@ fn requested_paths_resolve_lexically_against_the_root() {
     assert_eq!(printed_path(Path::new("/out.R"), root), "/out.R");
 }
 
+/// `alias/../data.R`, where `alias` links to another tree, names the file the
+/// OS opens (`../other/data.R`), not the workspace's `data.R` that collapsing
+/// `..` lexically would give.
+#[cfg(unix)]
+#[test]
+fn requested_path_follows_a_symlink_before_dot_dot() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = base.join("ws");
+    std::fs::create_dir_all(base.join("other/dir")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("data.R"), "ws <- 1\n").unwrap();
+    std::fs::write(base.join("other/data.R"), "other <- 1\n").unwrap();
+    std::os::unix::fs::symlink("../other/dir", root.join("alias")).unwrap();
+    assert_eq!(
+        requested_path(Path::new("alias/../data.R"), &root),
+        base.join("other/data.R")
+    );
+    // Without a symlink, `..` still collapses lexically.
+    assert_eq!(
+        requested_path(Path::new("sub/../data.R"), &root),
+        root.join("data.R")
+    );
+}
+
 mod errors_and_directives;
 
 /// A writer that fails every write and flush with `kind`, as stdout does on a
