@@ -73,7 +73,8 @@ mod imp {
     ///   code in this console reading `<path>.lock`).
     /// * Only consoles that take the lock are protected from each other: a
     ///   console that predates it replaces the socket regardless.
-    /// * A filesystem that can't lock gives no protection, as before.
+    /// * A filesystem that says it can't lock gives no protection, as
+    ///   before. Any other failure to take the lock fails the bind.
     fn lock_endpoint(path: &Path) -> io::Result<File> {
         let mut name = path.as_os_str().to_owned();
         name.push(".lock");
@@ -98,16 +99,31 @@ mod imp {
         let mut whole: libc::flock = unsafe { std::mem::zeroed() };
         whole.l_type = libc::F_WRLCK as libc::c_short;
         whole.l_whence = libc::SEEK_SET as libc::c_short;
-        // SAFETY: an open descriptor and a valid `flock`.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &whole) } == -1 {
+        loop {
+            // SAFETY: an open descriptor and a valid `flock`.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &whole) } != -1 {
+                break;
+            }
             let err = io::Error::last_os_error();
+            let code = err.raw_os_error().unwrap_or(0);
+            if code == libc::EINTR {
+                continue;
+            }
             // Held by another process (POSIX allows either errno).
-            if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
+            if code == libc::EAGAIN || code == libc::EACCES {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "another raven console is listening here",
                 ));
             }
+            // The filesystem doesn't do record locks: carry on unprotected.
+            // (Two of these are one number on Linux, hence no `match`.)
+            if [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code) {
+                break;
+            }
+            // Anything else (a full lock table, say) leaves it unknown
+            // whether a console is listening; don't touch its socket.
+            return Err(err);
         }
         Ok(file)
     }

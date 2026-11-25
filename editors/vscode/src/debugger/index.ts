@@ -736,6 +736,8 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
                 // configuration): what `admit_launch` asks is whether an
                 // attach started since this resolution.
                 resolved[ATTACH_SEEN] = auto_attach_seq;
+                // Only `auto_attach` says what an automatic attach is.
+                delete resolved[AUTO_ATTACH];
             }
             return resolved;
         } finally {

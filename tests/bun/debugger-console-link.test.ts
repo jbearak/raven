@@ -1118,7 +1118,11 @@ describe("the host's launch sequence: a launch whose preLaunchTask outlasts its 
         await settle(100);
         // The stop's session ends, and the user starts a session by hand.
         host_end([...start_sessions].reverse().find((s) => s.configuration.consoleSocket === sock)!);
-        const by_hand = await host_launch({ type: 'raven-r', request: 'launch', name: 'R console', consoleSocket: sock });
+        // (A mark of the extension's own, written into launch.json, is not
+        // taken for an automatic attach's.)
+        const by_hand = await host_launch(
+            { type: 'raven-r', request: 'launch', name: 'R console', consoleSocket: sock, ravenAutoAttach: 1e9 },
+        );
         expect(by_hand).toBeDefined();
         finish(true);
         const session = await launch;
