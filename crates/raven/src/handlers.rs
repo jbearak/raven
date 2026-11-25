@@ -2335,6 +2335,108 @@ pub(crate) type MetadataLookup<'a> =
 pub(crate) type SnapshotScopeStream<'a> =
     scope::ScopeStream<'a, &'a ArtifactsLookup<'a>, &'a MetadataLookup<'a>>;
 
+/// What one diagnostics pass keeps of the scope at each position, keyed by
+/// `(line, UTF-16 column)` and shared by the out-of-scope and
+/// undefined-variable collectors.
+///
+/// A [`scope::ScopeAtPosition`] copies every visible symbol, and the default
+/// packages alone export about 3,500. So the pass keeps a full one only where
+/// the file bounds how many there are: at each `source()` call, at the start
+/// of the file, and at each use in a file with no artifacts of its own (which
+/// has no stream to ask instead). At a use the stream cannot resolve it keeps
+/// at most the package sets. Keeping a full scope at each such use cost about
+/// 1.3 MB per undefined name (issue #898).
+type PassScopes = HashMap<(u32, u32), PassScope>;
+
+/// One position's entry in [`PassScopes`].
+#[derive(Default)]
+struct PassScope {
+    /// The point scope (`DiagnosticsSnapshot::get_scope`) at this position.
+    full: Option<Box<scope::ScopeAtPosition>>,
+    /// The point scope's packages at a use the out-of-scope collector resolved
+    /// for its package guard. The undefined-variable collector reads them back
+    /// at the same use, so both collectors answer from one scope.
+    packages: Option<UsePackages>,
+}
+
+/// The full scope `scopes` keeps at `key`, from `resolve` on first need.
+fn full_pass_scope(
+    scopes: &mut PassScopes,
+    key: (u32, u32),
+    resolve: impl FnOnce() -> scope::ScopeAtPosition,
+) -> &scope::ScopeAtPosition {
+    scopes
+        .entry(key)
+        .or_default()
+        .full
+        .get_or_insert_with(|| Box::new(resolve()))
+}
+
+/// How many scopes one diagnostics pass kept until it ended: see
+/// `PassScopes`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassScopeCounts {
+    /// Positions with a full scope.
+    pub full: usize,
+    /// Uses with only their package sets.
+    pub use_packages: usize,
+}
+
+impl PassScopeCounts {
+    fn of(scopes: &PassScopes) -> Self {
+        let full = scopes.values().filter(|kept| kept.full.is_some()).count();
+        let use_packages = scopes
+            .values()
+            .filter(|kept| kept.full.is_none() && kept.packages.is_some())
+            .count();
+        Self { full, use_packages }
+    }
+}
+
+/// The package sets of the point scope at one use.
+struct UsePackages {
+    inherited: HashSet<String>,
+    loaded: HashSet<String>,
+    attached: HashSet<String>,
+}
+
+impl UsePackages {
+    fn of(scope: scope::ScopeAtPosition) -> Self {
+        Self {
+            inherited: scope.inherited_packages,
+            loaded: scope.loaded_packages,
+            attached: scope.attached_packages,
+        }
+    }
+
+    fn view(&self) -> ScopePackages<'_> {
+        ScopePackages {
+            inherited: &self.inherited,
+            loaded: &self.loaded,
+            attached: &self.attached,
+        }
+    }
+}
+
+/// The package sets of a scope: all a collector reads of the scope at a use
+/// once the name is known to be unresolved.
+#[derive(Clone, Copy)]
+struct ScopePackages<'a> {
+    inherited: &'a HashSet<String>,
+    loaded: &'a HashSet<String>,
+    attached: &'a HashSet<String>,
+}
+
+impl<'a> ScopePackages<'a> {
+    fn of(scope: &'a scope::ScopeAtPosition) -> Self {
+        Self {
+            inherited: &scope.inherited_packages,
+            loaded: &scope.loaded_packages,
+            attached: &scope.attached_packages,
+        }
+    }
+}
+
 /// Compute diagnostics from a pre-built snapshot (no lock held).
 ///
 /// This is the main entry point for debounced diagnostics.
@@ -2344,6 +2446,18 @@ pub(crate) fn diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
     cancel: &DiagCancelToken,
+) -> Option<Vec<Diagnostic>> {
+    diagnostics_from_snapshot_counting(snapshot, uri, cancel, &mut PassScopeCounts::default())
+}
+
+/// [`diagnostics_from_snapshot`], also reporting in `scope_counts` the scopes
+/// the pass kept. The counts stay zero when the pass ends before its scope
+/// collectors finish.
+fn diagnostics_from_snapshot_counting(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+    scope_counts: &mut PassScopeCounts,
 ) -> Option<Vec<Diagnostic>> {
     let start = std::time::Instant::now();
 
@@ -2598,8 +2712,8 @@ pub(crate) fn diagnostics_from_snapshot(
         return None;
     }
 
-    // Shared scope cache for expensive collectors
-    let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
+    // Scopes the two expensive collectors share
+    let mut scopes = PassScopes::new();
 
     let scope_start = std::time::Instant::now();
 
@@ -2610,7 +2724,7 @@ pub(crate) fn diagnostics_from_snapshot(
         snapshot.tree.root_node(),
         &snapshot.text,
         &mut diagnostics,
-        &mut scope_cache,
+        &mut scopes,
         cancel,
         if track_unused {
             Some(&mut suppressed_pairs)
@@ -2636,7 +2750,7 @@ pub(crate) fn diagnostics_from_snapshot(
             &snapshot.text,
             severity,
             &mut diagnostics,
-            &mut scope_cache,
+            &mut scopes,
             cancel,
             if track_unused {
                 Some(&mut suppressed_pairs)
@@ -2654,11 +2768,13 @@ pub(crate) fn diagnostics_from_snapshot(
         return None;
     }
 
+    *scope_counts = PassScopeCounts::of(&scopes);
     log::trace!(
-        "Diagnostics computed in {}ms (scope resolution: {}ms, {} scope cache entries)",
+        "Diagnostics computed in {}ms (scope resolution: {}ms, {} scope cache entries, {} package-only entries)",
         start.elapsed().as_millis(),
         scope_start.elapsed().as_millis(),
-        scope_cache.len(),
+        scope_counts.full,
+        scope_counts.use_packages,
     );
 
     // F2 Step 4: range- and file-level suppressions (`# raven: ignore-start/end`,
@@ -6615,6 +6731,20 @@ pub fn diagnostics_via_snapshot_profile(
     (t_build, t_diag, outcome)
 }
 
+/// [`diagnostics_via_snapshot`], with the scopes the pass kept (issue #898).
+/// `None` when `uri` has no snapshot or the pass was cancelled.
+#[cfg(any(test, feature = "test-support"))]
+pub fn diagnostics_via_snapshot_scope_counts(
+    state: &WorldState,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> Option<(Vec<Diagnostic>, PassScopeCounts)> {
+    let snapshot = DiagnosticsSnapshot::build(state, uri)?;
+    let mut counts = PassScopeCounts::default();
+    let diagnostics = diagnostics_from_snapshot_counting(&snapshot, uri, cancel, &mut counts)?;
+    Some((diagnostics, counts))
+}
+
 /// Compute diagnostics for the document at the given URI.
 ///
 /// Performs a full set of checks for the specified open document and returns collected diagnostics.
@@ -8936,7 +9066,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     node: Node,
     text: &str,
     diagnostics: &mut Vec<Diagnostic>,
-    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+    scopes: &mut PassScopes,
     cancel: &DiagCancelToken,
     mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
@@ -9120,12 +9250,12 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         }
         let key = (source.line, source.column);
         source_scope_symbols.entry(key).or_insert_with(|| {
-            let s = scope_cache
-                .entry(key)
-                .or_insert_with(|| snapshot.get_scope(uri, key.0, key.1, cancel));
+            let s = full_pass_scope(scopes, key, || {
+                snapshot.get_scope(uri, key.0, key.1, cancel)
+            });
             // Build a slimmed map of (symbol_name → source_uri) for the
             // defense-in-depth `inherited` check. Cloning just the URI
-            // avoids holding borrows on `scope_cache`.
+            // avoids holding borrows on `scopes`.
             s.symbols
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.source_uri.clone()))
@@ -9182,9 +9312,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             stream.advance_to(*usage_line, *usage_col);
             stream.is_visible(name)
         } else {
-            let scope = scope_cache
-                .entry((*usage_line, *usage_col))
-                .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+            let scope = full_pass_scope(scopes, (*usage_line, *usage_col), || {
+                snapshot.get_scope(uri, *usage_line, *usage_col, cancel)
+            });
             scope.symbols.contains_key(name.as_str())
         };
         let default_eof_source_uri = default_expression
@@ -9348,24 +9478,34 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // emit a false "used before available" that the undefined-variable
             // collector already suppresses. Resolved lazily here — only at the
             // rare would-fire point, not per usage — so the streaming fast path
-            // stays cheap; `get_scope` is memoized in `scope_cache`.
+            // stays cheap. Only the scope's package sets are kept, for the
+            // undefined-variable collector to read at this same use (see
+            // `PassScopes`).
             // Position-awareness AND the load_all out-of-root sentinel gate both
             // come for free from `get_scope`'s `ScopeContributions`.
             if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
-                let scope = scope_cache
-                    .entry((*usage_line, *usage_col))
-                    .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
-                let pkgs: Vec<String> = scope
-                    .inherited_packages
+                let key = (*usage_line, *usage_col);
+                let kept = scopes.entry(key).or_default();
+                let packages = match &kept.full {
+                    Some(scope) => ScopePackages::of(scope),
+                    None => kept
+                        .packages
+                        .get_or_insert_with(|| {
+                            UsePackages::of(snapshot.get_scope(uri, key.0, key.1, cancel))
+                        })
+                        .view(),
+                };
+                let pkgs: Vec<String> = packages
+                    .inherited
                     .iter()
-                    .chain(scope.loaded_packages.iter())
+                    .chain(packages.loaded.iter())
                     .chain(snapshot.scope_contribution.full_imports.iter())
                     .cloned()
                     .collect();
                 if !pkgs.is_empty() && is_package_export(name, &pkgs, &snapshot.package_library) {
                     break;
                 }
-                if attached_outside_active_renv_exports(snapshot, name, &scope.attached_packages) {
+                if attached_outside_active_renv_exports(snapshot, name, packages.attached) {
                     break;
                 }
             }
@@ -10056,7 +10196,7 @@ fn collect_undefined_variables_from_snapshot(
     text: &str,
     severity: DiagnosticSeverity,
     diagnostics: &mut Vec<Diagnostic>,
-    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+    scopes: &mut PassScopes,
     cancel: &DiagCancelToken,
     mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
@@ -10221,10 +10361,7 @@ fn collect_undefined_variables_from_snapshot(
         .unwrap_or_default();
 
     let parent_symbol_names: HashSet<String> = {
-        scope_cache
-            .entry((0, 0))
-            .or_insert_with(|| snapshot.get_scope(uri, 0, 0, cancel));
-        let scope_0_0 = scope_cache.get(&(0, 0)).unwrap();
+        let scope_0_0 = full_pass_scope(scopes, (0, 0), || snapshot.get_scope(uri, 0, 0, cancel));
         // Only include symbols from OTHER files. When a parent sources this file,
         // the file's own exports flow into the parent's scope and back here via
         // backward edges. Including those would suppress forward-reference diagnostics.
@@ -10418,7 +10555,13 @@ fn collect_undefined_variables_from_snapshot(
             // Advance the stream cursor and query visibility. Fall back to
             // the legacy snapshot.get_scope path if stream construction
             // failed (no artifacts for the queried URI).
-            let scope = if let Some(stream) = stream_opt.as_mut() {
+            //
+            // `symbols` is the scope's symbol map wherever the checks below
+            // look a name up in it: in the no-stream fallback and at a
+            // replacement call. `packages` is the scope's package sets.
+            let key = (usage_line, usage_col_utf16);
+            let transient;
+            let (symbols, packages) = if let Some(stream) = stream_opt.as_mut() {
                 stream.advance_to(usage_line, usage_col_utf16);
                 // Fast path: if the symbol is visible AND not a forward
                 // reference in the same file, skip the diagnostic. The
@@ -10441,28 +10584,47 @@ fn collect_undefined_variables_from_snapshot(
                 {
                     continue;
                 }
-                // Slow path: name is undefined or forward-referenced. We
-                // need the full ScopeAtPosition for the package checks
-                // below. Materialize once via `snapshot()` and store in
-                // `scope_cache` so repeat lookups (rare; same usage twice)
-                // are free, AND so the out-of-scope collector can read the
-                // populated entry if it runs over the same positions.
-                let entry = scope_cache.entry((usage_line, usage_col_utf16));
-                entry.or_insert_with(|| stream.snapshot())
+                // Slow path: name is undefined or forward-referenced. The
+                // package checks below need the scope's package sets, and a
+                // replacement call needs its symbols. Nothing built here is
+                // kept: a file can have thousands of these uses (see
+                // `PassScopes`).
+                //
+                // A scope the pass already holds at this position answers
+                // first. It came from the point resolver (`get_scope`), in the
+                // out-of-scope collector or at the start of the file.
+                let kept = scopes.get(&key);
+                if let Some(scope) = kept.and_then(|kept| kept.full.as_deref()) {
+                    (Some(&scope.symbols), ScopePackages::of(scope))
+                } else if let Some(recorded) = kept.and_then(|kept| kept.packages.as_ref()) {
+                    if replacement_function_name.is_some() {
+                        transient = snapshot.get_scope(uri, key.0, key.1, cancel);
+                        (Some(&transient.symbols), recorded.view())
+                    } else {
+                        (None, recorded.view())
+                    }
+                } else if replacement_function_name.is_some() {
+                    transient = stream.snapshot();
+                    (Some(&transient.symbols), ScopePackages::of(&transient))
+                } else {
+                    transient = stream.package_snapshot();
+                    (None, ScopePackages::of(&transient))
+                }
             } else {
                 // No artifacts → fall back to the legacy path. This branch
                 // is rare (it happens only for files that aren't open or
                 // indexed), and matches the pre-Stage-2 behavior.
-                scope_cache
-                    .entry((usage_line, usage_col_utf16))
-                    .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col_utf16, cancel))
+                let scope = full_pass_scope(scopes, key, || {
+                    snapshot.get_scope(uri, key.0, key.1, cancel)
+                });
+                (Some(&scope.symbols), ScopePackages::of(scope))
             };
 
             // For the no-stream fall-back path we still need to apply the
             // forward-reference check (the stream path applied it above
             // before the snapshot materialization).
             if stream_opt.is_none()
-                && let Some(sym) = scope.symbols.get(name.as_str())
+                && let Some(sym) = symbols.and_then(|symbols| symbols.get(name.as_str()))
                 && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
             {
                 continue;
@@ -10470,7 +10632,7 @@ fn collect_undefined_variables_from_snapshot(
             if stream_opt.is_none()
                 && let Some(sym) = unquoted_usage_name
                     .as_deref()
-                    .and_then(|unquoted| scope.symbols.get(unquoted))
+                    .and_then(|unquoted| symbols.and_then(|symbols| symbols.get(unquoted)))
                 && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
             {
                 continue;
@@ -10480,11 +10642,11 @@ fn collect_undefined_variables_from_snapshot(
                 .map(|name| format!("`{name}`"));
             let replacement_symbol = replacement_function_name
                 .as_deref()
-                .and_then(|name| scope.symbols.get(name))
+                .and_then(|name| symbols.and_then(|symbols| symbols.get(name)))
                 .or_else(|| {
                     replacement_backtick_name
                         .as_deref()
-                        .and_then(|name| scope.symbols.get(name))
+                        .and_then(|name| symbols.and_then(|symbols| symbols.get(name)))
                 });
             if let Some(sym) = replacement_symbol
                 && (stream_opt
@@ -10521,10 +10683,10 @@ fn collect_undefined_variables_from_snapshot(
             if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
                 position_aware_packages_buf.clear();
                 position_aware_packages_buf.extend(
-                    scope
-                        .inherited_packages
+                    packages
+                        .inherited
                         .iter()
-                        .chain(scope.loaded_packages.iter())
+                        .chain(packages.loaded.iter())
                         .chain(snapshot.scope_contribution.full_imports.iter())
                         .cloned(),
                 );
@@ -10539,11 +10701,7 @@ fn collect_undefined_variables_from_snapshot(
                 ) {
                     continue;
                 }
-                if attached_outside_active_renv_exports(
-                    snapshot,
-                    export_name,
-                    &scope.attached_packages,
-                ) {
+                if attached_outside_active_renv_exports(snapshot, export_name, packages.attached) {
                     continue;
                 }
 
@@ -10551,7 +10709,7 @@ fn collect_undefined_variables_from_snapshot(
                     &package_loader_call_end_offsets,
                     usage_node.start_byte(),
                 );
-                let has_cross_file_packages = !scope.inherited_packages.is_empty();
+                let has_cross_file_packages = !packages.inherited.is_empty();
                 // A package is "pending" only when it is installed but its exports have
                 // not yet been loaded into cache — not when it is simply not installed.
                 // Using package_exists() guards against treating a permanently-missing
@@ -10584,8 +10742,8 @@ fn collect_undefined_variables_from_snapshot(
                 if snapshot.cross_file_config.packages_enabled
                     && !snapshot.package_library_ready
                     && is_function_call_identifier_textually(usage_node, text)
-                    && (!scope.loaded_packages.is_empty()
-                        || !scope.inherited_packages.is_empty()
+                    && (!packages.loaded.is_empty()
+                        || !packages.inherited.is_empty()
                         || has_prior_library_call)
                 {
                     continue;
@@ -67444,6 +67602,203 @@ y <- x"#;
             "snapshot path: x referenced inside f() must be flagged when \
              rm(x) precedes the function definition; got: {:?}",
             snap_messages
+        );
+    }
+}
+
+/// How many scopes a diagnostics pass keeps (issue #898). A full scope copies
+/// every visible symbol, so a pass that kept one per unresolved use took about
+/// 1.3 MB for each undefined name. These count what the pass kept, which is
+/// exact, rather than measuring memory.
+#[cfg(test)]
+mod pass_scope_retention_tests {
+    use super::{DiagCancelToken, PassScopeCounts, diagnostics_via_snapshot_scope_counts};
+    use crate::package_library::PackageInfo;
+    use crate::state::{Document, WorldState};
+    use std::collections::HashSet;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, Url};
+
+    const USES: usize = 256;
+
+    /// A scanned workspace of `files`, the first of which is diagnosed.
+    fn state_with(files: &[(&str, &str)]) -> (WorldState, Url) {
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+        for (name, code) in files {
+            let uri = Url::parse(&format!("file:///workspace/{name}")).unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                &uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+        let main = Url::parse(&format!("file:///workspace/{}", files[0].0)).unwrap();
+        (state, main)
+    }
+
+    /// The pass's messages, sorted, and the scopes it kept.
+    fn run(state: &WorldState, uri: &Url) -> (Vec<String>, PassScopeCounts) {
+        let (diagnostics, counts) =
+            diagnostics_via_snapshot_scope_counts(state, uri, &DiagCancelToken::never())
+                .expect("the pass completes");
+        let mut messages: Vec<String> = diagnostics.into_iter().map(|d| d.message).collect();
+        messages.sort();
+        (messages, counts)
+    }
+
+    fn sorted(mut messages: Vec<String>) -> Vec<String> {
+        messages.sort();
+        messages
+    }
+
+    /// One undefined name per line, each assigned to a new variable: the
+    /// issue's reproduction. The only full scope left is the one at the start
+    /// of the file. Before the fix the pass kept one more for every use.
+    #[test]
+    fn undefined_names_keep_no_scope_each() {
+        let code: String = (0..USES)
+            .map(|i| format!("y{i} <- undefined_name_{i}\n"))
+            .collect();
+        let expected = sorted(
+            (0..USES)
+                .map(|i| format!("undefined_name_{i} is not defined"))
+                .collect(),
+        );
+        for packages in [true, false] {
+            let (mut state, uri) = state_with(&[("a.R", &code)]);
+            state.cross_file_config.packages_enabled = packages;
+            state.package_library_ready = packages;
+            let (messages, counts) = run(&state, &uri);
+            assert_eq!(messages, expected, "packages enabled: {packages}");
+            assert_eq!(
+                counts,
+                PassScopeCounts {
+                    full: 1,
+                    use_packages: 0
+                },
+                "packages enabled: {packages}"
+            );
+        }
+    }
+
+    /// A replacement call (`f(x) <- v`) whose getter is undefined reads its
+    /// setter from a full scope. That scope is dropped after the lookup, and
+    /// the setter still resolves the call.
+    #[test]
+    fn replacement_calls_keep_no_scope_each() {
+        let mut code = String::from("`setter<-` <- function(x, value) x\nx <- 1\n");
+        for i in 0..USES {
+            code.push_str(&format!("setter(x) <- {i}\n"));
+        }
+        code.push_str("missing_setter(x) <- 1\n");
+        let (state, uri) = state_with(&[("a.R", &code)]);
+        let (messages, counts) = run(&state, &uri);
+        assert_eq!(messages, ["missing_setter is not defined"]);
+        assert_eq!(
+            counts,
+            PassScopeCounts {
+                full: 1,
+                use_packages: 0
+            }
+        );
+    }
+
+    /// Uses of a name that a later `source()` defines. Each gets both
+    /// diagnostics, as before the fix, and the pass keeps the package sets of
+    /// the scope at each use for the second collector. The two full scopes are
+    /// the ones at the start of the file and at the `source()` call. Before
+    /// the fix the pass kept a full scope at every use as well.
+    #[test]
+    fn uses_before_a_later_source_keep_package_sets_only() {
+        let mut code: String = (0..USES).map(|i| format!("y{i} <- later\n")).collect();
+        code.push_str("source(\"provider.R\")\n");
+        let (mut state, uri) = state_with(&[("a.R", &code), ("provider.R", "later <- 1\n")]);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        let (messages, counts) = run(&state, &uri);
+        let mut expected = vec![
+            format!(
+                "'later' is used before it's available (sourced on line {})",
+                USES + 1
+            );
+            USES
+        ];
+        expected.extend(vec!["later is not defined".to_string(); USES]);
+        assert_eq!(messages, sorted(expected));
+        assert_eq!(
+            counts,
+            PassScopeCounts {
+                full: 2,
+                use_packages: USES
+            }
+        );
+    }
+
+    /// The package sets kept at a use answer the second collector as the full
+    /// scope did. `shared` is exported by an attached package and by a file
+    /// sourced later, so the first collector resolves each use through the
+    /// package and the second must find the package again: no diagnostic.
+    #[tokio::test]
+    async fn kept_package_sets_resolve_a_package_export() {
+        let mut code = String::from("library(lender)\n");
+        for i in 0..USES {
+            code.push_str(&format!("y{i} <- shared\n"));
+        }
+        code.push_str("source(\"provider.R\")\n");
+        let (mut state, uri) = state_with(&[("a.R", &code), ("provider.R", "shared <- 1\n")]);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "lender".to_string(),
+                HashSet::from(["shared".to_string()]),
+            ))
+            .await;
+        let (messages, counts) = run(&state, &uri);
+        assert_eq!(messages, Vec::<String>::new());
+        assert_eq!(
+            counts,
+            PassScopeCounts {
+                full: 2,
+                use_packages: USES
+            }
+        );
+    }
+
+    /// A replacement call at a use whose package sets were kept looks its
+    /// setter up in the point scope again. Here the getter comes from a later
+    /// `source()` and the setter is defined above the call, so the call is
+    /// used before it is available but is not undefined.
+    #[test]
+    fn replacement_call_at_a_kept_use_finds_its_setter() {
+        let code = "\
+`shape<-` <- function(x, value) x
+x <- 1
+shape(x) <- 2
+source(\"provider.R\")
+";
+        let (mut state, uri) =
+            state_with(&[("a.R", code), ("provider.R", "shape <- function(x) x\n")]);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        let (messages, counts) = run(&state, &uri);
+        assert_eq!(
+            messages,
+            ["'shape' is used before it's available (sourced on line 4)"]
+        );
+        assert_eq!(
+            counts,
+            PassScopeCounts {
+                full: 2,
+                use_packages: 1
+            }
         );
     }
 }
