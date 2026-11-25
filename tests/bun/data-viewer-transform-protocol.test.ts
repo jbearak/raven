@@ -5,7 +5,7 @@
  * termination, reader restart and re-seed).
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, unlinkSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -449,6 +449,38 @@ describe('WorkerEngine: thread lifecycles', () => {
         expect(await c.install(t)).toBe(true);
         const rows = await engine.getRows({ start: 0, end: 5, columns: [0], viewportGeneration: 1 }, t.gen);
         expect(rows.rows.map(r => r[0])).toEqual([5, 4, 3, 2, 1]);
+    }, 30_000);
+
+    test('a crashed thread whose file is gone restarts once, not forever', async () => {
+        // The 24 h sweep from another window can delete a live panel's file.
+        const dir = mkdtempSync(join(tmpdir(), 'raven-dv-gone-'));
+        const path = join(dir, 'tiny.arrow');
+        copyFileSync(TINY, path);
+        engine = await start(path, 5);
+        unlinkSync(path);
+        await engine.scan.crashForTest();
+        await Bun.sleep(1500);
+        // The replacement can't open the file, posts openFailed and exits;
+        // it is not restarted again.
+        expect(engine.scan.restarts).toBe(1);
+        const err = await engine.compute({ sort: SORT_X_DESC }).then(() => undefined, e => e);
+        expect(err).toBeInstanceOf(Error);
+    }, 30_000);
+
+    test('a request issued while a cancel restarts onto a deleted file is rejected, not left waiting', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'raven-dv-gone-'));
+        const path = join(dir, 'tiny.arrow');
+        copyFileSync(TINY, path);
+        engine = await start(path, 5);
+        unlinkSync(path);
+        // A cancel or deadline terminates the scan thread and starts a
+        // replacement, which cannot open the deleted file. A request
+        // issued meanwhile waits for the restart, then must fail.
+        const restarted = engine.scan.terminateAndRestart(undefined, new Error('cancelled'));
+        const waiting = engine.compute({ sort: SORT_X_DESC }).then(() => undefined, e => e);
+        await restarted;
+        const err = await Promise.race([waiting, Bun.sleep(3000).then(() => 'still waiting')]);
+        expect(err).toBeInstanceOf(Error);
     }, 30_000);
 
     test('a request naming a generation the reader does not hold is a protocol error', async () => {

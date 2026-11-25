@@ -374,4 +374,39 @@ describe('selection summary', () => {
         await wait(50);
         expect(renders()).toBe(before);
     });
+
+    // Click row 1's number, then Shift-click row 1,000,000: a row
+    // selection too large to spread into Math.min / Math.max as arguments
+    // (V8, the webview's engine, overflows its stack at 300,000; bun's
+    // JavaScriptCore by 1,000,000).
+    test('a 1,000,000-row selection shows its cell count and copies its bounds', async () => {
+        const { CompactSelection } = await import('@glideapps/glide-data-grid');
+        const { posted } = await renderApp();
+        await send(init({ nrow: 2_000_000 }));
+        await wait(20);
+        const select = (rows: InstanceType<typeof CompactSelection>) => act(() => {
+            gridProps().onGridSelectionChange({ columns: CompactSelection.empty(), rows, current: undefined });
+        });
+        select(CompactSelection.fromSingleSelection([0, 1_000_000]));
+        // Three data columns; past the summary's cell cap, so no Σ.
+        expect(document.querySelector('.status-line-selection')?.textContent).toBe('3,000,000 cells');
+        posted.length = 0;
+        key('c', { meta: true });
+        expect(posted.find(m => m.type === 'copy').range).toMatchObject({ rowStart: 0, rowEnd: 1_000_000 });
+        // A gap: the count is the selected rows, the copy spans the bounds.
+        select(CompactSelection.fromSingleSelection([0, 1_000_000]).add([1_500_000, 1_600_000]));
+        expect(document.querySelector('.status-line-selection')?.textContent).toBe('3,300,000 cells');
+        posted.length = 0;
+        key('c', { meta: true });
+        expect(posted.find(m => m.type === 'copy').range).toMatchObject({ rowStart: 0, rowEnd: 1_600_000 });
+    });
 });
+
+/** The glide DataEditor's props, found by walking up React's fiber tree
+ *  from the grid's canvas. */
+function gridProps(): any {
+    const canvas = document.querySelector('canvas')!;
+    let fiber = Object.entries(canvas).find(([k]) => k.startsWith('__reactFiber$'))![1] as any;
+    while (fiber && !fiber.memoizedProps?.onGridSelectionChange) fiber = fiber.return;
+    return fiber.memoizedProps;
+}

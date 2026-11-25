@@ -19,7 +19,7 @@
 import type { ColumnSchema } from '../arrow-reader';
 import type { FilterPredicate, HistogramBin } from '../messages';
 import type { ColumnProfile, CountedEntry, Estimate, ProfileState } from '../profile';
-import type { Cell } from '../wire-format';
+import { encodeDate, type Cell } from '../wire-format';
 import { displayTypeTag } from '../display-format';
 
 /** Height of the summary band under the header text. */
@@ -234,7 +234,8 @@ export function setFilterFor(
     if (kind === 'date') {
         // One date: an equality the date filter evaluates exactly.
         if (entries.length !== 1) return undefined;
-        return { kind: 'dateCompare', op: '=', value: isoDay(entries[0].value as number) };
+        const day = isoDay(entries[0].value as number);
+        return day === undefined ? undefined : { kind: 'dateCompare', op: '=', value: day };
     }
     if (kind === 'factor') {
         return {
@@ -251,8 +252,12 @@ export function setFilterFor(
     return { kind: 'setIn', values: entries.map(e => String(e.value)) };
 }
 
-function isoDay(days: number): string {
-    return new Date(days * 86_400_000).toISOString().slice(0, 10);
+/** A day count as an ISO date `Date.parse` reads back (`+010000-01-01`
+ *  past year 9999), or undefined outside JavaScript's Date range. */
+function isoDay(days: number): string | undefined {
+    const d = new Date(days * 86_400_000);
+    if (Number.isNaN(d.getTime())) return undefined;
+    return d.toISOString().split('T')[0];
 }
 
 /** A counted value as a wire cell, so it formats like the grid. */
@@ -266,7 +271,8 @@ export function entryCell(col: ColumnSchema, kind: ColumnProfile['kind'], value:
             const ms = Math.floor(value / 1000);
             return { _: 'ts', ms, us: value - ms * 1000 };
         }
-        return { _: 'date', v: isoDay(value) };
+        // Range-checked as in the grid: `<out of range>` past ±1e8 days.
+        return encodeDate(value);
     }
     return value as Cell;
 }

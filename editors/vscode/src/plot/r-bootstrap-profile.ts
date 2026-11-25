@@ -581,6 +581,12 @@ local({
         # would not fit.
         expr_text <- tryCatch(deparse1(substitute(x), collapse = "\n", backtick = TRUE),
                               error = function(e) "")
+        # Refresh re-runs the expression at the console prompt, in the
+        # global environment. Called from any other frame (a function,
+        # local(), with(), a magrittr pipe's \`.\`), it may name a different
+        # object there, so send none: Refresh and Copy as R code then say
+        # there is no expression. Sourced code and |> run in globalenv.
+        if (!identical(parent.frame(), globalenv())) expr_text <- ""
 
         # Type dispatch: matrix and data.frame are tested first (a
         # data.frame is also a list). Then an atomic / factor /

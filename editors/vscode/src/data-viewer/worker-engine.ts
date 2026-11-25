@@ -78,6 +78,8 @@ class ThreadClient {
     private nextId = 1;
     /** Workers terminated on purpose; their `exit` is not a crash. */
     private readonly retired = new WeakSet<Worker>();
+    /** Workers that posted `ready` (opened the file). */
+    private readonly opened = new WeakSet<Worker>();
     private disposed = false;
     /** Seeds a fresh thread before re-issued requests run. `call` here
      *  bypasses the seeded gate. */
@@ -110,7 +112,7 @@ class ThreadClient {
                 if (m.type !== 'ready' && m.type !== 'openFailed') return;
                 w.off('message', onMsg);
                 w.off('exit', onEarlyExit);
-                if (m.type === 'ready') resolve();
+                if (m.type === 'ready') { this.opened.add(w); resolve(); }
                 else reject(new Error(m.error));
             };
             w.on('message', onMsg);
@@ -140,6 +142,13 @@ class ThreadClient {
 
     private async onExit(w: Worker, code: number): Promise<void> {
         if (this.worker !== w || this.disposed || this.retired.has(w)) return;
+        // A thread that never opened the file (gone, say, after the stale
+        // sweep) would fail the same way again: its failed start already
+        // rejected the waiting requests, so stop rather than loop.
+        if (!this.opened.has(w)) {
+            this.log(`${this.name} thread exited (${code}) before it was ready; not restarting`);
+            return;
+        }
         this.log(`${this.name} thread exited (${code}); restarting`);
         await this.restartAndReissue(this.reissueAllOnCrash);
     }
@@ -191,6 +200,11 @@ class ThreadClient {
         opts: { onProgress?: (v: unknown) => void; reissue?: boolean; onId?: (id: number) => void } = {},
     ): Promise<T> {
         if (this.disposed) return Promise.reject(abortError(`${this.name} thread disposed`));
+        // A thread that never opened its file is not restarted (see
+        // onExit) and would never answer.
+        if (!this.worker || !this.opened.has(this.worker)) {
+            return Promise.reject(restartError(`${this.name} thread did not open its file`));
+        }
         const id = this.nextId++;
         opts.onId?.(id);
         const full = { ...msg, id };
