@@ -26,13 +26,16 @@ export const HAS_CHUNKS_CONTEXT = 'raven.editorHasChunks';
 
 /** Whether `document` has a chunk the navigation commands can move to. */
 export function has_navigable_chunks(document: vscode.TextDocument): boolean {
-    return supports_chunk_navigation(document) && chunks_for_document(document).length > 0;
+    // The keybindings fire only in these languages; don't scan other files.
+    if (!['r', 'rmd', 'quarto'].includes(document.languageId)) return false;
+    return chunks_for_document(document).length > 0;
 }
 
 /**
  * Keep {@link HAS_CHUNKS_CONTEXT} in step with the active editor: at once on
- * an editor switch, and shortly after an edit to its document (adding or
- * removing a `# %%` marker or fence changes it).
+ * an editor switch or a language-mode change (VS Code reopens the document),
+ * and shortly after an edit to its document (adding or removing a `# %%`
+ * marker or fence changes it).
  */
 function track_chunk_context(context: vscode.ExtensionContext): void {
     let current: boolean | undefined;
@@ -49,6 +52,7 @@ function track_chunk_context(context: vscode.ExtensionContext): void {
     update();
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(update),
+        vscode.workspace.onDidOpenTextDocument(update),
         vscode.workspace.onDidChangeTextDocument((e) => {
             if (e.document !== vscode.window.activeTextEditor?.document) return;
             if (pending !== undefined) clearTimeout(pending);

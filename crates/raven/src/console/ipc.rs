@@ -32,9 +32,10 @@
 //! ← {"id":11,"status":"ok"}                            // session exists
 //! ```
 //!
-//! A `subscribe` made while R is stopped in the debugger is followed by that
-//! stop's `stopped` event, so an editor that connects (or reconnects to a
-//! persistent console) after the stop still attaches. A `breakpoints` mirror
+//! A `subscribe` made while R is stopped in the debugger, with no debug
+//! session showing the stop, is followed by that stop's `stopped` event, so
+//! an editor that connects (or reconnects to a persistent console) after the
+//! stop still attaches. A `breakpoints` mirror
 //! is answered `not-ready` while R is starting (the console pushes `ready`
 //! once the debugger runs) and `unavailable` when the debugger will never
 //! run in this console; a client should stop resending it then. Clients
@@ -213,7 +214,7 @@ fn serve(
                     // recorded after it is pushed once this subscriber is in
                     // the list. Either way the editor hears of it.
                     let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
-                    let replayed = match super::dap::stop_reason() {
+                    let replayed = match super::dap::unattended_stop_reason() {
                         Some(reason) => {
                             let line = serde_json::json!({"event": "stopped", "reason": reason});
                             push.write_all(format!("{line}\n").as_bytes()).is_ok()

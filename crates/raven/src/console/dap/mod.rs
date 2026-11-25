@@ -314,10 +314,16 @@ pub fn unavailable() -> bool {
     INIT_SETTLED.load(Ordering::SeqCst) && !ready()
 }
 
-/// Why R is stopped in the debugger, if it is (callable from any thread).
-pub fn stop_reason() -> Option<String> {
+/// Why R is stopped in the debugger, if it is and no live debug session
+/// shows the stop (callable from any thread). A session another window
+/// holds is left alone.
+pub fn unattended_stop_reason() -> Option<String> {
     let h = handle()?;
-    lock(h).stop.as_ref().map(|s| s.reason.clone())
+    let s = lock(h);
+    if s.connected && !s.ended {
+        return None;
+    }
+    s.stop.as_ref().map(|st| st.reason.clone())
 }
 
 /// The debugger is running in this console.

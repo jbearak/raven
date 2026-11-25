@@ -78,6 +78,16 @@ const ending = new Set<string>();
 const links = new Map<string, ConsoleLink>();
 /** Consoles a session is being started for (a stop can be heard twice). */
 const attaching = new Set<string>();
+/**
+ * Launches (F5, launch.json, Raven commands) still choosing their console,
+ * and the consoles they chose, until their session starts. A stop heard
+ * meanwhile is theirs to show: F5 can reattach a stopped persistent console,
+ * whose subscription then replays the stop. The console replays it to the
+ * launch's session too.
+ */
+let launches_resolving = 0;
+const launch_claims = new Set<string>();
+const LAUNCH_CLAIM_MS = 10_000;
 
 function wait_for_file(file: string, ms: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -473,7 +483,7 @@ async function auto_attach(ipc: string): Promise<void> {
         return;
     }
     // A stop replayed on subscribe can arrive next to the same stop's push.
-    if (attaching.has(ipc)) return;
+    if (attaching.has(ipc) || launches_resolving > 0 || launch_claims.has(ipc)) return;
     attaching.add(ipc);
     try {
         await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
@@ -560,50 +570,67 @@ async function inspect_last_error(): Promise<void> {
 
 const configuration_provider: vscode.DebugConfigurationProvider = {
     async resolveDebugConfiguration(_folder, config) {
-        if (!debugger_enabled()) {
-            void vscode.window.showInformationMessage(
-                'Raven: the R debugger is turned off (raven.debugger.enabled).',
-            );
-            return undefined;
-        }
-        if (!config.type && !config.request) {
-            // F5 with no launch.json: source the open R script, if any.
-            const doc = vscode.window.activeTextEditor?.document;
-            config = doc && doc.uri.scheme === 'file' && /\.r$/i.test(doc.uri.fsPath)
-                ? { type: DEBUG_TYPE, request: 'launch', name: 'Source R file', program: doc.uri.fsPath }
-                : { type: DEBUG_TYPE, request: 'launch', name: 'R console' };
-        }
-        if (config.request === 'launch' && config.program) {
-            if (config.program === '${file}') {
-                config.program = vscode.window.activeTextEditor?.document.uri.fsPath;
-                if (!config.program) {
-                    void vscode.window.showErrorMessage('Raven: no R file is open to run.');
-                    return undefined;
-                }
+        const ipc: unknown = config.consoleSocket;
+        if (typeof ipc === 'string' && attaching.has(ipc)) return resolve_configuration(config);
+        launches_resolving++;
+        try {
+            const resolved = await resolve_configuration(config);
+            const chosen: unknown = resolved?.consoleSocket;
+            if (typeof chosen === 'string') {
+                launch_claims.add(chosen);
+                setTimeout(() => launch_claims.delete(chosen), LAUNCH_CLAIM_MS);
             }
-            const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === config.program);
-            if (open?.isDirty && !(await open.save())) return undefined;
+            return resolved;
+        } finally {
+            launches_resolving--;
         }
-        config.justMyCode ??= just_my_code();
-        if (!config.consoleSocket) {
-            const ipc = await choose_console();
-            if (!ipc) {
-                void vscode.window.showErrorMessage(
-                    "Raven: the R debugger needs Raven's R console, and it couldn't open one.",
-                );
-                return undefined;
-            }
-            config.consoleSocket = ipc;
-        }
-        if (!(await wait_for_file(dap_socket_for(config.consoleSocket), SOCKET_WAIT_MS))) {
-            void vscode.window.showErrorMessage(
-                "Raven: this R console wasn't started with the debugger. Close it and open a new R console.",
-            );
-            return undefined;
-        }
-        return config;
     },
 };
+
+async function resolve_configuration(config: vscode.DebugConfiguration): Promise<vscode.DebugConfiguration | undefined> {
+    if (!debugger_enabled()) {
+        void vscode.window.showInformationMessage(
+            'Raven: the R debugger is turned off (raven.debugger.enabled).',
+        );
+        return undefined;
+    }
+    if (!config.type && !config.request) {
+        // F5 with no launch.json: source the open R script, if any.
+        const doc = vscode.window.activeTextEditor?.document;
+        config = doc && doc.uri.scheme === 'file' && /\.r$/i.test(doc.uri.fsPath)
+            ? { type: DEBUG_TYPE, request: 'launch', name: 'Source R file', program: doc.uri.fsPath }
+            : { type: DEBUG_TYPE, request: 'launch', name: 'R console' };
+    }
+    if (config.request === 'launch' && config.program) {
+        if (config.program === '${file}') {
+            config.program = vscode.window.activeTextEditor?.document.uri.fsPath;
+            if (!config.program) {
+                void vscode.window.showErrorMessage('Raven: no R file is open to run.');
+                return undefined;
+            }
+        }
+        const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === config.program);
+        if (open?.isDirty && !(await open.save())) return undefined;
+    }
+    config.justMyCode ??= just_my_code();
+    if (!config.consoleSocket) {
+        const ipc = await choose_console();
+        if (!ipc) {
+            void vscode.window.showErrorMessage(
+                "Raven: the R debugger needs Raven's R console, and it couldn't open one.",
+            );
+            return undefined;
+        }
+        config.consoleSocket = ipc;
+    }
+    if (!(await wait_for_file(dap_socket_for(config.consoleSocket), SOCKET_WAIT_MS))) {
+        void vscode.window.showErrorMessage(
+            "Raven: this R console wasn't started with the debugger. Close it and open a new R console.",
+        );
+        return undefined;
+    }
+    return config;
+}
 
 const descriptor_factory: vscode.DebugAdapterDescriptorFactory = {
     createDebugAdapterDescriptor(session) {
@@ -657,11 +684,6 @@ export function register_debugger_unavailable(context: vscode.ExtensionContext):
                 return undefined;
             },
         }),
-        vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
-            createDebugAdapterDescriptor() {
-                throw new Error(why);
-            },
-        }),
     );
 }
 
@@ -683,6 +705,7 @@ export function register_debugger(context: vscode.ExtensionContext): void {
         vscode.debug.onDidChangeBreakpoints(mirror_all),
         vscode.debug.onDidStartDebugSession((s) => {
             if (s.type === DEBUG_TYPE && s.configuration.consoleSocket) {
+                launch_claims.delete(s.configuration.consoleSocket);
                 sessions.set(s.configuration.consoleSocket, s);
                 update_status();
             }

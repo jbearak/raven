@@ -572,6 +572,29 @@ describe('auto-attach', () => {
     });
 });
 
+describe('an explicit launch', () => {
+    test('a stop heard while it resolves (F5 reattaching a stopped console) is left to its session', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        // The console's DAP socket, which the launch waits for.
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        const before = started.filter((c) => c.consoleSocket === sock).length;
+        const resolving = config_providers[0].resolveDebugConfiguration(
+            undefined,
+            { type: 'raven-r', request: 'launch', name: 'Source R file', consoleSocket: sock },
+        );
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        expect(await resolving).toMatchObject({ consoleSocket: sock });
+        // Still before VS Code has started the launch's session.
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await settle(300);
+        expect(started.filter((c) => c.consoleSocket === sock).length - before).toBe(0);
+    });
+});
+
 describe('with the R console turned off', () => {
     test('a raven-r launch configuration says why instead of failing to find an adapter', async () => {
         const ctx = { subscriptions: [] as Array<{ dispose(): void }> };

@@ -62,6 +62,7 @@ describe('the raven-r debugger', () => {
 type Listener<T> = (e: T) => void;
 const active_listeners: Array<Listener<unknown>> = [];
 const change_listeners: Array<Listener<{ document: unknown }>> = [];
+const open_listeners: Array<Listener<unknown>> = [];
 const context_values: Array<[string, unknown]> = [];
 const window_mock: { activeTextEditor: unknown } = { activeTextEditor: undefined };
 const disposable = () => ({ dispose() {} });
@@ -81,10 +82,11 @@ mock.module('vscode', () => ({
     workspace: {
         getConfiguration: () => ({ get: (_k: string, fallback?: unknown) => fallback }),
         onDidChangeTextDocument: (cb: Listener<{ document: unknown }>) => { change_listeners.push(cb); return disposable(); },
+        onDidOpenTextDocument: (cb: Listener<unknown>) => { open_listeners.push(cb); return disposable(); },
     },
 }));
 
-const { register_chunk_navigation, HAS_CHUNKS_CONTEXT } = await import('../../editors/vscode/src/chunks/chunk-navigation');
+const { register_chunk_navigation, has_navigable_chunks, HAS_CHUNKS_CONTEXT } = await import('../../editors/vscode/src/chunks/chunk-navigation');
 
 function doc(text: string, languageId = 'r', file = '/w/a.R') {
     const d = {
@@ -129,6 +131,22 @@ describe('raven.editorHasChunks', () => {
         for (const l of change_listeners) l({ document: plain });
         await new Promise((r) => setTimeout(r, 300));
         expect(last()).toBe(true);
+
+        // A language-mode change (VS Code reopens the document): a Markdown
+        // file with an R fence switched to R Markdown.
+        const md = doc('# T\n\n```{r}\nx <- 1\n```\n', 'markdown', '/w/d.txt');
+        window_mock.activeTextEditor = { document: md };
+        for (const l of active_listeners) l(window_mock.activeTextEditor);
+        expect(last()).toBe(false);
+        md.languageId = 'rmd';
+        for (const l of open_listeners) l(md);
+        expect(last()).toBe(true);
         for (const d of ctx.subscriptions) d.dispose();
+    });
+
+    test('never reads a document in a language the keys ignore', () => {
+        const log = doc('%% not a cell\n', 'log', '/w/big.log');
+        log.getText = () => { throw new Error('read'); };
+        expect(has_navigable_chunks(log as never)).toBe(false);
     });
 });

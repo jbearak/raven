@@ -2842,4 +2842,15 @@ fn subscribing_while_r_is_stopped_reports_the_stop() {
         "{}",
         c.text()
     );
+    // Once a session shows the stop, another window subscribing isn't sent
+    // it (its auto-attach would take the session over).
+    let mut d = Dap::connect(&c);
+    let m = d.mark();
+    d.req("configurationDone", json!({}));
+    d.event("stopped", m);
+    let mut other = Subscriber::connect(&c);
+    assert!(
+        other.event("stopped", Duration::from_secs(1)).is_none(),
+        "replayed a stop a live session shows"
+    );
 }
