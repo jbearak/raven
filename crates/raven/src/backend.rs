@@ -13290,8 +13290,13 @@ fn commit_open_metadata_reenrichment(
         // trigger (the text and version are unchanged), so it could consume
         // that marker first and leave the new one gated out. This commit
         // holds the publish lock, and workers re-check cancellation under it
-        // before consuming, so cancelling here retires them.
+        // before consuming, so cancelling here retires them. The direct
+        // publisher has no token to cancel; advancing the refresh generation
+        // it captured with its snapshot retires it the same way.
         state.cross_file_revalidation.cancel(&uri);
+        state
+            .diagnostics_gate
+            .advance_metadata_refresh_generation(&uri);
         state.diagnostics_gate.ensure_force_republish(&uri);
     }
     Ok(effects.revalidations)
@@ -13418,7 +13423,18 @@ enum WatchedResyncBatchMode {
 
 #[derive(Clone)]
 enum WatchedResyncCompletion {
-    Detached,
+    /// No handler waits for the batch.
+    Detached {
+        /// The backend whose open-child refresh queue
+        /// (`WorldState::open_wd_refresh_queue`) a delayed retry of this
+        /// batch drains when it finishes (issue #885). The handler that
+        /// started the batch drains the queue when its own run returns. A
+        /// retry commits after that, so without a drain of its own the open
+        /// children it queues would keep their old directory until the next
+        /// editor event. `None` only in tests that drive a batch without a
+        /// handler. Boxed for the same reason as `post_commit`.
+        open_wd_refresh: Option<Box<Backend>>,
+    },
     InvocationOwned {
         /// Boxed: it carries a whole `Backend` by value, and the enum is
         /// moved through several batch structs alongside a dataless variant.
@@ -13426,6 +13442,18 @@ enum WatchedResyncCompletion {
         receipt: OpenSourceBatchCompletionReceipt,
         boundary_waiter: bool,
     },
+}
+
+impl WatchedResyncCompletion {
+    /// [`Self::Detached`]'s `open_wd_refresh`. An invocation-owned batch has
+    /// none: its handler waits on the receipt, through every retry, and
+    /// drains the queue after that.
+    fn detached_open_wd_refresh(&self) -> Option<Box<Backend>> {
+        match self {
+            Self::Detached { open_wd_refresh } => open_wd_refresh.clone(),
+            Self::InvocationOwned { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -14828,6 +14856,7 @@ fn spawn_watched_undecodable_retry(
     routing_tasks: RoutingTaskOwner,
     admission: WatchedTaskAdmission,
     item: WatchedResyncItem,
+    open_wd_refresh: Option<Box<Backend>>,
 ) {
     // This delayed retry is a separately spawned invocation. The
     // invocation-scoped final-handoff test seam deliberately ends at the
@@ -14877,7 +14906,9 @@ fn spawn_watched_undecodable_retry(
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: open_wd_refresh.clone(),
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 #[cfg(test)]
@@ -14885,8 +14916,20 @@ fn spawn_watched_undecodable_retry(
             },
         )
         .await;
+        refresh_open_children_after_detached_retry(open_wd_refresh).await;
     }) {
         log::debug!("Shutdown rejected delayed undecodable watched retry");
+    }
+}
+
+/// Drain the open-child refresh queue once a detached retry's batch has run
+/// (see [`WatchedResyncCompletion::Detached`]). Called outside every state and
+/// publish guard, after the batch returns and not between its commits. The
+/// batch may have handed its work to a further retry and committed nothing;
+/// that retry drains again when it finishes.
+async fn refresh_open_children_after_detached_retry(open_wd_refresh: Option<Box<Backend>>) {
+    if let Some(backend) = open_wd_refresh {
+        backend.refresh_open_children_after_parent_change().await;
     }
 }
 
@@ -15002,8 +15045,9 @@ fn spawn_watched_package_retry(
     token: tokio_util::sync::CancellationToken,
 ) -> bool {
     batch.attempts_remaining = 2;
+    let open_wd_refresh = batch.completion.detached_open_wd_refresh();
     let completion_receipt = match &mut batch.completion {
-        WatchedResyncCompletion::Detached => None,
+        WatchedResyncCompletion::Detached { .. } => None,
         WatchedResyncCompletion::InvocationOwned {
             receipt,
             boundary_waiter,
@@ -15019,32 +15063,35 @@ fn spawn_watched_package_retry(
     let completion_lifecycle = retry_lifecycle.clone();
     let worker_receipt = completion_receipt.clone();
     let admitted = admission.spawn(&routing_tasks, async move {
-        let mut completion_guard = OpenSourceBatchCompletionGuard::new(worker_receipt);
-        let _retry_owner = LibraryRoutingRetryOwner {
-            lifecycle: retry_lifecycle,
-            generation,
-        };
-        tokio::select! {
-            () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
-            () = token.cancelled() => return,
-            () = shutdown.cancelled() => return,
+        {
+            let mut completion_guard = OpenSourceBatchCompletionGuard::new(worker_receipt);
+            let _retry_owner = LibraryRoutingRetryOwner {
+                lifecycle: retry_lifecycle,
+                generation,
+            };
+            tokio::select! {
+                () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
+                () = token.cancelled() => return,
+                () = shutdown.cancelled() => return,
+            }
+            if state_arc.read().await.routing_is_shutdown() {
+                return;
+            }
+            // The nested runner installs its guard before its first suspension
+            // point. Transfer responsibility as we enter it so every admitted
+            // successor has exactly one fail-closed owner.
+            completion_guard.disarm();
+            run_watched_resync_batch_owned(
+                state_arc.clone(),
+                client,
+                traversal_truncation,
+                child_tasks,
+                WatchedTaskAdmission::TrackedParent,
+                batch,
+            )
+            .await;
         }
-        if state_arc.read().await.routing_is_shutdown() {
-            return;
-        }
-        // The nested runner installs its guard before its first suspension
-        // point. Transfer responsibility as we enter it so every admitted
-        // successor has exactly one fail-closed owner.
-        completion_guard.disarm();
-        run_watched_resync_batch_owned(
-            state_arc.clone(),
-            client,
-            traversal_truncation,
-            child_tasks,
-            WatchedTaskAdmission::TrackedParent,
-            batch,
-        )
-        .await;
+        refresh_open_children_after_detached_retry(open_wd_refresh).await;
     });
     if !admitted {
         refusal_token.cancel();
@@ -15464,7 +15511,7 @@ async fn run_watched_resync_batch_owned(
         final_handoff_test_capture,
     } = batch;
     let (post_commit_source_refresh, completion_receipt, boundary_waiter) = match &completion {
-        WatchedResyncCompletion::Detached => (None, None, false),
+        WatchedResyncCompletion::Detached { .. } => (None, None, false),
         WatchedResyncCompletion::InvocationOwned {
             post_commit,
             receipt,
@@ -15558,6 +15605,7 @@ async fn run_watched_resync_batch_owned(
                         routing_tasks.clone(),
                         admission,
                         item.clone(),
+                        completion.detached_open_wd_refresh(),
                     );
                 }
             }
@@ -16239,6 +16287,7 @@ async fn run_watched_resync_batch_owned(
                             routing_tasks.clone(),
                             admission,
                             item.clone(),
+                            completion.detached_open_wd_refresh(),
                         );
                     }
                     ResyncOutcome::Prepared { .. } => {
@@ -20681,7 +20730,9 @@ impl LanguageServer for Backend {
                         deletions: deleted_uris,
                         reserved_tickets: Vec::new(),
                         transfer_handles: Vec::new(),
-                        completion: WatchedResyncCompletion::Detached,
+                        completion: WatchedResyncCompletion::Detached {
+                            open_wd_refresh: Some(Box::new(backend.clone())),
+                        },
                         mode: WatchedResyncBatchMode::Immediate,
                         attempts_remaining: 2,
                         #[cfg(test)]
@@ -20717,7 +20768,9 @@ impl LanguageServer for Backend {
                     deletions: deleted_uris,
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
-                    completion: WatchedResyncCompletion::Detached,
+                    completion: WatchedResyncCompletion::Detached {
+                        open_wd_refresh: Some(Box::new(self.clone())),
+                    },
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 2,
                     #[cfg(test)]
@@ -24931,7 +24984,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // Phase 1: brief read lock — gate check, build the diagnostics
     // snapshot, capture inputs for the off-lock work. NO scope
     // resolution or other heavy work happens inside this scope.
-    let (trigger, snapshot, coherence_generation) = {
+    let (trigger, metadata_refresh_generation, snapshot, coherence_generation) = {
         let state = state_arc.read().await;
         // Full trigger capture (version + revision + epoch + config
         // generation): the direct path has no cancellation token, so the
@@ -24939,6 +24992,9 @@ pub(crate) async fn publish_diagnostics_inner(
         // against a lifecycle reuse (close+reopen), a same-version edit, or a
         // configuration reload racing the off-lock compute below.
         let trigger = DiagnosticsTrigger::capture(&state, uri);
+        // A metadata refresh changes none of the trigger's fields; see
+        // `CrossFileDiagnosticsGate::metadata_refresh_generation`.
+        let metadata_refresh_generation = state.diagnostics_gate.metadata_refresh_generation(uri);
 
         if !state.diagnostics_publish_allowed(uri) {
             log::trace!(
@@ -24994,7 +25050,12 @@ pub(crate) async fn publish_diagnostics_inner(
 
         let coherence_generation = state.diagnostics_coherence.generation();
 
-        (trigger, snapshot, coherence_generation)
+        (
+            trigger,
+            metadata_refresh_generation,
+            snapshot,
+            coherence_generation,
+        )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
 
@@ -25066,6 +25127,16 @@ pub(crate) async fn publish_diagnostics_inner(
                 uri
             );
             (state.documents.contains_key(uri), coherence_deferred)
+        } else if state.diagnostics_gate.metadata_refresh_generation(uri)
+            != metadata_refresh_generation
+        {
+            // The refresh's own ticket republishes from the new metadata and
+            // owns the force marker; leave both to it.
+            log::trace!(
+                "Skipping diagnostics for {}: metadata refreshed after snapshot",
+                uri
+            );
+            return;
         } else if !trigger.commit_publish(&state.diagnostics_gate, uri) {
             log::trace!(
                 "Skipping diagnostics for {}: gate refused after async (version={:?})",
@@ -28103,7 +28174,9 @@ mod tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: super::WatchedResyncCompletion::Detached,
+                completion: super::WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: super::WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -28147,6 +28220,7 @@ mod tests {
                 generation,
                 package_input_only: false,
             },
+            None,
         );
         tokio::task::yield_now().await;
         tokio::time::timeout(std::time::Duration::from_secs(1), backend.shutdown())
@@ -39664,122 +39738,800 @@ mod project_config_initialize_tests {
     }
 
     async fn an_open_file_follows_its_parent_changing_directory_with(child_text: &str) {
-        use futures_util::StreamExt;
-        use tower::{Service, ServiceExt};
-        use tower_lsp::jsonrpc::Request;
+        let fixture = ParentDirectoryFixture::open(child_text).await;
+        let backend = fixture.backend();
 
-        let tmp = TempDir::new().unwrap();
-        let base = fs::canonicalize(tmp.path()).unwrap();
-        for dir in ["lib", "lib2", "scripts"] {
-            fs::create_dir_all(base.join(dir)).unwrap();
+        change_doc(backend, &fixture.main_uri, 2, &fixture.main_text("lib2")).await;
+        fixture.until(false, "util.R resolves from lib2/").await;
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("lib2")));
+
+        // Closing the unsaved parent reverts it to its file (`cd lib`).
+        close_doc(backend, &fixture.main_uri).await;
+        fixture
+            .until(true, "util.R is missing again once the parent closes")
+            .await;
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
+    }
+
+    /// An open parent and an open child whose `source("util.R")` does not
+    /// resolve yet. The child's missing-file diagnostic has been published
+    /// and the workers the opens scheduled have finished, so a later publish
+    /// for the child can only come from what the test does next.
+    ///
+    /// [`Self::open`] builds the usual pair: `main.R` (`# raven: cd lib`)
+    /// sources `scripts/child.R`, and `util.R` exists only in `lib2/`.
+    struct ParentDirectoryFixture {
+        svc: tower_lsp::LspService<Backend>,
+        _tmp: TempDir,
+        base: std::path::PathBuf,
+        child_text: String,
+        main_uri: Url,
+        child_uri: Url,
+        /// Each diagnostics publish for the child since the last
+        /// [`Self::forget_published`], in order: `true` when it reports
+        /// `util.R` missing.
+        published: Arc<std::sync::Mutex<Vec<bool>>>,
+        collector: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ParentDirectoryFixture {
+        fn drop(&mut self) {
+            self.collector.abort();
         }
-        let main_text = |dir: &str| format!("# raven: cd {dir}\nsource(\"../scripts/child.R\")\n");
-        fs::write(base.join("main.R"), main_text("lib")).unwrap();
-        fs::write(base.join("scripts/child.R"), child_text).unwrap();
-        fs::write(base.join("lib2/util.R"), "f <- function() 1\n").unwrap();
-        let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
-        let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+    }
 
-        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
-        // The latest diagnostics published for the child: `Some(true)` while
-        // they report `util.R` missing.
-        let missing = Arc::new(std::sync::Mutex::new(None::<bool>));
-        let collector = {
-            let missing = missing.clone();
-            let child_uri = child_uri.clone();
-            tokio::spawn(async move {
-                while let Some(message) = socket.next().await {
-                    if message.method() != "textDocument/publishDiagnostics" {
-                        continue;
-                    }
-                    let params: PublishDiagnosticsParams =
-                        serde_json::from_value(message.params().unwrap().clone()).unwrap();
-                    if params.uri == child_uri {
-                        *missing.lock().unwrap() = Some(
-                            params
-                                .diagnostics
-                                .iter()
-                                .any(|diagnostic| diagnostic.message.contains("util.R")),
-                        );
-                    }
-                }
-            })
-        };
-        let initialize = Request::build("initialize")
-            .id(1)
-            .params(
-                serde_json::to_value(InitializeParams {
-                    workspace_folders: Some(vec![WorkspaceFolder {
-                        uri: Url::from_file_path(&base).unwrap(),
-                        name: "t".into(),
-                    }]),
-                    initialization_options: Some(serde_json::json!({
-                        "crossFile": { "indexWorkspace": false },
-                        "packages": { "enabled": false },
-                        "diagnosticUris": [main_uri.to_string(), child_uri.to_string()]
-                    })),
-                    ..Default::default()
-                })
-                .unwrap(),
+    impl ParentDirectoryFixture {
+        async fn open(child_text: &str) -> Self {
+            let fixture = Self::open_files(
+                ("main.R", &Self::main_text_for("lib")),
+                ("scripts/child.R", child_text),
+                &["lib/", "lib2/util.R"],
             )
-            .finish();
-        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
-        assert!(response.is_some_and(|response| response.is_ok()));
-        let backend = svc.inner();
-        backend.state.write().await.workspace_scan_complete = true;
-        open_doc(backend, &main_uri, "r", 1, &main_text("lib")).await;
-        open_doc(backend, &child_uri, "r", 1, child_text).await;
-        let inherited = |state: &WorldState| {
-            state
-                .get_enriched_metadata(&child_uri)
-                .and_then(|meta| meta.inherited_working_directory.clone())
-        };
-        let lib = |dir: &str| base.join(dir).to_string_lossy().into_owned();
-        let until = |want: bool, what: &'static str| {
-            let missing = missing.clone();
-            async move {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                loop {
-                    let now = *missing.lock().unwrap();
-                    if now == Some(want) {
-                        return;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "{child_text:?}: {what}, latest {now:?}"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            .await;
+            assert_eq!(fixture.inherited().await, Some(fixture.dir("lib")));
+            fixture
+        }
+
+        /// Open `parent` and `child` (each a relative path and its text) in
+        /// a workspace that also holds `others`: a directory when the path
+        /// ends in `/`, else a file defining `f`.
+        async fn open_files(parent: (&str, &str), child: (&str, &str), others: &[&str]) -> Self {
+            use futures_util::StreamExt;
+            use tower::{Service, ServiceExt};
+            use tower_lsp::jsonrpc::Request;
+
+            let tmp = TempDir::new().unwrap();
+            let base = fs::canonicalize(tmp.path()).unwrap();
+            let (main_path, child_path) = (base.join(parent.0), base.join(child.0));
+            let child_text = child.1;
+            let write = |path: &std::path::Path, text: &str| {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            };
+            write(&main_path, parent.1);
+            write(&child_path, child_text);
+            for other in others {
+                if other.ends_with('/') {
+                    fs::create_dir_all(base.join(other)).unwrap();
+                } else {
+                    write(&base.join(other), "f <- function() 1\n");
                 }
             }
+            let main_uri = Url::from_file_path(&main_path).unwrap();
+            let child_uri = Url::from_file_path(&child_path).unwrap();
+
+            let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+            let published = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let collector = {
+                let published = published.clone();
+                let child_uri = child_uri.clone();
+                tokio::spawn(async move {
+                    while let Some(message) = socket.next().await {
+                        if message.method() != "textDocument/publishDiagnostics" {
+                            continue;
+                        }
+                        let params: PublishDiagnosticsParams =
+                            serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                        if params.uri == child_uri {
+                            published.lock().unwrap().push(
+                                params
+                                    .diagnostics
+                                    .iter()
+                                    .any(|diagnostic| diagnostic.message.contains("util.R")),
+                            );
+                        }
+                    }
+                })
+            };
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        workspace_folders: Some(vec![WorkspaceFolder {
+                            uri: Url::from_file_path(&base).unwrap(),
+                            name: "t".into(),
+                        }]),
+                        initialization_options: Some(serde_json::json!({
+                            "crossFile": { "indexWorkspace": false },
+                            "packages": { "enabled": false },
+                            "diagnosticUris": [main_uri.to_string(), child_uri.to_string()]
+                        })),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let fixture = Self {
+                svc,
+                _tmp: tmp,
+                base,
+                child_text: child_text.to_string(),
+                main_uri,
+                child_uri,
+                published,
+                collector,
+            };
+            let backend = fixture.backend();
+            backend.state.write().await.workspace_scan_complete = true;
+            open_doc(backend, &fixture.main_uri, "r", 1, parent.1).await;
+            open_doc(backend, &fixture.child_uri, "r", 1, child_text).await;
+            fixture.until(true, "util.R must be missing at first").await;
+            fixture.settle().await;
+            fixture
+        }
+
+        fn backend(&self) -> &Backend {
+            self.svc.inner()
+        }
+
+        fn main_text_for(dir: &str) -> String {
+            format!("# raven: cd {dir}\nsource(\"../scripts/child.R\")\n")
+        }
+
+        fn main_text(&self, dir: &str) -> String {
+            Self::main_text_for(dir)
+        }
+
+        fn dir(&self, dir: &str) -> String {
+            self.base.join(dir).to_string_lossy().into_owned()
+        }
+
+        /// The child's installed inherited working directory.
+        async fn inherited(&self) -> Option<String> {
+            self.backend()
+                .state
+                .read()
+                .await
+                .get_enriched_metadata(&self.child_uri)
+                .and_then(|meta| meta.inherited_working_directory.clone())
+        }
+
+        /// Outstanding force-republish markers for the child.
+        async fn markers(&self) -> u32 {
+            self.backend()
+                .state
+                .read()
+                .await
+                .diagnostics_gate
+                .force_republish_count_for_test(&self.child_uri)
+        }
+
+        /// The child's publishes since the last [`Self::forget_published`].
+        fn published(&self) -> Vec<bool> {
+            self.published.lock().unwrap().clone()
+        }
+
+        fn forget_published(&self) {
+            self.published.lock().unwrap().clear();
+        }
+
+        /// Wait until the latest diagnostics published for the child report
+        /// `util.R` missing (`want`) or not.
+        async fn until(&self, want: bool, what: &'static str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let now = self.published.lock().unwrap().last().copied();
+                if now == Some(want) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}: {what}, latest {now:?}",
+                    self.child_text
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Wait until no debounced diagnostics worker is pending for the child.
+        async fn settle(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while self
+                .backend()
+                .state
+                .read()
+                .await
+                .cross_file_revalidation
+                .has_pending_for_test(&self.child_uri)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child diagnostics settle"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// An active Shiny app runs the files it `source()`s in its application
+    /// directory (issue #885). When the open `app.R` starts sourcing an open
+    /// file, that file takes the directory and its `source("util.R")`
+    /// resolves from it; when the app stops, the file loses it again. Neither
+    /// needs an edit to the sourced file.
+    #[tokio::test]
+    async fn an_open_file_follows_a_shiny_app_that_starts_and_stops_sourcing_it() {
+        let fixture = ParentDirectoryFixture::open_files(
+            ("demo/app.R", "a <- 1\n"),
+            ("demo/sub/child.R", "source(\"util.R\")\n"),
+            &["demo/util.R"],
+        )
+        .await;
+        let backend = fixture.backend();
+        assert_eq!(fixture.inherited().await, None);
+
+        let sourcing = "a <- 1\nsource(\"sub/child.R\")\n";
+        change_doc(backend, &fixture.main_uri, 2, sourcing).await;
+        fixture
+            .until(false, "util.R resolves from the app directory")
+            .await;
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("demo")));
+
+        change_doc(backend, &fixture.main_uri, 3, "a <- 1\n").await;
+        fixture
+            .until(true, "util.R is missing once the app stops sourcing")
+            .await;
+        assert_eq!(fixture.inherited().await, None);
+    }
+
+    /// A closed `main.R` (`# raven: cd w`) sources the open `mods/child.R`.
+    /// Returns the service, the workspace, `main.R`'s path and URI, and the
+    /// child's URI, once the child has taken `w/` as its directory.
+    async fn open_child_of_closed_cd_parent() -> (
+        tower_lsp::LspService<Backend>,
+        TempDir,
+        std::path::PathBuf,
+        Url,
+        Url,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["w", "b", "mods"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let main_path = base.join("main.R");
+        fs::write(&main_path, "# raven: cd w\nsource(\"../mods/child.R\")\n").unwrap();
+        let child_text = "source(\"util.R\")\n";
+        fs::write(base.join("mods/child.R"), child_text).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+        let svc = service_in_workspace_with_options_at(
+            &base,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await;
+        let backend = svc.inner();
+        backend.state.write().await.workspace_scan_complete = true;
+        let install = resync_file_from_disk(
+            &backend.state,
+            &main_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
+        assert!(matches!(install, ResyncOutcome::Updated { .. }));
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+        assert_eq!(
+            inherited_directory(&*backend.state.read().await, &child_uri),
+            Some(base.join("w"))
+        );
+        (svc, tmp, main_path, main_uri, child_uri)
+    }
+
+    fn inherited_directory(state: &WorldState, uri: &Url) -> Option<std::path::PathBuf> {
+        state
+            .get_enriched_metadata(uri)
+            .and_then(|metadata| metadata.inherited_working_directory.clone())
+            .map(std::path::PathBuf::from)
+    }
+
+    /// Wait for the open child to take `expected` as its directory with the
+    /// refresh queue drained, without any further editor event.
+    async fn child_follows_the_watched_change(
+        backend: &Backend,
+        child_uri: &Url,
+        expected: Option<std::path::PathBuf>,
+    ) -> bool {
+        wait_for_state(backend, 5_000, |state| {
+            inherited_directory(state, child_uri) == expected
+                && state.open_wd_refresh_queue.is_empty()
+        })
+        .await
+    }
+
+    /// A watched change whose bytes do not decode is committed by a delayed
+    /// retry, after the handler drained the open-child refresh queue (issue
+    /// #885). When the bytes stay invalid the retry removes the closed
+    /// parent, and the open child it ran in `w/` loses that directory then,
+    /// not at its next edit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_retry_that_removes_a_closed_parent_refreshes_its_open_child() {
+        let (svc, _tmp, main_path, main_uri, child_uri) = open_child_of_closed_cd_parent().await;
+        let backend = svc.inner();
+
+        fs::write(&main_path, [0x78u8, 0x80, 0x79]).unwrap();
+        send_watched_change(backend, &main_uri).await;
+
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, None).await,
+            "the retry's removal must reach the open child"
+        );
+        assert!(
+            !backend
+                .state
+                .read()
+                .await
+                .workspace_index
+                .contains(&main_uri)
+        );
+    }
+
+    /// As above, with the write finishing before the retry reads: the retry
+    /// commits the recovered parent, whose `cd` now names `b/`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_retry_that_recovers_a_closed_parent_refreshes_its_open_child() {
+        let (svc, tmp, main_path, main_uri, child_uri) = open_child_of_closed_cd_parent().await;
+        let backend = svc.inner();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+
+        fs::write(&main_path, [0x78u8, 0x80, 0x79]).unwrap();
+        send_watched_change(backend, &main_uri).await;
+        // Let the immediate pass observe the invalid bytes and schedule its
+        // retry, then finish the non-atomic write.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            inherited_directory(&*backend.state.read().await, &child_uri),
+            Some(base.join("w"))
+        );
+        fs::write(&main_path, "# raven: cd b\nsource(\"../mods/child.R\")\n").unwrap();
+
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, Some(base.join("b"))).await,
+            "the retry's recovered commit must reach the open child"
+        );
+    }
+
+    /// A watched batch that exhausts its inline commit attempts hands the
+    /// commit to a delayed package retry, which also lands after the
+    /// handler's drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_package_retry_refreshes_the_open_child_it_queues() {
+        let (svc, tmp, main_path, main_uri, child_uri) = open_child_of_closed_cd_parent().await;
+        let backend = svc.inner();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+
+        fs::write(&main_path, "# raven: cd b\nsource(\"../mods/child.R\")\n").unwrap();
+        let attempts = {
+            let mut state = backend.state.write().await;
+            // Every inline attempt of the batch is rejected.
+            state.watched_batch_test_reject_remaining = 3;
+            state.watched_batch_test_commit_attempts
         };
-        until(true, "util.R must be missing from lib/").await;
-        // Let every worker the opens scheduled finish first, so the publish
-        // awaited below can only come from the parent's edit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while backend
+        send_watched_change(backend, &main_uri).await;
+
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, Some(base.join("b"))).await,
+            "the package retry's commit must reach the open child"
+        );
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .watched_batch_test_commit_attempts
+                - attempts,
+            4,
+            "three rejected inline attempts, then the retry's commit"
+        );
+    }
+
+    /// A closed intermediate file starts, then stops, sourcing an open file
+    /// (issue #885): the open `main.R` (`# raven: cd w`) sources the closed
+    /// `mods/middle.R`, and a watched change makes `middle.R` source the open
+    /// `mods/child.R`. On the over-budget path the change is committed from
+    /// disk metadata, which holds no directory for `middle.R`, so neither its
+    /// old nor its new metadata proposes one; the child must still take
+    /// `w/` through it, and lose it when the call goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_file_follows_a_closed_intermediate_that_starts_and_stops_sourcing_it() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["w", "mods"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let main_text = "# raven: cd w\nsource(\"../mods/middle.R\")\n";
+        let child_text = "source(\"util.R\")\n";
+        let middle_path = base.join("mods/middle.R");
+        fs::write(base.join("main.R"), main_text).unwrap();
+        fs::write(&middle_path, "z <- 1\n").unwrap();
+        fs::write(base.join("mods/child.R"), child_text).unwrap();
+        let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
+        let middle_uri = Url::from_file_path(&middle_path).unwrap();
+        let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+        let svc = service_in_workspace_with_options_at(
+            &base,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await;
+        let backend = svc.inner();
+        backend.state.write().await.workspace_scan_complete = true;
+        open_doc(backend, &main_uri, "r", 1, main_text).await;
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+        {
+            let mut state = backend.state.write().await;
+            assert!(state.workspace_index.contains(&middle_uri));
+            assert_eq!(inherited_directory(&state, &child_uri), None);
+            state.cross_file_config.max_transitive_dependents_visited = 1;
+            assert!(
+                state.workspace_index.graph_derivation_entries().len()
+                    + snapshot_workspace_graph_overlays(&state).len()
+                    > state.cross_file_config.max_transitive_dependents_visited,
+                "fixture must force the ordered traversal-budget fallback"
+            );
+        }
+
+        fs::write(&middle_path, "source(\"../mods/child.R\")\n").unwrap();
+        send_watched_change(backend, &middle_uri).await;
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, Some(base.join("w"))).await,
+            "the child takes w/ through the closed file that now sources it"
+        );
+
+        fs::write(&middle_path, "z <- 1\n").unwrap();
+        send_watched_change(backend, &middle_uri).await;
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, None).await,
+            "the child loses w/ once the closed file stops sourcing it"
+        );
+
+        // Deleting the closed file while it sources the child does the same.
+        fs::write(&middle_path, "source(\"../mods/child.R\")\n").unwrap();
+        send_watched_change(backend, &middle_uri).await;
+        assert!(child_follows_the_watched_change(backend, &child_uri, Some(base.join("w"))).await);
+        fs::remove_file(&middle_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![tower_lsp::lsp_types::FileEvent {
+                    uri: middle_uri.clone(),
+                    typ: tower_lsp::lsp_types::FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, None).await,
+            "the child loses w/ once the closed file is deleted"
+        );
+    }
+
+    /// One watched notification changes a closed parent and the closed
+    /// intermediate file it sources, so that both the parent's `source()` of
+    /// the intermediate file and the intermediate file's `source()` of the
+    /// open child go away: by deleting both files, or by rewriting both.
+    /// Whichever is committed first, the child must lose the parent's
+    /// directory. Committing the parent first takes the intermediate file's
+    /// ancestor edge with it, so the ancestor is read from the graph as it
+    /// was before the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_file_follows_its_closed_parents_changed_together_in_either_order() {
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        for (delete, parent_first) in [(true, true), (true, false), (false, true), (false, false)] {
+            let tmp = TempDir::new().unwrap();
+            let base = fs::canonicalize(tmp.path()).unwrap();
+            for dir in ["w", "mods"] {
+                fs::create_dir_all(base.join(dir)).unwrap();
+            }
+            let child_text = "source(\"util.R\")\n";
+            let (main_path, middle_path) = (base.join("main.R"), base.join("mods/middle.R"));
+            fs::write(&main_path, "# raven: cd w\nsource(\"../mods/middle.R\")\n").unwrap();
+            fs::write(&middle_path, "source(\"../mods/child.R\")\n").unwrap();
+            fs::write(base.join("mods/child.R"), child_text).unwrap();
+            let main_uri = Url::from_file_path(&main_path).unwrap();
+            let middle_uri = Url::from_file_path(&middle_path).unwrap();
+            let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+            let svc = service_in_workspace_with_options_at(
+                &base,
+                Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+            )
+            .await;
+            let backend = svc.inner();
+            backend.state.write().await.workspace_scan_complete = true;
+            // Both indexed from disk: the intermediate file's own entry holds
+            // no directory.
+            for uri in [&middle_uri, &main_uri] {
+                let install = resync_file_from_disk(
+                    &backend.state,
+                    uri,
+                    None,
+                    None,
+                    true,
+                    None,
+                    ResyncCommitMode::Immediate,
+                )
+                .await;
+                assert!(matches!(install, ResyncOutcome::Updated { .. }));
+            }
+            open_doc(backend, &child_uri, "r", 1, child_text).await;
+            {
+                let state = backend.state.read().await;
+                assert_eq!(inherited_directory(&state, &middle_uri), None);
+                assert_eq!(
+                    inherited_directory(&state, &child_uri),
+                    Some(base.join("w"))
+                );
+            }
+
+            if delete {
+                fs::remove_file(&main_path).unwrap();
+                fs::remove_file(&middle_path).unwrap();
+            } else {
+                fs::write(&main_path, "# raven: cd w\nx <- 1\n").unwrap();
+                fs::write(&middle_path, "z <- 1\n").unwrap();
+            }
+            let mut changed = vec![main_uri.clone(), middle_uri.clone()];
+            if !parent_first {
+                changed.reverse();
+            }
+            let typ = if delete {
+                FileChangeType::DELETED
+            } else {
+                FileChangeType::CHANGED
+            };
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: changed
+                        .into_iter()
+                        .map(|uri| FileEvent { uri, typ })
+                        .collect(),
+                })
+                .await;
+            assert!(
+                child_follows_the_watched_change(backend, &child_uri, None).await,
+                "deleted: {delete}, parent first: {parent_first}"
+            );
+        }
+    }
+
+    /// A `didSave` of an open child races the refresh of its inherited
+    /// directory (issue #885). The save computes its diagnostics before the
+    /// refresh commits and takes the publish lock after it, while the
+    /// refreshed worker has not published yet. The save's result was computed
+    /// against the replaced metadata, so it must not be sent, and it must
+    /// leave the refresh's force marker for the refreshed worker.
+    #[tokio::test]
+    async fn a_save_computed_before_a_directory_refresh_does_not_take_its_republish() {
+        let fixture = ParentDirectoryFixture::open("source(\"util.R\")\n").await;
+        let backend = fixture.backend();
+        let child_uri = &fixture.child_uri;
+        let bounded = std::time::Duration::from_secs(10);
+
+        // Park the refresh coordinator before its commit, and the edit's own
+        // debounced worker for the child after its compute.
+        let (commit, predecessor) = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.revalidation_debounce_ms = 0;
+            (
+                state
+                    .open_tar_source_refresh_pre_commit_test_pause
+                    .arm(child_uri.clone()),
+                state.diagnostics_test_pause.arm(child_uri.clone()),
+            )
+        };
+        assert_eq!(fixture.markers().await, 0);
+        // The appended definition changes the parent's interface, so the
+        // edit reserves a same-version republish for the child.
+        let edited = format!("{}new_name <- 1\n", fixture.main_text("lib2"));
+        change_doc(backend, &fixture.main_uri, 2, &edited).await;
+        tokio::time::timeout(bounded, commit.wait_arrived())
+            .await
+            .expect("the refresh reaches its commit");
+        tokio::time::timeout(bounded, predecessor.wait_arrived())
+            .await
+            .expect("the edit's worker computes");
+        assert_eq!(fixture.markers().await, 1);
+
+        // The save computes against `lib/` and parks before the publish lock.
+        let save_pause = backend
             .state
             .read()
             .await
-            .cross_file_revalidation
-            .has_pending_for_test(&child_uri)
+            .diagnostics_test_pause
+            .arm(child_uri.clone());
+        let save = {
+            let backend = backend.clone();
+            let uri = child_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_save(DidSaveTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        text: None,
+                    })
+                    .await;
+            })
+        };
+        tokio::time::timeout(bounded, save_pause.wait_arrived())
+            .await
+            .expect("the save computes before the refresh commits");
+
+        // The refresh commits; its worker computes against `lib2/` and parks.
+        let refreshed = backend
+            .state
+            .read()
+            .await
+            .diagnostics_test_pause
+            .arm(child_uri.clone());
+        commit.release();
+        tokio::time::timeout(bounded, refreshed.wait_arrived())
+            .await
+            .expect("the refreshed worker computes");
+        assert_eq!(fixture.inherited().await, Some(fixture.dir("lib2")));
+        predecessor.release();
+
+        // The save takes the publish lock first.
+        fixture.forget_published();
+        save_pause.release();
+        tokio::time::timeout(bounded, save).await.unwrap().unwrap();
+        assert_eq!(
+            fixture.markers().await,
+            1,
+            "the save must leave the refresh's marker for the refreshed worker"
+        );
+
+        refreshed.release();
+        fixture.until(false, "util.R resolves from lib2/").await;
+        fixture.settle().await;
+        assert_eq!(fixture.markers().await, 0);
+        assert_eq!(
+            fixture.published(),
+            [false],
+            "only the refreshed worker's diagnostics reach the client"
+        );
+    }
+
+    /// The refresh fence above retires only direct publishes that cross a
+    /// committed refresh of their own document. A save parked across another
+    /// document's refresh, or across a replacement of its own metadata that
+    /// is not a refresh (as the workspace scan, open-document replay and
+    /// `system.file` routing make), still publishes and consumes its marker.
+    #[tokio::test]
+    async fn a_parked_save_survives_metadata_replacements_that_are_not_its_refresh() {
+        let fixture = ParentDirectoryFixture::open("source(\"util.R\")\n").await;
+        let backend = fixture.backend();
+        let child_uri = &fixture.child_uri;
+        let bounded = std::time::Duration::from_secs(10);
+
+        // A same-version publish needs a marker to pass the monotonic gate.
+        let save_pause = {
+            let state = backend.state.read().await;
+            state.diagnostics_gate.mark_force_republish(child_uri);
+            state.diagnostics_test_pause.arm(child_uri.clone())
+        };
+        fixture.forget_published();
+        let save = {
+            let backend = backend.clone();
+            let uri = child_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_save(DidSaveTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        text: None,
+                    })
+                    .await;
+            })
+        };
+        tokio::time::timeout(bounded, save_pause.wait_arrived())
+            .await
+            .expect("the save computes");
+
         {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "open diagnostics settle"
+            let mut state = backend.state.write().await;
+            let before = state
+                .diagnostics_gate
+                .metadata_refresh_generation(child_uri);
+            // The parent's refresh commits.
+            let generation = state
+                .documents
+                .get_record(&fixture.main_uri)
+                .unwrap()
+                .generation();
+            let captured = state
+                .capture_open_metadata_derivation(&fixture.main_uri, generation)
+                .unwrap();
+            let derived = derive_open_metadata_reenrichment(&captured);
+            let tickets =
+                commit_open_metadata_reenrichment(&mut state, captured, derived, &[]).unwrap();
+            assert!(tickets.iter().any(|ticket| ticket.uri == fixture.main_uri));
+            // The child's own metadata record is replaced outside a refresh.
+            let record = state.documents.get_record(child_uri).unwrap();
+            let (generation, metadata) = (record.generation(), record.metadata().clone());
+            let replaced = state
+                .replace_open_document_metadata_if_current(child_uri, generation, metadata)
+                .unwrap();
+            assert_ne!(replaced.generation(), generation);
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .metadata_refresh_generation(child_uri),
+                before
             );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
 
-        change_doc(backend, &main_uri, 2, &main_text("lib2")).await;
-        until(false, "util.R resolves from lib2/").await;
-        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib2")));
+        save_pause.release();
+        tokio::time::timeout(bounded, save).await.unwrap().unwrap();
+        fixture.until(true, "the parked save still publishes").await;
+        assert_eq!(fixture.markers().await, 0);
+    }
 
-        // Closing the unsaved parent reverts it to its file (`cd lib`).
-        close_doc(backend, &main_uri).await;
-        until(true, "util.R is missing again once the parent closes").await;
-        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
-        collector.abort();
+    /// A save that starts after a refresh of its document committed captures
+    /// the advanced generation, so it publishes.
+    #[tokio::test]
+    async fn a_save_started_after_a_directory_refresh_publishes() {
+        let fixture = ParentDirectoryFixture::open("source(\"util.R\")\n").await;
+        let backend = fixture.backend();
+        let child_uri = &fixture.child_uri;
+
+        {
+            let mut state = backend.state.write().await;
+            let generation = state.documents.get_record(child_uri).unwrap().generation();
+            let captured = state
+                .capture_open_metadata_derivation(child_uri, generation)
+                .unwrap();
+            let derived = derive_open_metadata_reenrichment(&captured);
+            let tickets =
+                commit_open_metadata_reenrichment(&mut state, captured, derived, &[]).unwrap();
+            assert!(tickets.iter().any(|ticket| ticket.uri == *child_uri));
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .metadata_refresh_generation(child_uri),
+                Some(1)
+            );
+        }
+        assert_eq!(fixture.markers().await, 1);
+        fixture.forget_published();
+        backend
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: child_uri.clone(),
+                },
+                text: None,
+            })
+            .await;
+        fixture.until(true, "the later save publishes").await;
+        assert_eq!(fixture.markers().await, 0);
     }
 
     /// A self-contained file indexed on demand through a caller with a
@@ -41418,7 +42170,9 @@ mod project_config_initialize_tests {
                 deletions: collected.deletions,
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -52747,7 +53501,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -52806,7 +53562,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -52861,7 +53619,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -52922,7 +53682,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53000,7 +53762,9 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -63569,7 +64333,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -63652,7 +64418,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -63707,7 +64475,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -63775,7 +64545,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -63838,7 +64610,9 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -63960,7 +64734,9 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64442,7 +65218,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64506,7 +65284,9 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64579,7 +65359,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64631,7 +65413,9 @@ infixContinuationStyle = "aligned"
                     deletions: Vec::new(),
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
-                    completion: WatchedResyncCompletion::Detached,
+                    completion: WatchedResyncCompletion::Detached {
+                        open_wd_refresh: None,
+                    },
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 0,
                     final_handoff_test_capture: None,
@@ -64688,7 +65472,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -64723,7 +65509,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64810,7 +65598,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: vec![transfer.handle],
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -64899,7 +65689,9 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: vec![old_ticket],
                 transfer_handles: Vec::new(),
-                completion: WatchedResyncCompletion::Detached,
+                completion: WatchedResyncCompletion::Detached {
+                    open_wd_refresh: None,
+                },
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,

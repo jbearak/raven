@@ -10961,6 +10961,14 @@ impl WorldState {
         };
         let mut post_fanout = Vec::new();
         let mut wd_refresh = Vec::new();
+        // The targets something could pass a directory to before the batch
+        // (`has_wd_ancestor`). Read here because a target's own update, or
+        // an earlier mutation in the batch, can remove the edge that says so.
+        let had_wd_ancestor: HashSet<Url> = targets
+            .iter()
+            .filter(|uri| has_wd_ancestor(&self.cross_file_graph, uri))
+            .cloned()
+            .collect();
         let mut graph_changed = false;
         // Pending/Complete upserts hydrate prerequisites before their caller's
         // graph exists. Only observed disk mutations can retire their ownership.
@@ -10982,10 +10990,13 @@ impl WorldState {
                     // A closed parent has no open commit to re-derive the
                     // open children its `source()` calls pass a directory
                     // to, so queue those whose proposal changes here.
+                    let children_before = forward_children(&self.cross_file_graph, &prepared.uri);
                     let proposals_before = forward_child_proposals(
-                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        children_before.clone(),
                         self.workspace_index.get_metadata(&prepared.uri).as_deref(),
                     );
+                    let observed =
+                        matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
                     let new_metadata = prepared.entry.metadata.clone();
                     let reserve_fanout = reserve_closed_fanout
                         && matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
@@ -11045,8 +11056,9 @@ impl WorldState {
                         prepared.snapshot,
                         prepared.content,
                     );
+                    let children_after = forward_children(&self.cross_file_graph, &prepared.uri);
                     let proposals_after = forward_child_proposals(
-                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        children_after.clone(),
                         Some(new_metadata.as_ref()),
                     );
                     wd_refresh.extend(
@@ -11054,6 +11066,22 @@ impl WorldState {
                             .symmetric_difference(&proposals_after)
                             .map(|(child, _)| child.clone()),
                     );
+                    if observed {
+                        // Edges it dropped passed on the directory it had
+                        // before; edges it added pass on the one it has now.
+                        let before: std::collections::BTreeSet<_> =
+                            children_before.into_iter().collect();
+                        let after: std::collections::BTreeSet<_> =
+                            children_after.into_iter().collect();
+                        if had_wd_ancestor.contains(&prepared.uri) {
+                            wd_refresh
+                                .extend(before.difference(&after).map(|(child, _)| child.clone()));
+                        }
+                        if has_wd_ancestor(&self.cross_file_graph, &prepared.uri) {
+                            wd_refresh
+                                .extend(after.difference(&before).map(|(child, _)| child.clone()));
+                        }
+                    }
                     self.cross_file_meta.invalidate_many(&prepared.wd_children);
                     if reserve_fanout || report_unmarked_fanout {
                         let wd_open = prepared.wd_children.iter().filter_map(|child| {
@@ -11075,9 +11103,13 @@ impl WorldState {
                 }
                 PreparedClosedMutation::Remove { basis: _, uri } => {
                     // A deleted parent stops proposing to its open children.
+                    let children = forward_children(&self.cross_file_graph, &uri);
+                    if had_wd_ancestor.contains(&uri) {
+                        wd_refresh.extend(children.iter().map(|(child, _)| child.clone()));
+                    }
                     wd_refresh.extend(
                         forward_child_proposals(
-                            forward_children(&self.cross_file_graph, &uri),
+                            children,
                             self.workspace_index.get_metadata(&uri).as_deref(),
                         )
                         .into_iter()
@@ -12579,10 +12611,39 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
         .collect()
 }
 
+/// Whether another file can pass `uri` a working directory: something
+/// `source()`s it on a lending edge, or it names a parent in
+/// `# raven: sourced-by`.
+///
+/// For such a file, closed, [`forward_child_proposals`] cannot tell what it
+/// really proposes (see the note there on closed parents). A watched change
+/// or deletion of it therefore also queues the open children it started or
+/// stopped sourcing, whatever either side appears to propose: their refresh
+/// re-derives the directory through the file's ancestors
+/// ([`enrich_open_metadata_with_inherited_wd`]). A file nothing runs has only
+/// the directory its own metadata gives it, and the comparison is exact.
+///
+/// `try_commit_closed_batch` asks this of the graph as it was before the
+/// batch for the edges a file dropped (and for a deleted file), and of the
+/// updated graph for the edges it added.
+fn has_wd_ancestor(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> bool {
+    graph
+        .get_dependents(uri)
+        .into_iter()
+        .any(is_wd_ancestor_edge)
+}
+
 /// What a parent proposes to each of its `forward_children`, given its
 /// metadata: the directory it runs them in, or `None` for a `chdir = TRUE`
 /// call, which runs the child in its own directory. A parent that proposes
 /// nothing (no `cd` in effect, no `chdir = TRUE`) gives an empty set.
+///
+/// The directory is the first of the parent's explicit `# raven: cd`, its
+/// Shiny application directory, and its inherited directory, the order
+/// [`PathContext::from_metadata`](crate::cross_file::path_resolve::PathContext::from_metadata)
+/// applies them in. The values are compared as stored, without resolving
+/// them: this runs under the `WorldState` write lock, and two spellings of
+/// one directory only cost a refresh that changes nothing.
 ///
 /// A commit re-derives the open children whose proposal changed between the
 /// parent's old and new sets, whether because the directory it runs them in
@@ -12592,9 +12653,14 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 /// a directory a forward parent passed on in the last workspace derivation,
 /// while the new set comes from disk metadata, whose inherited directory
 /// comes only from its backward directives. Such a parent can then queue a
-/// refresh that changes nothing, or miss one; that is the documented limit of
-/// a closed intermediate file keeping its old directory until it is
-/// re-indexed.
+/// refresh that changes nothing, or appear to propose nothing while it in
+/// fact passes its own parent's directory on. For the second case
+/// `try_commit_closed_batch` also queues the children a file with an
+/// ancestor started or stopped sourcing ([`has_wd_ancestor`]). What remains
+/// is the documented limit of a closed intermediate file: its own index entry
+/// and graph edges keep the directory they were derived under until it is
+/// re-indexed, so a `source()` path that resolves to a different file under
+/// the directory its parent really runs it in is not followed.
 fn forward_child_proposals(
     children: Vec<(Url, bool)>,
     metadata: Option<&crate::cross_file::CrossFileMetadata>,
@@ -12603,6 +12669,7 @@ fn forward_child_proposals(
         metadata
             .working_directory
             .clone()
+            .or_else(|| metadata.application_working_directory.clone())
             .or_else(|| metadata.inherited_working_directory.clone())
     });
     children
@@ -16751,6 +16818,50 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 .inherited_working_directory,
             None,
             "nothing sources old.R once the batch lists wd/members"
+        );
+    }
+
+    /// The proposal comparison reads a parent's directory in the order path
+    /// resolution applies it: an explicit `cd`, then the Shiny application
+    /// directory, then an inherited one (issue #885). A change the
+    /// application directory masks is no change, and a `chdir = TRUE` call
+    /// proposes the child's own directory whatever the parent's is.
+    #[test]
+    fn forward_child_proposals_follow_path_resolution_precedence() {
+        let child = Url::parse("file:///w/demo/sub/child.R").unwrap();
+        let metadata = |cd: Option<&str>, app: Option<&str>, inherited: Option<&str>| {
+            crate::cross_file::CrossFileMetadata {
+                working_directory: cd.map(str::to_string),
+                application_working_directory: app.map(str::to_string),
+                inherited_working_directory: inherited.map(str::to_string),
+                ..Default::default()
+            }
+        };
+        let proposed = |chdir: bool, metadata: &crate::cross_file::CrossFileMetadata| {
+            forward_child_proposals(vec![(child.clone(), chdir)], Some(metadata))
+                .into_iter()
+                .map(|(_, proposal)| proposal)
+                .collect::<Vec<_>>()
+        };
+        let dir = |dir: &str| vec![Some(dir.to_string())];
+
+        assert!(proposed(false, &metadata(None, None, None)).is_empty());
+        assert_eq!(
+            proposed(false, &metadata(None, Some("/w/demo"), None)),
+            dir("/w/demo")
+        );
+        assert_eq!(
+            proposed(false, &metadata(None, Some("/w/demo"), Some("/w/a"))),
+            proposed(false, &metadata(None, Some("/w/demo"), Some("/w/b"))),
+            "the application directory masks the inherited one"
+        );
+        assert_eq!(
+            proposed(false, &metadata(Some("lib"), Some("/w/demo"), None)),
+            dir("lib")
+        );
+        assert_eq!(
+            proposed(true, &metadata(None, Some("/w/demo"), None)),
+            vec![None]
         );
     }
 

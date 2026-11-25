@@ -147,6 +147,14 @@ const MAX_FORCE_REPUBLISH: u32 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DiagnosticsEpoch(u64);
 
+/// One URI's live diagnostic lifecycle, as the gate tracks it.
+#[derive(Debug, Clone, Copy)]
+struct LiveLifecycle {
+    epoch: DiagnosticsEpoch,
+    /// See [`CrossFileDiagnosticsGate::metadata_refresh_generation`].
+    metadata_refresh_generation: u64,
+}
+
 /// Diagnostics publish gating to enforce monotonic publishing
 ///
 /// `force_republish` is a counter, not a set: each `mark_force_republish` adds
@@ -178,9 +186,9 @@ pub struct CrossFileDiagnosticsGate {
     last_published_version: RwLock<HashMap<Url, i32>>,
     /// Outstanding forced-republish markers per URI (dependency-triggered, version unchanged)
     force_republish: RwLock<HashMap<Url, u32>>,
-    /// Each URI's current diagnostic lifecycle epoch. Present iff the URI is
+    /// Each URI's current diagnostic lifecycle. Present iff the URI is
     /// currently diagnostic-eligible and has not been retired via `clear`.
-    current_epoch: RwLock<HashMap<Url, DiagnosticsEpoch>>,
+    current_epoch: RwLock<HashMap<Url, LiveLifecycle>>,
     /// Process-wide monotonic source for `begin_epoch`. Never reset, so
     /// retired epochs are never reused.
     next_epoch: AtomicU64,
@@ -210,7 +218,13 @@ impl CrossFileDiagnosticsGate {
         let mut force = self.force_republish.write().unwrap();
         last_published.remove(uri);
         force.remove(uri);
-        current.insert(uri.clone(), epoch);
+        current.insert(
+            uri.clone(),
+            LiveLifecycle {
+                epoch,
+                metadata_refresh_generation: 0,
+            },
+        );
         epoch
     }
 
@@ -219,7 +233,49 @@ impl CrossFileDiagnosticsGate {
     /// [`Self::clear`]). Captured alongside version/revision when diagnostic
     /// work starts and validated by [`Self::try_consume_publish`] at commit.
     pub fn current_epoch(&self, uri: &Url) -> Option<DiagnosticsEpoch> {
-        self.current_epoch.read().unwrap().get(uri).copied()
+        self.current_epoch
+            .read()
+            .unwrap()
+            .get(uri)
+            .map(|live| live.epoch)
+    }
+
+    /// How many metadata refreshes have committed for `uri` in its live
+    /// lifecycle (issue #885), or `None` when it has none.
+    ///
+    /// A metadata refresh replaces an open document's metadata and keeps its
+    /// text, so no field of `DiagnosticsTrigger` changes: diagnostics computed
+    /// against the replaced metadata keep a fresh trigger. The refresh
+    /// retires the debounced workers by cancelling them. The direct publisher
+    /// has no cancellation token, so it captures this generation with its
+    /// snapshot and declines to commit when it has moved since; otherwise it
+    /// could publish the old result and consume the force marker the
+    /// refresh reserved for its own republish.
+    ///
+    /// Only [`Self::advance_metadata_refresh_generation`] moves it, so the
+    /// other writers that replace an open document's metadata (workspace
+    /// scan, open-document replay, a watched box importer, `system.file`
+    /// routing) leave an in-flight direct publish alone.
+    pub fn metadata_refresh_generation(&self, uri: &Url) -> Option<u64> {
+        self.current_epoch
+            .read()
+            .unwrap()
+            .get(uri)
+            .map(|live| live.metadata_refresh_generation)
+    }
+
+    /// Record that a metadata refresh of `uri` committed and returned a
+    /// ticket that republishes it. The caller holds the diagnostics publish
+    /// lock and the `WorldState` write lock, so no publisher's final check
+    /// can interleave with the commit. A URI without a live lifecycle is left
+    /// alone: nothing can publish for it.
+    pub fn advance_metadata_refresh_generation(&self, uri: &Url) {
+        if let Some(live) = self.current_epoch.write().unwrap().get_mut(uri) {
+            live.metadata_refresh_generation = live
+                .metadata_refresh_generation
+                .checked_add(1)
+                .expect("metadata refresh generation exhausted");
+        }
     }
 
     /// Check if diagnostics can be published for this version.
@@ -299,7 +355,7 @@ impl CrossFileDiagnosticsGate {
         let mut last_published = self.last_published_version.write().unwrap();
         let mut force = self.force_republish.write().unwrap();
 
-        if current.get(uri) != Some(&epoch) {
+        if current.get(uri).map(|live| live.epoch) != Some(epoch) {
             return false;
         }
 
@@ -389,7 +445,7 @@ impl CrossFileDiagnosticsGate {
     /// obsolete ticket from consuming a marker minted for a reopened URI.
     pub fn retire_force_republish(&self, uri: &Url, epoch: DiagnosticsEpoch) {
         let current = self.current_epoch.read().unwrap();
-        if current.get(uri) != Some(&epoch) {
+        if current.get(uri).map(|live| live.epoch) != Some(epoch) {
             return;
         }
         let mut force = self.force_republish.write().unwrap();
@@ -1361,6 +1417,36 @@ mod tests {
 
         gate.retire_force_republish(&uri, current);
         assert_eq!(gate.force_republish_count_for_test(&uri), 0);
+    }
+
+    #[test]
+    fn metadata_refresh_generation_is_scoped_to_one_live_lifecycle() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+        let other = test_uri("other.R");
+
+        // No live lifecycle: nothing to capture, and nothing to advance.
+        assert_eq!(gate.metadata_refresh_generation(&uri), None);
+        gate.advance_metadata_refresh_generation(&uri);
+        assert_eq!(gate.metadata_refresh_generation(&uri), None);
+
+        let epoch = gate.begin_epoch(&uri);
+        gate.begin_epoch(&other);
+        assert_eq!(gate.metadata_refresh_generation(&uri), Some(0));
+        gate.advance_metadata_refresh_generation(&uri);
+        gate.advance_metadata_refresh_generation(&uri);
+        assert_eq!(gate.metadata_refresh_generation(&uri), Some(2));
+        assert_eq!(gate.metadata_refresh_generation(&other), Some(0));
+        // Advancing leaves the lifecycle itself and its publish state alone.
+        assert_eq!(gate.current_epoch(&uri), Some(epoch));
+        assert!(gate.try_consume_publish(&uri, 1, epoch));
+
+        // A new lifecycle starts over; a retired one has none.
+        gate.begin_epoch(&uri);
+        assert_eq!(gate.metadata_refresh_generation(&uri), Some(0));
+        gate.advance_metadata_refresh_generation(&uri);
+        gate.clear(&uri);
+        assert_eq!(gate.metadata_refresh_generation(&uri), None);
     }
 
     #[test]
