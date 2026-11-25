@@ -9906,9 +9906,8 @@ fn self_nse_package_for_file(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Optio
 /// [`NseAnalysis::infix_sites`] for the file at `uri`: for each infix
 /// operator call under `root` that some package declares (judged file-wide,
 /// so a file with none costs one tree walk), what the operator reaches at the
-/// call, read from the same streaming scope and position-aware package set
-/// (`inherited_packages`, `loaded_packages`, the package's `full_imports`)
-/// the undefined-variable collector uses for package exports. `None` when no
+/// call, read from the same streaming scope the undefined-variable collector
+/// uses, with the packages attached there ([`attached_at`]). `None` when no
 /// such call exists or the file has no scope artifacts; the analysis then
 /// keeps its file-wide behavior.
 fn infix_sites_from_snapshot(
@@ -9926,20 +9925,33 @@ fn infix_sites_from_snapshot(
     if !text.contains(":=") && !text.contains('%') {
         return None;
     }
-    // (operator, operator token) for each declared operator call.
+    // (operator, operator token) for each infix operator call, and the
+    // (package, name) of each `pkg::name` (a top-level alias of an operator
+    // can be replaced further down, so the file's last one isn't enough).
     let mut calls: Vec<(&str, Node)> = Vec::new();
+    let mut qualified: Vec<(&str, &str)> = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "binary_operator"
             && let Some(op) = declarable_infix_operator(node, text)
             && let Some(operator) = node.child_by_field_name("operator")
-            && may_declare_infix_operator(op, analysis)
         {
             calls.push((op, operator));
+        } else if node.kind() == "namespace_operator"
+            && let Some((package, name)) = namespace_parts(node, text)
+        {
+            qualified.push((package, unquote_backtick_name(name).unwrap_or(name)));
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
+    calls.retain(|(op, _)| {
+        let aliased = qualified
+            .iter()
+            .filter(|(_, name)| name == op)
+            .map(|(package, _)| *package);
+        may_declare_infix_operator(op, analysis, aliased)
+    });
     if calls.is_empty() {
         return None;
     }
@@ -9987,7 +9999,7 @@ fn infix_sites_from_snapshot(
                 _ if late_bound => InfixSite::Shadowed,
                 Some((symbol, _)) if package_name_from_uri(&symbol.source_uri).is_some() => {
                     let package = package_name_from_uri(&symbol.source_uri).unwrap_or_default();
-                    InfixSite::Packages(vec![package.to_string()])
+                    InfixSite::Provider(package.to_string())
                 }
                 // The file's own top level: the binding the call reaches,
                 // not the file's last one (an alias made below the call
@@ -10000,29 +10012,38 @@ fn infix_sites_from_snapshot(
                             package,
                             name,
                         }))) if unquote_backtick_name(&name).unwrap_or(&name) == op => {
-                            InfixSite::Alias(package)
+                            InfixSite::Provider(package)
                         }
                         Some(Some(_)) => InfixSite::Shadowed,
                         // A non-function value: R's lookup skips it.
-                        Some(None) => attached_at(stream, snapshot, analysis, None),
+                        Some(None) => attached_at(stream, snapshot, analysis),
                         // A binding with no assignment to read (`assign()`, a
                         // `# raven: func` directive): the file's last binding.
                         None => file_final_infix_site(op, analysis)
-                            .unwrap_or_else(|| attached_at(stream, snapshot, analysis, None)),
+                            .unwrap_or_else(|| attached_at(stream, snapshot, analysis)),
                     }
                 }
-                // A contributed name is also what the package's NAMESPACE
-                // imports by name: `importFrom(pkg, ":=")` puts `pkg`'s
-                // operator in reach of the package's files without
-                // attaching `pkg`.
-                Some((_, ScopeLayer::Contributions)) => attached_at(
-                    stream,
-                    snapshot,
-                    analysis,
-                    snapshot.scope_contribution.imported_symbols.get(op),
-                ),
+                // A contributed name is the package's own definition or what
+                // its NAMESPACE imports by name (`importFrom(pkg, ":=")`).
+                // Either is in the package's namespace, which R searches
+                // before any attached package.
+                Some((_, ScopeLayer::Contributions)) => {
+                    let contribution = &snapshot.scope_contribution;
+                    match (
+                        &analysis.self_nse_package,
+                        contribution.imported_symbols.get(op),
+                    ) {
+                        (Some(own), _) if contribution.r_internal_symbols.contains(op) => {
+                            InfixSite::Provider(own.clone())
+                        }
+                        (_, Some(importers)) if !importers.is_empty() => {
+                            InfixSite::Packages(vec![importers.iter().cloned().collect()])
+                        }
+                        _ => attached_at(stream, snapshot, analysis),
+                    }
+                }
                 Some(_) => InfixSite::Shadowed,
-                None => attached_at(stream, snapshot, analysis, None),
+                None => attached_at(stream, snapshot, analysis),
             };
             sites.insert(operator.start_byte(), site);
         }
@@ -10031,38 +10052,60 @@ fn infix_sites_from_snapshot(
 }
 
 /// [`InfixSite::Packages`] at the stream's cursor: the packages attached
-/// there (in the file or by a file that sources it), the package's own
-/// imports, and `importers` (the packages a NAMESPACE `importFrom` takes the
-/// operator from, if any), in the file-wide in-play order, then any others,
-/// sorted. A `loadNamespace()` doesn't count: it puts nothing on the search
-/// path, so the operator isn't reachable by its bare name.
+/// there (in the file or by a file that sources it) and the package's own
+/// imports, in tiers in R's lookup order. A `loadNamespace()` doesn't count:
+/// it puts nothing on the search path, so the operator isn't reachable by
+/// its bare name.
+///
+/// In the package's own files the imports come first, as the namespace's
+/// imports environment precedes the search path. Elsewhere each package a
+/// top-level `library()` call in this file attaches is its own tier, the
+/// most recently attached first, since R puts each new attachment in front.
+/// Everything else (what callers attach, a package attached again after a
+/// caller attached it) was attached before this file ran, in an order Raven
+/// doesn't know, so it forms one last tier.
 fn attached_at(
     stream: &mut SnapshotScopeStream<'_>,
     snapshot: &DiagnosticsSnapshot,
     analysis: &NseAnalysis,
-    importers: Option<&std::collections::BTreeSet<String>>,
 ) -> InfixSite {
     let scope = stream.package_snapshot();
-    let attached: HashSet<&String> = scope
+    let imports = &snapshot.scope_contribution.full_imports;
+    let package_file = analysis.self_nse_package.is_some();
+    let mut tiers: Vec<Vec<String>> = Vec::new();
+    if package_file && !imports.is_empty() {
+        tiers.push(imports.iter().cloned().collect());
+    }
+    let mut recent: Vec<&String> = Vec::new();
+    if !package_file {
+        let mut calls: Vec<_> = snapshot
+            .directive_meta
+            .library_calls
+            .iter()
+            .filter(|call| call.attaches && call.function_scope.is_none())
+            .collect();
+        calls.sort_by_key(|call| (call.line, call.column));
+        for call in calls {
+            if scope.attached_packages.contains(&call.package)
+                && !scope.inherited_packages.contains(&call.package)
+                && !recent.contains(&&call.package)
+            {
+                recent.push(&call.package);
+            }
+        }
+    }
+    tiers.extend(recent.iter().rev().map(|package| vec![(*package).clone()]));
+    let mut rest: Vec<String> = scope
         .attached_packages
         .iter()
-        .chain(snapshot.scope_contribution.full_imports.iter())
-        .chain(importers.into_iter().flatten())
-        .collect();
-    let mut packages: Vec<String> = analysis
-        .in_play_packages
-        .iter()
-        .filter(|package| attached.contains(package))
-        .cloned()
-        .collect();
-    let mut rest: Vec<String> = attached
-        .into_iter()
-        .filter(|package| !analysis.in_play_packages.contains(package))
+        .chain(imports.iter().filter(|_| !package_file))
+        .filter(|package| !recent.contains(package))
         .cloned()
         .collect();
     rest.sort();
-    packages.extend(rest);
-    InfixSite::Packages(packages)
+    rest.dedup();
+    tiers.push(rest);
+    InfixSite::Packages(tiers)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20453,14 +20496,16 @@ enum InfixSite {
     /// definition, a sourced file's, a caller's, or a top-level function or
     /// computed value of the file's own. No package declaration applies.
     Shadowed,
-    /// The file's top-level `` `op` <- pkg::`op` `` alias is the binding the
-    /// call reaches: only `pkg`'s declaration applies.
-    Alias(String),
-    /// The packages that may provide the operator here, in lookup order: a
-    /// selective import's package when one binds it, otherwise the packages
-    /// attached at this position (this file's earlier `library()` calls,
-    /// what callers lend, the package's own imports).
-    Packages(Vec<String>),
+    /// The one package whose operator the call reaches: the one a top-level
+    /// `` `op` <- pkg::`op` `` alias the call reaches names, or the package
+    /// under development when its own sources define `op`. Only its
+    /// declaration applies.
+    Provider(String),
+    /// The packages that may provide the operator here, in tiers in R's
+    /// lookup order (see [`attached_at`]): the first tier with a package
+    /// that exports the operator decides. Within a tier the order is
+    /// unknown, so its exporters' declarations must agree.
+    Packages(Vec<Vec<String>>),
 }
 
 impl<'a> NseAnalysis<'a> {
@@ -23344,13 +23389,15 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
 /// operator token's start byte), as [`NseAnalysis::infix_sites`] records it:
 /// a binding the call's scope reaches first that is not a package's shadows
 /// every package ([`InfixSite::Shadowed`]); a top-level
-/// `` `op` <- pkg::`op` `` alias the call reaches names the provider outright
-/// ([`InfixSite::Alias`]); otherwise the provider is the package among those
-/// reachable at the call that exports `op`. When several of them export it,
-/// Raven can't tell which one R's search path puts first, so it applies a
-/// declaration only when they all declare the same thing. With no reachable
-/// exporter, the package under development and the owner of the export among
-/// the reachable packages' dependencies are tried in that order. A `pkg::`
+/// `` `op` <- pkg::`op` `` alias the call reaches, or the package's own
+/// definition, names the provider outright ([`InfixSite::Provider`]);
+/// otherwise the provider is the package that exports `op` in the first of
+/// the reachable packages' tiers that has one (a package's `Depends:` count
+/// with it). When a tier has several, Raven can't tell which one R's search
+/// path puts first, so it applies a declaration only when they all declare
+/// the same thing. With no reachable exporter, the package under development
+/// and the owner of the export among the reachable packages' dependencies
+/// are tried in that order. A `pkg::`
 /// qualifier elsewhere in the file does not count: it does not put `op` on
 /// the search path, and neither does a `library()` call after the
 /// operator's call.
@@ -23358,7 +23405,7 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
 /// Without [`NseAnalysis::infix_sites`] (the collector tests that build an
 /// analysis by hand, or a call the site pass found nothing to declare for),
 /// the file's last top-level binding of `op` stands for the binding the call
-/// reaches, and the reachable packages are the file-wide in-play set.
+/// reaches, and the reachable packages are the file-wide in-play set, as one tier.
 fn declared_infix_operator(
     op: &str,
     operator_start: usize,
@@ -23387,34 +23434,47 @@ fn declared_infix_operator(
         .and_then(|sites| sites.get(&operator_start))
         .cloned()
         .or_else(|| file_final_infix_site(op, analysis));
-    let attached = match &site {
+    let tiers = match site {
         Some(InfixSite::Shadowed) => return none,
-        Some(InfixSite::Alias(package)) => return lookup(package).unwrap_or(none),
-        Some(InfixSite::Packages(packages)) => packages,
-        None => &analysis.in_play_packages,
+        Some(InfixSite::Provider(package)) => return lookup(&package).unwrap_or(none),
+        Some(InfixSite::Packages(tiers)) => tiers,
+        None => vec![analysis.in_play_packages.clone()],
     };
-    let exporters: Vec<&str> = attached
-        .iter()
-        .map(String::as_str)
-        .filter(|pkg| {
-            lib.namespace_member_status_sync(pkg, op)
+    for tier in &tiers {
+        // The package in this tier whose `op` R finds: its own export, or
+        // one a package it depends on puts on the search path with it.
+        let mut exporters: Vec<String> = Vec::new();
+        for pkg in tier {
+            let exporter = if lib.namespace_member_status_sync(pkg, op)
                 == crate::package_library::NamespaceMemberStatus::Present
-        })
-        .collect();
-    if let Some((first, rest)) = exporters.split_first() {
-        let declared = lookup(first);
-        return if rest.iter().all(|pkg| lookup(pkg) == declared) {
-            declared.unwrap_or(none)
-        } else {
-            none
-        };
+            {
+                Some(pkg.clone())
+            } else {
+                lib.find_package_owner_for_symbol(op, std::slice::from_ref(pkg))
+                    .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
+            };
+            if let Some(exporter) = exporter
+                && !exporters.contains(&exporter)
+            {
+                exporters.push(exporter);
+            }
+        }
+        if let Some((first, rest)) = exporters.split_first() {
+            let declared = lookup(first);
+            return if rest.iter().all(|pkg| lookup(pkg) == declared) {
+                declared.unwrap_or(none)
+            } else {
+                none
+            };
+        }
     }
+    let attached: Vec<String> = tiers.into_iter().flatten().collect();
     analysis
         .self_nse_package
         .as_deref()
         .and_then(lookup)
         .or_else(|| {
-            lib.find_package_owner_for_symbol(op, attached)
+            lib.find_package_owner_for_symbol(op, &attached)
                 .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
                 .and_then(|owner| lookup(&owner))
         })
@@ -23432,7 +23492,7 @@ fn file_final_infix_site(op: &str, analysis: &NseAnalysis) -> Option<InfixSite> 
         Some(LocalCalleeAlias::Qualified { package, name })
             if unquote_backtick_name(name).unwrap_or(name) == op =>
         {
-            Some(InfixSite::Alias(package.clone()))
+            Some(InfixSite::Provider(package.clone()))
         }
         Some(_) => Some(InfixSite::Shadowed),
         None => analysis
@@ -23444,11 +23504,16 @@ fn file_final_infix_site(op: &str, analysis: &NseAnalysis) -> Option<InfixSite> 
 
 /// Whether any package that could provide `op` somewhere in the file
 /// declares it: the file-wide in-play packages, the package under
-/// development, the export's owner among their dependencies, and the
-/// package the file's last top-level alias of `op` names. A loose test that
-/// decides which calls [`infix_sites_from_snapshot`] resolves; the per-call
-/// rules live in [`declared_infix_operator`].
-fn may_declare_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
+/// development, the export's owner among their dependencies, the package
+/// the file's last top-level alias of `op` names, and `qualified`, the
+/// packages the file refers to as `` pkg::`op` `` (an earlier alias). A
+/// loose test that decides which calls [`infix_sites_from_snapshot`]
+/// resolves; the per-call rules live in [`declared_infix_operator`].
+fn may_declare_infix_operator<'q>(
+    op: &str,
+    analysis: &NseAnalysis,
+    qualified: impl IntoIterator<Item = &'q str>,
+) -> bool {
     let Some(lib) = analysis.package_library else {
         return false;
     };
@@ -23470,6 +23535,7 @@ fn may_declare_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
         .chain(analysis.self_nse_package.as_deref())
         .chain(alias_package)
         .any(declares)
+        || qualified.into_iter().any(declares)
         || lib
             .find_package_owner_for_symbol(op, &analysis.in_play_packages)
             .is_some_and(|owner| declares(&owner))
@@ -23488,7 +23554,13 @@ fn top_level_callee_binding_at<'t>(
     let line = text.lines().nth(row)?;
     let column = crate::utf16::utf16_column_to_byte_offset(line, symbol.defined_column);
     let point = tree_sitter::Point { row, column };
-    let mut node = root.descendant_for_point_range(point, point)?;
+    // A one-byte range: an empty one at the file's start is the whole
+    // program's.
+    let end = tree_sitter::Point {
+        row,
+        column: column + 1,
+    };
+    let mut node = root.descendant_for_point_range(point, end)?;
     loop {
         if let Some(target) = assignment_target_node(node)
             && target.start_position() == point
@@ -32921,26 +32993,29 @@ d[n > 1, older] := 1
         captured = ["cond"]
     "#;
 
-    /// Run the full diagnostics pipeline on `code` with four fake packages
-    /// installed: `capa` and `capb` export `%where%` and declare its right
-    /// operand captured, `plain` exports a `%where%` that evaluates it and
-    /// declares nothing, and `dotpkg` exports `%dot%` declared the same way.
-    /// Returns the names reported as undefined variables.
-    async fn where_undefined_names(code: &str) -> Vec<String> {
+    /// A warmed library of fake packages: `capa` and `capb` export `%where%`
+    /// and declare its right operand captured, `plain` exports a `%where%`
+    /// that evaluates it and declares nothing, `wrapplain` depends on
+    /// `plain`, `dotpkg` exports `%dot%` declared like `capa`'s `%where%`,
+    /// and `ownop` (a package under development) exports its own declared
+    /// `%where%`.
+    async fn where_library() -> (tempfile::TempDir, crate::package_library::PackageLibrary) {
         let (root, mut lib) =
             library_with_declaring_package("capa", &["\"%where%\""], Some(WHERE_CAPTURES_SIDECAR))
                 .await;
         let dot_sidecar = WHERE_CAPTURES_SIDECAR.replace("%where%", "%dot%");
-        for (pkg, export, sidecar) in [
-            ("capb", "%where%", Some(WHERE_CAPTURES_SIDECAR)),
-            ("plain", "%where%", None),
-            ("dotpkg", "%dot%", Some(dot_sidecar.as_str())),
+        for (pkg, depends, export, sidecar) in [
+            ("capb", "", "%where%", Some(WHERE_CAPTURES_SIDECAR)),
+            ("plain", "", "%where%", None),
+            ("wrapplain", "Depends: plain\n", "wrap_fn", None),
+            ("dotpkg", "", "%dot%", Some(dot_sidecar.as_str())),
+            ("ownop", "", "%where%", Some(WHERE_CAPTURES_SIDECAR)),
         ] {
             let dir = root.path().join(pkg);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("DESCRIPTION"),
-                format!("Package: {pkg}\nVersion: 0.1.0\n"),
+                format!("Package: {pkg}\nVersion: 0.1.0\n{depends}"),
             )
             .unwrap();
             std::fs::write(dir.join("NAMESPACE"), format!("export(\"{export}\")\n")).unwrap();
@@ -32950,18 +33025,17 @@ d[n > 1, older] := 1
             }
         }
         lib.set_lib_paths(vec![root.path().to_path_buf()]);
-        for pkg in ["capa", "capb", "plain", "dotpkg"] {
+        for pkg in ["capa", "capb", "plain", "wrapplain", "dotpkg", "ownop"] {
             lib.get_package(pkg).await;
         }
-        let uri = Url::parse("file:///workspace/main.R").unwrap();
-        let mut state = WorldState::new();
-        state.workspace_scan_complete = true;
-        state.package_library_ready = true;
-        state.package_library = Arc::new(lib);
-        state.open_document(uri.clone(), code, Some(1));
-        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
-        let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
-            .expect("diagnostics");
+        // What attaching `wrapplain` brings in, as the diagnostics run's
+        // package warm-up records it.
+        lib.get_all_exports("wrapplain").await;
+        (root, lib)
+    }
+
+    /// The names a diagnostics run reports as undefined variables.
+    fn undefined_names(diagnostics: &[Diagnostic]) -> Vec<String> {
         diagnostics
             .iter()
             .filter(|d| {
@@ -32978,6 +33052,22 @@ d[n > 1, older] := 1
             .collect()
     }
 
+    /// Run the full diagnostics pipeline on the script `code` against
+    /// [`where_library`]. Returns the names reported as undefined variables.
+    async fn where_undefined_names(code: &str) -> Vec<String> {
+        let (_root, lib) = where_library().await;
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.package_library_ready = true;
+        state.package_library = Arc::new(lib);
+        state.open_document(uri.clone(), code, Some(1));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics");
+        undefined_names(&diagnostics)
+    }
+
     /// Only foreach's execution operators are claimed as modeled: a package's
     /// `%dot%`, which merely begins with `%do`, keeps its declaration.
     #[tokio::test]
@@ -32986,15 +33076,20 @@ d[n > 1, older] := 1
         assert_eq!(where_undefined_names(code).await, Vec::<String>::new());
     }
 
-    /// When two attached packages export the operator, the declaration
-    /// applies only if both declare the same thing: Raven can't tell which
-    /// one R's search path puts first, and a masked package's declaration
-    /// must not apply to the operator that runs. A package attached only
-    /// after the call doesn't compete.
+    /// When several attached packages export the operator, the one this
+    /// file attached last is the one R runs, and only its declaration
+    /// applies, including through a package's `Depends:`. A package attached
+    /// only after the call doesn't compete. When the order isn't known
+    /// (packages a caller attached), the declaration applies only if they
+    /// all declare the same thing.
     #[tokio::test]
-    async fn infix_declaration_with_several_exporters_needs_them_to_agree() {
+    async fn infix_declaration_follows_the_exporter_attached_last() {
         let masked = "library(capa)\nlibrary(plain)\nd <- 1\nd %where% missing_after\n";
         assert_eq!(where_undefined_names(masked).await, vec!["missing_after"]);
+        let last = "library(plain)\nlibrary(capa)\nd <- 1\nd %where% captured_last\n";
+        assert_eq!(where_undefined_names(last).await, Vec::<String>::new());
+        let depends = "library(capa)\nlibrary(wrapplain)\nd <- 1\nd %where% missing_dep\n";
+        assert_eq!(where_undefined_names(depends).await, vec!["missing_dep"]);
         let agreeing = "library(capa)\nlibrary(capb)\nd <- 1\nd %where% captured\n";
         assert_eq!(where_undefined_names(agreeing).await, Vec::<String>::new());
         let later = "library(capa)\nd <- 1\nd %where% captured\nlibrary(plain)\n";
@@ -33033,6 +33128,80 @@ d %where% shadow_first
 d %where% captured_after
 ";
         assert_eq!(where_undefined_names(shadowed).await, vec!["shadow_first"]);
+        let redefined = "`%where%` <- capa::`%where%`
+d <- 1
+d %where% captured_alias
+`%where%` <- function(data, cond) cond
+d %where% missing_redef
+";
+        assert_eq!(
+            where_undefined_names(redefined).await,
+            vec!["missing_redef"]
+        );
+    }
+
+    /// In a package's own files the namespace comes before the search path:
+    /// an `importFrom` of the operator, or the package's own definition of
+    /// it, is what the call runs, whatever else the package imports.
+    #[tokio::test]
+    async fn infix_declaration_in_a_package_prefers_its_namespace() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        let code = "f <- function(d) d %where% captured_col\n";
+        let mut flagged = Vec::new();
+        for (package, namespace, own_op) in [
+            (
+                "usesca",
+                "importFrom(capa, \"%where%\")\nimport(plain)\nexport(f)\n",
+                false,
+            ),
+            ("ownop", "import(plain)\nexport(f)\n", true),
+        ] {
+            let (_root, lib) = where_library().await;
+            let mut state = WorldState::new();
+            state.workspace_folders = vec![Url::parse("file:///work/pkg").unwrap()];
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = true;
+            state.package_library = Arc::new(lib);
+            state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+            state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+            state.package_inputs.description = Some(DescriptionInput {
+                text: format!("Package: {package}\nImports: capa, plain\n").into(),
+            });
+            state.package_inputs.namespace = Some(NamespaceInput {
+                text: namespace.into(),
+            });
+            let mut files = vec![("/work/pkg/R/f.R", code)];
+            if own_op {
+                files.push((
+                    "/work/pkg/R/op.R",
+                    "`%where%` <- function(data, cond) data\n",
+                ));
+            }
+            for (path, text) in files {
+                let text: std::sync::Arc<str> = text.into();
+                state.package_inputs.r_files.insert(
+                    std::path::PathBuf::from(path),
+                    RFileInput {
+                        kind: RFileKind::Source,
+                        text: text.clone(),
+                        content_digest: ContentDigest::of(&text),
+                    },
+                );
+            }
+            state.apply_package_event(&PackageInputDelta::Initial);
+            let uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+            state.open_document(uri.clone(), code, Some(1));
+            let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+            let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("diagnostics");
+            flagged.push(undefined_names(&diagnostics));
+        }
+        assert_eq!(flagged[0], Vec::<String>::new(), "importFrom");
+        assert_eq!(flagged[1], Vec::<String>::new(), "own definition");
     }
 
     // ---- Package-declared bracket NSE (`[subset]` in `inst/raven/nse.toml`) ----
