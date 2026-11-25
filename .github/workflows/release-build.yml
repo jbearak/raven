@@ -19,6 +19,13 @@ jobs:
   # Classify the tag as a stable or pre-release (odd minor) release before any
   # other work, and reject versions the VS Code Marketplace would refuse.
   # scripts/release-channel.sh documents the versioning scheme.
+  #
+  # Also fail unless the tag names the workspace version of the tagged commit
+  # (scripts/check-release-tag.sh). The extension, archive, and Debian package
+  # take their version from the tag and `raven --version` takes it from
+  # Cargo.toml, so a tag pushed without the version bump would ship a
+  # mislabelled release. Every other job needs this one, directly or through
+  # another job, so nothing builds or publishes after a mismatch.
   release-channel:
     runs-on: ubuntu-latest
     outputs:
@@ -26,10 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Determine release channel
+      - name: Check the tag against the workspace version and determine the release channel
         id: channel
         run: |
-          channel=$(./scripts/release-channel.sh "$GITHUB_REF_NAME")
+          channel=$(./scripts/check-release-tag.sh "$GITHUB_REF_NAME" < Cargo.toml)
           echo "Release channel for $GITHUB_REF_NAME: $channel"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
 

@@ -526,6 +526,9 @@ impl RSubprocess {
     ///
     /// The returned list contains platform-specific candidate paths (macOS, Linux, Windows) in a preferred order.
     /// Entries are suggestions and may point to non-existent files; callers should validate existence before use.
+    ///
+    /// `scripts/fresh-install-check.sh` refuses to run its "no R" check when any of these exists, so its
+    /// candidate list must cover this one; `fresh_install_check_lists_every_common_r_path` compares them.
     fn get_common_r_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
@@ -1727,6 +1730,38 @@ mod tests {
         let paths = RSubprocess::get_common_r_paths();
         // Should return at least some common paths for the platform
         assert!(!paths.is_empty());
+    }
+
+    /// `scripts/fresh-install-check.sh` proves the tutorial works without R, so it must refuse to run
+    /// when R sits in any location discovery probes after PATH.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_install_check_lists_every_common_r_path() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/fresh-install-check.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .arg("--list-r-candidates")
+            .output()
+            .expect("bash should run scripts/fresh-install-check.sh");
+        assert!(
+            output.status.success(),
+            "--list-r-candidates failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listed: Vec<PathBuf> = String::from_utf8(output.stdout)
+            .expect("candidate paths should be UTF-8")
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+        for path in RSubprocess::get_common_r_paths() {
+            assert!(
+                listed.contains(&path),
+                "scripts/fresh-install-check.sh does not check {}, which R discovery probes; \
+                 add it to r_candidates there. Listed: {listed:?}",
+                path.display()
+            );
+        }
     }
 
     #[test]
