@@ -22,6 +22,11 @@ const change_listeners: Array<() => void> = [];
 const close_listeners: Array<(t: unknown) => void> = [];
 const start_listeners: Array<(s: unknown) => void> = [];
 let tracker_factory: { createDebugAdapterTracker(s: unknown): { onDidSendMessage(m: unknown): void } } | null = null;
+/** Every `startDebugging` call's configuration. */
+const started: Array<{ consoleSocket?: string }> = [];
+/** Configuration providers by registration order. */
+const config_providers: Array<{ resolveDebugConfiguration(...a: unknown[]): unknown }> = [];
+const error_messages: string[] = [];
 
 class SourceBreakpoint {
     enabled = true;
@@ -51,7 +56,10 @@ mock.module('vscode', () => ({
     debug: {
         get breakpoints() { return bps; },
         activeDebugSession: undefined,
-        registerDebugConfigurationProvider: disposable,
+        registerDebugConfigurationProvider: (_t: string, p: (typeof config_providers)[number]) => {
+            config_providers.push(p);
+            return disposable();
+        },
         registerDebugAdapterDescriptorFactory: disposable,
         registerDebugAdapterTrackerFactory: (_t: string, f: typeof tracker_factory) => {
             tracker_factory = f;
@@ -60,7 +68,12 @@ mock.module('vscode', () => ({
         onDidChangeBreakpoints: (cb: () => void) => { change_listeners.push(cb); return disposable(); },
         onDidStartDebugSession: (cb: (s: unknown) => void) => { start_listeners.push(cb); return disposable(); },
         onDidTerminateDebugSession: disposable,
-        startDebugging: async () => true,
+        startDebugging: async (_f: unknown, config: { consoleSocket?: string }) => {
+            started.push(config);
+            // VS Code takes a moment to start a session.
+            await new Promise((r) => setTimeout(r, 50));
+            return true;
+        },
     },
     window: {
         activeTerminal: undefined,
@@ -69,7 +82,7 @@ mock.module('vscode', () => ({
         onDidChangeActiveTerminal: disposable,
         onDidCloseTerminal: (cb: (t: unknown) => void) => { close_listeners.push(cb); return disposable(); },
         showInformationMessage: async () => undefined,
-        showErrorMessage: async () => undefined,
+        showErrorMessage: async (m: string) => { error_messages.push(m); return undefined; },
         showWarningMessage: async () => undefined,
     },
     workspace: {
@@ -79,7 +92,7 @@ mock.module('vscode', () => ({
     },
 }));
 
-const { register_debugger } = await import('../../editors/vscode/src/debugger/index');
+const { register_debugger, register_debugger_unavailable } = await import('../../editors/vscode/src/debugger/index');
 const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
 
 // --------------------------------------------------------------- fake console
@@ -92,6 +105,12 @@ class FakeConsole {
     executes: Wire[] = [];
     /** Reply `ok` before applying, as when the summary thread lags. */
     ok_first = false;
+    /**
+     * How a mirror is answered: applied (`ok`), as by a console still
+     * running R's startup profiles (`not-ready`), or as by one whose
+     * debugger can't start (`unavailable`).
+     */
+    mirror_mode: 'ok' | 'not-ready' | 'unavailable' = 'ok';
     private subscribers: net.Socket[] = [];
     private server: net.Server;
     constructor(readonly socket: string) {
@@ -117,6 +136,10 @@ class FakeConsole {
         for (const s of this.subscribers) s.destroy();
         this.server.close();
     }
+    /** Push an event to every subscriber. */
+    push(event: object): void {
+        for (const s of this.subscribers) s.write(JSON.stringify(event) + '\n');
+    }
     private reply(sock: net.Socket, id: unknown, status: string): void {
         sock.write(JSON.stringify({ id, status }) + '\n');
     }
@@ -127,6 +150,11 @@ class FakeConsole {
                 this.subscribers.push(sock);
                 return;
             case 'breakpoints': {
+                if (this.mirror_mode !== 'ok') {
+                    this.reply(sock, msg.id, this.mirror_mode);
+                    sock.end();
+                    return;
+                }
                 const files = (msg.files ?? {}) as Record<string, Array<{ line: number }>>;
                 // Like set_file_breakpoints: one file at a time, each
                 // followed by a full summary (with a gap, so a client that
@@ -496,5 +524,64 @@ describe('launch with program', () => {
         await settle();
         expect(con.executes.length).toBe(1);
         expect(con.executes[0].debugProgram).toBe(true);
+    });
+});
+
+describe('a console whose debugger is not running yet, or never will', () => {
+    test("a console that can't run the debugger releases sends at once", async () => {
+        const { con, sock } = await console_at();
+        con.mirror_mode = 'unavailable';
+        set_breakpoints([line_bp(a_r, 1)]);
+        attach(sock);
+        const start = Date.now();
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        expect(Date.now() - start).toBeLessThan(1_000);
+    });
+
+    test('breakpoints are armed when the debugger starts after the mirror gave up', async () => {
+        const { con, sock } = await console_at();
+        con.mirror_mode = 'not-ready';
+        set_breakpoints([line_bp(a_r, 2)]);
+        attach(sock);
+        // The profiles outlast the link's retries (about 10 s): it gives up
+        // and releases sends with nothing armed.
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 20_000);
+        expect(con.files.size).toBe(0);
+        // R finishes its startup profiles and the debugger starts.
+        con.mirror_mode = 'ok';
+        con.push({ event: 'ready' });
+        await until(() => con.files.size === 1);
+        expect([...con.files]).toEqual([[real(a_r), [2]]]);
+    }, 30_000);
+});
+
+describe('auto-attach', () => {
+    test('a stop heard twice (replayed on subscribe and pushed) starts one session', async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        const before = started.filter((c) => c.consoleSocket === sock).length;
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await settle(300);
+        expect(started.filter((c) => c.consoleSocket === sock).length - before).toBe(1);
+    });
+});
+
+describe('with the R console turned off', () => {
+    test('a raven-r launch configuration says why instead of failing to find an adapter', async () => {
+        const ctx = { subscriptions: [] as Array<{ dispose(): void }> };
+        const n_before = config_providers.length;
+        register_debugger_unavailable(ctx as never);
+        const provider = config_providers[n_before];
+        expect(provider).toBeDefined();
+        const result = await provider.resolveDebugConfiguration(undefined, { type: 'raven-r', request: 'launch', name: 'x' });
+        expect(result).toBeUndefined();
+        expect(error_messages.at(-1)).toContain('raven.rConsole.activation');
+        for (const d of ctx.subscriptions) d.dispose();
     });
 });

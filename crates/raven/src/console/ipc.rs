@@ -26,9 +26,21 @@
 //! ← {"event":"stopped","reason":"breakpoint"}          // stop/run events
 //! ← {"event":"breakpoints","breakpoints":[…]}          // and line breakpoint
 //!                                                      // states (DAP shape)
+//! ← {"event":"ready"}                                  // the debugger started
 //! → {"v":1,"id":11,"op":"breakpoints","files":{"/w/a.R":[{"line":3}]},
 //!    "functions":["f"],"exceptionFilters":["error"]}   // mirror while no
 //! ← {"id":11,"status":"ok"}                            // session exists
+//! ```
+//!
+//! A `subscribe` made while R is stopped in the debugger is followed by that
+//! stop's `stopped` event, so an editor that connects (or reconnects to a
+//! persistent console) after the stop still attaches. A `breakpoints` mirror
+//! is answered `not-ready` while R is starting (the console pushes `ready`
+//! once the debugger runs) and `unavailable` when the debugger will never
+//! run in this console; a client should stop resending it then. Clients
+//! that predate `unavailable` treat it as "not applied" and stop too.
+//!
+//! ```text
 //! → {"v":1,"id":13,"op":"inspect"}                    // Inspect Last Error
 //! ← {"id":13,"status":"ok"}        // or "none", "busy", "stopped"
 //! ```
@@ -192,19 +204,35 @@ fn serve(
             }
             Some("subscribe") => {
                 let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": "ok"}));
-                if let Ok(push) = writer.try_clone() {
+                if let Ok(mut push) = writer.try_clone() {
                     // A subscriber that stops reading is dropped rather
                     // than stalling every later push.
                     let _ = push.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-                    subscribers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(push);
+                    // Under the lock the pushing thread writes under: a stop
+                    // recorded before this check is replayed here, and one
+                    // recorded after it is pushed once this subscriber is in
+                    // the list. Either way the editor hears of it.
+                    let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+                    let replayed = match super::dap::stop_reason() {
+                        Some(reason) => {
+                            let line = serde_json::json!({"event": "stopped", "reason": reason});
+                            push.write_all(format!("{line}\n").as_bytes()).is_ok()
+                        }
+                        None => true,
+                    };
+                    if replayed {
+                        subs.push(push);
+                    }
                 }
             }
             Some("breakpoints") => {
-                let ok = apply_breakpoint_mirror(&msg);
-                let status = if ok { "ok" } else { "not-ready" };
+                let status = if apply_breakpoint_mirror(&msg) {
+                    "ok"
+                } else if super::dap::unavailable() {
+                    "unavailable"
+                } else {
+                    "not-ready"
+                };
                 let _ = writeln!(
                     writer,
                     "{}",
@@ -239,7 +267,8 @@ fn serve(
 
 /// The extension's copy of VS Code's R breakpoints, sent while no debug
 /// session exists (design §2.1), so code run before the first stop is
-/// already instrumented. `false` until the debugger has started.
+/// already instrumented. `false` until the debugger has started (and for
+/// good when it can't start; see `dap::unavailable`).
 fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
     if !super::dap::ready() {
         return false;
@@ -277,6 +306,6 @@ fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
                 .collect::<Vec<_>>()
         })
     };
-    super::dap::set_mirrored(strings("functions"), strings("exceptionFilters"));
+    super::dap::set_mirrored(strings("functions"), strings("exceptionFilters"), ticket);
     true
 }

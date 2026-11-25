@@ -164,7 +164,8 @@ See the [settings reference](settings-reference.md) for all settings.
 
 ## Limitations
 
-- Consoles. The debugger works only with Raven's console, not with plain R, radian or arf.
+- Consoles. The debugger works only with Raven's console, not with plain R, radian or arf. When Raven's console is turned off (`raven.rConsole.activation`), the R (Raven console) debugger and Raven's breakpoints in R files are off too.
+- R version. The debugger needs R 4.2 or later. In older R the console runs without it.
 - Code already loaded. Breakpoints bind when code runs from the editor, `source()`, or `load_all()`. A breakpoint set in a function that was defined earlier activates when you run the definition again. Ark/Positron has the same limitation. This includes breakpoints you add while stopped, and Run to Cursor, which works by adding a temporary breakpoint: in code loaded before the breakpoint existed, it continues instead.
 - Stepping into callbacks. Step Into a call to base R or package code steps over it, including the functions you pass to it, as in `lapply(xs, function(x) …)` or an S3 method reached through `print()`. Set a breakpoint inside the callback instead; it binds when you run the code that defines it.
 - Instrumented functions run slower. A function that holds a breakpoint isn't byte-compiled, so loops in it run several times slower until you remove the breakpoint and run it again. `print(f)` shows the probe lines.

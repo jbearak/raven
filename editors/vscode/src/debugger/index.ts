@@ -38,6 +38,11 @@ import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
  * - F5 with an R file open and no launch.json sources that file in the
  *   console (a `launch` with `program`); the session itself is the same
  *   attach to the console.
+ * - The `raven-r` debugger and the R breakpoint contributions are enabled
+ *   only while `raven.rConsoleEnabled` holds (package.json `when`). VS Code
+ *   still resolves an explicit launch.json `raven-r` configuration through
+ *   its providers, so with the console off `register_debugger_unavailable`
+ *   answers it with a message instead of a missing-adapter error.
  */
 
 export const DEBUG_TYPE = 'raven-r';
@@ -71,6 +76,8 @@ const attach_after_end = new Set<string>();
 /** Sessions the console has ended (`terminated`) that VS Code is tearing down. */
 const ending = new Set<string>();
 const links = new Map<string, ConsoleLink>();
+/** Consoles a session is being started for (a stop can be heard twice). */
+const attaching = new Set<string>();
 
 function wait_for_file(file: string, ms: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -286,6 +293,9 @@ class ConsoleLink {
                     this.mirror();
                 }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
+                // The debugger started after R ran its startup profiles: a
+                // mirror that gave up waiting for it is sent again.
+                if (msg.event === 'ready') this.mirror();
                 if (msg.event === 'breakpoints') {
                     this.heard = true;
                     this.states = msg.breakpoints ?? [];
@@ -418,6 +428,9 @@ class ConsoleLink {
             if (done || !reply.includes('\n')) return;
             done = true;
             sock.end();
+            // `not-ready`: R is still starting. `unavailable` (the debugger
+            // can't run in this console) is final and falls through to
+            // `finish()`, releasing sends at once.
             if (reply.includes('"not-ready"') && attempt < 40) {
                 // Rebuilt on retry, so it carries any change made meanwhile.
                 this.again = false;
@@ -459,12 +472,19 @@ async function auto_attach(ipc: string): Promise<void> {
         if (ending.has(current.id)) attach_after_end.add(ipc);
         return;
     }
-    await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
-        type: DEBUG_TYPE,
-        request: 'launch',
-        name: 'R console',
-        consoleSocket: ipc,
-    });
+    // A stop replayed on subscribe can arrive next to the same stop's push.
+    if (attaching.has(ipc)) return;
+    attaching.add(ipc);
+    try {
+        await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
+            type: DEBUG_TYPE,
+            request: 'launch',
+            name: 'R console',
+            consoleSocket: ipc,
+        });
+    } finally {
+        attaching.delete(ipc);
+    }
 }
 
 /** The console a new session should attach to, opening one if needed. */
@@ -621,6 +641,29 @@ const tracker_factory: vscode.DebugAdapterTrackerFactory = {
         };
     },
 };
+
+/**
+ * With Raven's R console turned off, `raven-r` is disabled (package.json
+ * `when`) but a launch.json configuration of that type still reaches its
+ * providers. Answer it with why, instead of VS Code's missing-adapter error.
+ */
+export function register_debugger_unavailable(context: vscode.ExtensionContext): void {
+    const why = "Raven: the R debugger runs in Raven's R console, which is turned off in this window (raven.rConsole.activation).";
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, {
+            resolveDebugConfiguration() {
+                void vscode.window.showErrorMessage(why);
+                // `undefined` aborts quietly; `null` would open launch.json.
+                return undefined;
+            },
+        }),
+        vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
+            createDebugAdapterDescriptor() {
+                throw new Error(why);
+            },
+        }),
+    );
+}
 
 function mirror_all(): void {
     for (const link of links.values()) link.mirror();

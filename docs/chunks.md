@@ -96,7 +96,7 @@ Both work like the file, line, and block [ignore directives](directives.md#ignor
 | `Cmd+PageDown` | `Ctrl+PageDown` | Go to Next Chunk |
 | `Cmd+PageUp` | `Ctrl+PageUp` | Go to Previous Chunk |
 
-The letter-key shortcuts (`P`/`N`) run code and follow the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs one neighboring chunk, and Shift runs all chunks above or below. `PageDown`/`PageUp` only move the cursor. See [Keybindings](keybinding-comparison.md) for a comparison with other tools.
+The letter-key shortcuts (`P`/`N`) run code and follow the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs one neighboring chunk, and Shift runs all chunks above or below. `PageDown`/`PageUp` only move the cursor, and only in a file that has chunks: elsewhere they keep VS Code's meaning (Next/Previous Editor on Windows and Linux). See [Keybindings](keybinding-comparison.md) for a comparison with other tools.
 
 In `.R` files without `# %%` cell markers, the current-chunk shortcuts show an information notification; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
 

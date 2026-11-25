@@ -52,6 +52,7 @@ The setting turns these on or off together:
 - [Knit Preview](knit.md), its command, and its `Shift+Cmd+Enter` / `Shift+Ctrl+Enter` keybinding. Knit Preview also needs `raven.rmdKnit.enabled`.
 - [Quarto Preview and Render](quarto.md): the commands, the editor-title button, and the Preview keybinding. **Stop Quarto Preview** stays in the Command Palette so you can always stop a running preview.
 - The [R package build commands](r-package-dev.md) (Load All, Document, Test Package, Check Package, and the rest).
+- The [debugger](debugger.md): the R (Raven console) debug type and Raven's breakpoints in R, R Markdown, and Quarto files. Another R debugger you have installed still gets F5 and its own breakpoints.
 
 These stay on regardless of the setting:
 

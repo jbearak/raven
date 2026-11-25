@@ -51,6 +51,13 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// How a test console is given `--dap`.
+enum DapArg {
+    Socket,
+    Unbindable,
+    Off,
+}
+
 struct Console {
     child: Child,
     master: Option<File>,
@@ -64,6 +71,28 @@ impl Console {
     }
 
     fn spawn_with_env(env: &[(&str, &str)]) -> Console {
+        let c = Console::launch(
+            env,
+            DapArg::Socket,
+            &["--no-save", "--no-restore", "--vanilla", "-q"],
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        while !(c.dir.join("i").exists() && c.dir.join("d").exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "console sockets never appeared:\n{}",
+                c.text()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let R finish starting (and the debugger install its handlers).
+        std::thread::sleep(Duration::from_millis(800));
+        c
+    }
+
+    /// Start a console and return once its IPC socket exists (R may still
+    /// be starting).
+    fn launch(env: &[(&str, &str)], dap: DapArg, r_args: &[&str]) -> Console {
         let dir = scratch();
         let mut master: libc::c_int = 0;
         let mut slave: libc::c_int = 0;
@@ -89,10 +118,18 @@ impl Console {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_raven"));
         cmd.arg("console")
             .args(["--no-history", "--ipc"])
-            .arg(dir.join("i"))
-            .arg("--dap")
-            .arg(dir.join("d"))
-            .args(["--no-save", "--no-restore", "--vanilla", "-q"])
+            .arg(dir.join("i"));
+        match dap {
+            DapArg::Socket => {
+                cmd.arg("--dap").arg(dir.join("d"));
+            }
+            // A directory that doesn't exist: the debugger can't listen.
+            DapArg::Unbindable => {
+                cmd.arg("--dap").arg(dir.join("missing").join("d"));
+            }
+            DapArg::Off => {}
+        }
+        cmd.args(r_args)
             .env("TERM", "xterm-256color")
             .envs(env.iter().copied())
             .env_remove("RAVEN_CONSOLE_BOOTSTRAPPED")
@@ -132,16 +169,14 @@ impl Console {
             dir,
         };
         let deadline = Instant::now() + TIMEOUT;
-        while !(c.dir.join("i").exists() && c.dir.join("d").exists()) {
+        while !c.dir.join("i").exists() {
             assert!(
                 Instant::now() < deadline,
-                "console sockets never appeared:\n{}",
+                "console IPC socket never appeared:\n{}",
                 c.text()
             );
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
         }
-        // Let R finish starting (and the debugger install its handlers).
-        std::thread::sleep(Duration::from_millis(800));
         c
     }
 
@@ -2609,4 +2644,202 @@ fn ascii_sends_still_bind_breakpoints_outside_a_utf8_locale() {
     c.send("f(1)", None);
     d.event("stopped", m);
     assert_eq!(d.stack()[0], ("f".to_string(), 3));
+}
+
+/// A `subscribe`d control connection: the events the console pushes.
+struct Subscriber {
+    reader: BufReader<UnixStream>,
+}
+
+impl Subscriber {
+    fn connect(c: &Console) -> Subscriber {
+        let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
+        s.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{}", json!({"v": 1, "id": 1, "op": "subscribe"})).unwrap();
+        let mut reader = BufReader::new(s);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"ok\""), "subscribe: {line}");
+        Subscriber { reader }
+    }
+
+    /// The next pushed event named `name`, skipping others; `None` once
+    /// nothing arrives for `wait`.
+    fn event(&mut self, name: &str, wait: Duration) -> Option<Value> {
+        self.reader.get_ref().set_read_timeout(Some(wait)).unwrap();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match self.reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {}
+                _ => return None,
+            }
+            let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            if v["event"] == name {
+                return Some(v);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mirror_is_answered_unavailable_once_the_debugger_cannot_start() {
+    if !r_available() {
+        return;
+    }
+    // `not-ready` would keep the extension resending (and holding the
+    // console's first send) for as long as its retry budget lasts.
+    for dap in [DapArg::Unbindable, DapArg::Off] {
+        let c = Console::launch(&[], dap, &["--no-save", "--no-restore", "--vanilla", "-q"]);
+        let mirror = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {}});
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            let status = ipc_request(&c, &mirror);
+            if status != "not-ready" || Instant::now() > deadline {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(status, "unavailable", "{}", c.text());
+    }
+}
+
+#[test]
+fn a_subscriber_hears_when_the_debugger_starts_after_slow_profiles() {
+    if !r_available() {
+        return;
+    }
+    let dir = scratch();
+    let profile = dir.join("slow.R");
+    std::fs::write(&profile, "Sys.sleep(3)\n").unwrap();
+    let c = Console::launch(
+        &[("R_PROFILE_USER", profile.to_str().unwrap())],
+        DapArg::Socket,
+        &[
+            "--no-save",
+            "--no-restore",
+            "--no-site-file",
+            "--no-environ",
+            "-q",
+        ],
+    );
+    let mut sub = Subscriber::connect(&c);
+    let mirror = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {}});
+    // R is still running the profile.
+    assert_eq!(ipc_request(&c, &mirror), "not-ready");
+    assert!(
+        sub.event("ready", TIMEOUT).is_some(),
+        "no ready event:\n{}",
+        c.text()
+    );
+    assert_eq!(ipc_request(&c, &mirror), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let deadline = Instant::now() + TIMEOUT;
+    while c.ipc_status("breakpoints") != "ok" {
+        assert!(Instant::now() < deadline, "debugger never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    c.send("fb_target <- function() 1", None);
+    let fifo = c.dir.join("stall.R");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let fifo = fifo.to_string_lossy().into_owned();
+    // An older mirror, carrying a function breakpoint, stalls reading a
+    // file...
+    let stalled = {
+        let msg = json!({"v": 1, "id": 2, "op": "breakpoints",
+            "files": {&fifo: [{"line": 1}]},
+            "functions": ["fb_target"], "exceptionFilters": ["error"]});
+        let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
+        s.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{msg}").unwrap();
+        s
+    };
+    let mut writer = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(f) => break f,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "the request never read: {e}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    };
+    // ... a newer one (the user removed the breakpoint) is applied ...
+    let newer = json!({"v": 1, "id": 3, "op": "breakpoints", "files": {},
+        "functions": [], "exceptionFilters": []});
+    assert_eq!(ipc_request(&c, &newer), "ok");
+    // ... and then the older one finishes.
+    writer.write_all(b"z <- 1\n").unwrap();
+    drop(writer);
+    let mut line = String::new();
+    BufReader::new(stalled).read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\""), "{line}");
+    std::thread::sleep(Duration::from_millis(300));
+    c.send(
+        "fb_target(); cat(toupper('ran past fb_target'), '\\n')",
+        None,
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let text = c.text();
+        assert!(
+            !text.contains("Browse["),
+            "the older mirror re-armed a removed function breakpoint:\n{text}"
+        );
+        if text.contains("RAN PAST FB_TARGET") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn subscribing_while_r_is_stopped_reports_the_stop() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let deadline = Instant::now() + TIMEOUT;
+    while c.ipc_status("breakpoints") != "ok" {
+        assert!(Instant::now() < deadline, "debugger never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let a = c.write_file("a.R", "x <- 1\ny <- 2\n");
+    let arm = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {&a: [{"line": 2}]}});
+    assert_eq!(ipc_request(&c, &arm), "ok");
+    // No editor is connected when R stops (a detached Perch console).
+    c.send(&format!("source({a:?})"), None);
+    c.expect("Browse[");
+    let mut sub = Subscriber::connect(&c);
+    let ev = sub.event("stopped", Duration::from_secs(5));
+    assert_eq!(
+        ev.as_ref().map(|v| v["reason"].clone()),
+        Some(json!("breakpoint")),
+        "{}",
+        c.text()
+    );
 }

@@ -13,6 +13,53 @@ function supports_chunk_navigation(document: vscode.TextDocument): boolean {
     return classify_chunk_document_for_document(document) !== 'markdown';
 }
 
+/**
+ * Context key: the active editor's document has chunks to move between.
+ *
+ * Gates the Ctrl/Cmd+PageDown and Ctrl/Cmd+PageUp bindings of
+ * `raven.goToNextChunk` / `raven.goToPreviousChunk`. On Windows and Linux
+ * those keys are VS Code's Next/Previous Editor; in an R file without
+ * chunks the commands would do nothing, so the keys must fall through to
+ * switching tabs. The commands stay in the palette regardless.
+ */
+export const HAS_CHUNKS_CONTEXT = 'raven.editorHasChunks';
+
+/** Whether `document` has a chunk the navigation commands can move to. */
+export function has_navigable_chunks(document: vscode.TextDocument): boolean {
+    return supports_chunk_navigation(document) && chunks_for_document(document).length > 0;
+}
+
+/**
+ * Keep {@link HAS_CHUNKS_CONTEXT} in step with the active editor: at once on
+ * an editor switch, and shortly after an edit to its document (adding or
+ * removing a `# %%` marker or fence changes it).
+ */
+function track_chunk_context(context: vscode.ExtensionContext): void {
+    let current: boolean | undefined;
+    let pending: ReturnType<typeof setTimeout> | undefined;
+    const update = () => {
+        if (pending !== undefined) clearTimeout(pending);
+        pending = undefined;
+        const doc = vscode.window.activeTextEditor?.document;
+        const value = doc !== undefined && has_navigable_chunks(doc);
+        if (value === current) return;
+        current = value;
+        void vscode.commands.executeCommand('setContext', HAS_CHUNKS_CONTEXT, value);
+    };
+    update();
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(update),
+        vscode.workspace.onDidChangeTextDocument((e) => {
+            if (e.document !== vscode.window.activeTextEditor?.document) return;
+            if (pending !== undefined) clearTimeout(pending);
+            pending = setTimeout(update, 150);
+        }),
+        new vscode.Disposable(() => {
+            if (pending !== undefined) clearTimeout(pending);
+        }),
+    );
+}
+
 function move_to_line(editor: vscode.TextEditor, line: number): void {
     const safe = Math.max(0, Math.min(line, editor.document.lineCount - 1));
     const text = editor.document.lineAt(safe).text;
@@ -100,4 +147,5 @@ export function register_chunk_navigation(context: vscode.ExtensionContext): voi
         vscode.commands.registerCommand('raven.goToPreviousChunk', go_to_previous),
         vscode.commands.registerCommand('raven.selectCurrentChunk', select_current),
     );
+    track_chunk_context(context);
 }
