@@ -49,8 +49,12 @@ export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
 let SOCKET_WAIT_MS = 10_000;
-/** Longest a new console's first send waits for its breakpoints. */
-const MIRROR_GATE_MS = 15_000;
+/**
+ * How long a new console's first send waits for its breakpoints, and how
+ * much longer it waits, once, for a mirror that is on its way to the console
+ * when that time is up (see `ConsoleLink.gate_deadline`).
+ */
+let MIRROR_GATE_MS = 15_000;
 
 /** The console's DAP socket lives next to its IPC socket. */
 export function dap_socket_for(ipc_socket: string): string {
@@ -138,6 +142,11 @@ function end_claim(ipc: string): void {
         c.timer = undefined;
     }
     prune_claim(ipc);
+}
+
+/** Test hook: a shorter send gate for consoles registered from now on. */
+export function _set_mirror_gate_for_test(ms: number): void {
+    MIRROR_GATE_MS = ms;
 }
 
 /** Test hook: shorter claim and socket waits. */
@@ -335,16 +344,42 @@ class ConsoleLink {
     private in_flight = false;
     private again = false;
     private closed = false;
+    /** Release the sends held for this console (idempotent). */
     private mirrored_once: () => void = () => undefined;
+    private gate_timer: ReturnType<typeof setTimeout> | undefined;
+    private gate_extended = false;
+    private readonly gate_ms = MIRROR_GATE_MS;
 
     constructor(readonly terminal: vscode.Terminal, readonly ipc: string) {
         // Code sent to a console before it knows the breakpoints would run
         // uninstrumented; hold sends until the first mirror lands.
         gate_sends(ipc, new Promise<void>((resolve) => {
-            this.mirrored_once = resolve;
-            setTimeout(resolve, MIRROR_GATE_MS);
+            this.mirrored_once = () => {
+                clearTimeout(this.gate_timer);
+                resolve();
+            };
         }));
+        this.gate_timer = setTimeout(() => this.gate_deadline(), this.gate_ms);
         void this.connect();
+    }
+
+    /**
+     * The held sends have waited `gate_ms` from the link's creation (the
+     * console may never listen, answer, or run the debugger, so the wait is
+     * bounded). A mirror on its way to the console right now is about to
+     * arm the breakpoints those sends need: the socket appeared late, or
+     * the debugger started during the first mirror's last retry and its
+     * replacement is still being applied. That mirror gets one more
+     * `gate_ms`, after which the sends go whatever is in flight, so they
+     * are never held more than twice `gate_ms`.
+     */
+    private gate_deadline(): void {
+        if (this.in_flight && !this.gate_extended) {
+            this.gate_extended = true;
+            this.gate_timer = setTimeout(this.mirrored_once, this.gate_ms);
+            return;
+        }
+        this.mirrored_once();
     }
 
     private async connect(): Promise<void> {

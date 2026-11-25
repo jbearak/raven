@@ -94,7 +94,12 @@ mock.module('vscode', () => ({
     },
 }));
 
-const { register_debugger, register_debugger_unavailable, _set_launch_timeouts_for_test } = await import('../../editors/vscode/src/debugger/index');
+const {
+    register_debugger,
+    register_debugger_unavailable,
+    _set_launch_timeouts_for_test,
+    _set_mirror_gate_for_test,
+} = await import('../../editors/vscode/src/debugger/index');
 const ipc = await import('../../editors/vscode/src/send-to-r/console-ipc');
 
 // --------------------------------------------------------------- fake console
@@ -117,6 +122,10 @@ class FakeConsole {
     mirrors = 0;
     /** Awaited before a mirror is answered `not-ready` or `unavailable`. */
     before_refusal?: (n: number) => Promise<void>;
+    /** How long an accepted mirror takes to apply (R is busy). */
+    apply_delay_ms = 0;
+    /** Never acknowledge `subscribe` (a console that has hung). */
+    silent_subscribe = false;
     private subscribers: net.Socket[] = [];
     private server: net.Server;
     constructor(readonly socket: string) {
@@ -152,6 +161,7 @@ class FakeConsole {
     private handle(sock: net.Socket, msg: Wire): void {
         switch (msg.op) {
             case 'subscribe':
+                if (this.silent_subscribe) return;
                 this.reply(sock, msg.id, 'ok');
                 this.subscribers.push(sock);
                 return;
@@ -172,6 +182,7 @@ class FakeConsole {
                 // acts on a summary before the reply is caught).
                 if (this.ok_first) this.reply(sock, msg.id, 'ok');
                 void (async () => {
+                    if (this.apply_delay_ms > 0) await new Promise((r) => setTimeout(r, this.apply_delay_ms));
                     for (const [p, list] of Object.entries(files)) {
                         await new Promise((r) => setTimeout(r, 30));
                         let key = p;
@@ -588,6 +599,93 @@ describe('a console whose debugger is not running yet, or never will', () => {
         expect(Date.now() - start).toBeLessThan(14_500);
         expect(con.executes[0].armed).toEqual({ [real(a_r)]: [2] });
     }, 30_000);
+});
+
+describe("the bound on how long a new console's first send is held", () => {
+    /** Register a console whose send gate lasts `gate_ms`. */
+    function attach_gated(sock: string, gate_ms: number): object {
+        _set_mirror_gate_for_test(gate_ms);
+        try {
+            return attach(sock);
+        } finally {
+            _set_mirror_gate_for_test(15_000);
+        }
+    }
+
+    test('a mirror still being applied when the time is up arms its breakpoints before the send', async () => {
+        const { con, sock } = await console_at();
+        // R is still starting; the debugger starts just before the gate's
+        // time is up, and R takes a while to apply the mirror that follows.
+        con.mirror_mode = 'not-ready';
+        const start = Date.now();
+        con.before_refusal = async () => {
+            if (con.mirror_mode !== 'ok' && Date.now() - start > 700) {
+                con.mirror_mode = 'ok';
+                con.apply_delay_ms = 500;
+                con.push({ event: 'ready' });
+            }
+        };
+        set_breakpoints([line_bp(a_r, 2)]);
+        const terminal = attach_gated(sock, 1_000);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        expect(con.executes[0].armed).toEqual({ [real(a_r)]: [2] });
+        // Held past the gate's own time, and released when the mirror
+        // landed rather than at the extended deadline (2 s).
+        const waited = Date.now() - start;
+        expect(waited).toBeGreaterThan(1_050);
+        expect(waited).toBeLessThan(1_900);
+        detach(terminal);
+    });
+
+    test('a mirror that never lands holds the send for one extension only', async () => {
+        const { con, sock } = await console_at();
+        // Every answer is a slow `not-ready`: the first mirror is still
+        // retrying at the deadline, and at the extended one.
+        con.mirror_mode = 'not-ready';
+        con.before_refusal = () => settle(300);
+        set_breakpoints([line_bp(a_r, 2)]);
+        const start = Date.now();
+        const terminal = attach_gated(sock, 600);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        const waited = Date.now() - start;
+        expect(waited).toBeGreaterThanOrEqual(1_150);
+        expect(waited).toBeLessThan(1_800);
+        detach(terminal);
+    });
+
+    test('with no mirror on its way the send goes when the time is up', async () => {
+        const { con, sock } = await console_at();
+        // The console never acknowledges the subscription, so no mirror is
+        // ever sent.
+        con.silent_subscribe = true;
+        set_breakpoints([line_bp(a_r, 2)]);
+        const start = Date.now();
+        const terminal = attach_gated(sock, 600);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await until(() => con.executes.length === 1, 5_000);
+        const waited = Date.now() - start;
+        expect(waited).toBeGreaterThanOrEqual(550);
+        expect(waited).toBeLessThan(1_100);
+        expect(con.mirrors).toBe(0);
+        detach(terminal);
+    });
+
+    test('closing the console releases a held send at once', async () => {
+        const { con, sock } = await console_at();
+        con.mirror_mode = 'not-ready';
+        set_breakpoints([line_bp(a_r, 2)]);
+        const terminal = attach(sock);
+        ipc.send_debug_program(sock, 'source("a.R")');
+        await settle(300);
+        expect(con.executes.length).toBe(0);
+        // A Perch terminal closing only detaches: the console lives on and
+        // takes the send.
+        for (const l of close_listeners) l(terminal);
+        await until(() => con.executes.length === 1, 2_000);
+        detach(terminal);
+    });
 });
 
 describe('auto-attach', () => {
