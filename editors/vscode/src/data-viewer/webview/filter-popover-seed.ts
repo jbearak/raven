@@ -24,7 +24,11 @@ export type StrRegexState = { pattern: string; caseSensitive: boolean; regexErro
 export type DateCompareState = { op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: string };
 export type DateBetweenState = { lo: string; hi: string; inclusive: boolean };
 export type BoolState = { value: boolean };
-export type SetFreeTextState = { text: string };
+/** The set's free-text value list. `values` holds the set an existing
+ *  filter was seeded from: its text joins them with newlines, which can't
+ *  round-trip a value holding a comma or line break, so the list is read
+ *  back from the text only once the text is edited. */
+export type SetFreeTextState = { text: string; values?: readonly (string | number)[] };
 
 /** The popover's full per-kind form state. All sub-states are kept alive so
  *  switching the kind-select and switching back doesn't lose typed values. */
@@ -99,7 +103,7 @@ export function seedFromEntry(p: FilterPredicate, int64 = false): FormState {
         case 'setIn':
         case 'setNotIn':
             base.set = { selected: p.values };
-            base.freeText = { text: p.values.join('\n') };
+            base.freeText = { text: p.values.join('\n'), values: p.values };
             break;
         case 'strContains':
         case 'strStartsWith':
@@ -154,6 +158,8 @@ function effectiveSetValues(s: FormState, setUsesChecklist: boolean): (string | 
     if (setUsesChecklist) {
         return s.set.selected;
     }
+    const seeded = s.freeText.values;
+    if (seeded && s.freeText.text === seeded.join('\n')) return [...seeded];
     return s.freeText.text
         .split(/[\n,]+/)
         .map(t => t.trim())
