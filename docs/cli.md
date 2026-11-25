@@ -400,7 +400,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 - `superseded`: a forward directive stands in for the call. A `line=N` directive covers a call to the same file on line N; a call to another file on that line keeps its own edge. A plain `# raven: source` directive followed by a `line=eof` directive for the same file covers a later call to that file.
 - `duplicate`: merged with an identical edge, such as a repeated directive.
 - `no_path_context`: Raven couldn't resolve any path in the file. It shouldn't happen for files on disk.
-- `url`: a `source()` call that reads a URL, such as `source("https://example.com/setup.R")`. R reads it, but it names no local file.
+- `url`: a `source()` call that reads a URL, such as `source("https://example.com/setup.R")`. R reads it, but Raven doesn't resolve a URL to a file.
 
 ### Graph limits
 
@@ -442,7 +442,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 - `0`: every requested file has a parsed document. A file with syntax errors still gets a full document.
 - `3`: at least one file couldn't be read or decoded. Its error document is printed in its place, and every other document is still printed.
 - `1`: a usage error, such as an unknown flag or a `--format` other than `json`.
-- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. So is a directory that can't be listed, such as one without read permission: the files Raven could find are still printed, and the directory is named on stderr. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
+- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. So is a directory that can't be listed or whose entries can't be examined, such as one without read or search permission: the files Raven could find are still printed, and the directory is named on stderr. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
 
 <!-- example: parse-unreadable -->
 ```console
@@ -469,7 +469,7 @@ Every `range` has a `start` and an `end` position, and the end is exclusive. A p
 
 A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `package_data`, `line_count`, `statements`, `comments`, and `errors`.
 
-- `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root. A `FILE` with `..` after a symlinked directory, such as `alias/../data.R`, names the file the system opens, in its canonical spelling, not the file that dropping `alias/..` would name.
+- `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root. A `FILE` with `..` after a symlinked directory, such as `alias/../data.R`, names the file in the directory the system resolves, in its canonical spelling, not the file that dropping `alias/..` would name.
 - `encoding`: `name` (`UTF-8`, `UTF-16LE`, or `UTF-16BE`), `bom` (whether a byte-order mark was present and stripped), and `line_endings` (`lf`, `crlf`, `cr`, `mixed`, or `none` for a file without one). Raven reads files as `raven check` does, as described in [File encoding](#file-encoding). A file that isn't valid in its encoding gets the error document, with a message naming the first invalid byte's offset. Raven never substitutes replacement characters.
 - `package_data`: which sources of package export names the run had. See [Package data](#package-data).
 - `line_count`: the number of lines. A final line ending doesn't start another line, so `a\nb\n` has 2 lines and an empty file has 0.

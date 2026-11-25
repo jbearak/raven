@@ -128,7 +128,8 @@ pub(crate) enum DropReason {
     /// A forward directive stands in for this call (`update_file`'s
     /// directive-vs-AST coverage rule).
     Superseded,
-    /// A `source()` call that reads a URL, which names no local file.
+    /// A `source()` call that reads a URL, which Raven doesn't resolve to a
+    /// file.
     Url,
 }
 

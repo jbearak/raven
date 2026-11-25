@@ -303,18 +303,26 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> (Ve
 ///
 /// A `..` after a symlinked directory (`alias/../data.R`) leaves the link's
 /// target, not the link, so collapsing it lexically can name another file than
-/// the one the OS opens. When the two name different existing files, the file
-/// the OS opens is used, in canonical form.
+/// the one the OS opens. When the directory the OS resolves for the file's
+/// parent differs from the collapsed path's, the file is taken in that
+/// directory, in canonical form, whether or not it exists there (a missing
+/// file gets its error document at the place the OS looked).
 fn requested_path(file: &Path, root: &Path) -> PathBuf {
     let absolute = absolute_path(root, file);
     let lexical = crate::cross_file::path_resolve::normalize_path_public(&absolute)
         .unwrap_or_else(|| absolute.clone());
-    if let (Ok(opened), Ok(collapsed)) = (
-        std::fs::canonicalize(&absolute),
-        std::fs::canonicalize(&lexical),
-    ) && opened != collapsed
+    if absolute
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+        && let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
+        && let Ok(opened_parent) = std::fs::canonicalize(parent)
+        && lexical
+            .parent()
+            .and_then(|collapsed| std::fs::canonicalize(collapsed).ok())
+            .as_ref()
+            != Some(&opened_parent)
     {
-        return opened;
+        return opened_parent.join(name);
     }
     if lexical.starts_with(root) {
         return lexical;

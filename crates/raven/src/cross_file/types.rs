@@ -959,8 +959,8 @@ impl ForwardSource {
     }
 
     /// An AST-detected `source()` call that reads a URL
-    /// (`source("https://...")`): R reads it, but it names no file Raven can
-    /// resolve, so it gets no graph edge either.
+    /// (`source("https://...")`): R reads it, but Raven doesn't resolve a URL
+    /// to a file, so it gets no graph edge either.
     pub(crate) fn is_url_source_call(&self) -> bool {
         !self.is_sys_source
             && !self.is_directive

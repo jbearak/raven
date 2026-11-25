@@ -1261,6 +1261,18 @@ fn requested_path_follows_a_symlink_before_dot_dot() {
         requested_path(Path::new("alias/../data.R"), &root),
         base.join("other/data.R")
     );
+    // Also when only one of the two places has the file: the OS's place is
+    // the one read (or reported as missing).
+    std::fs::write(base.join("other/only_there.R"), "x <- 1\n").unwrap();
+    std::fs::write(root.join("only_here.R"), "x <- 1\n").unwrap();
+    assert_eq!(
+        requested_path(Path::new("alias/../only_there.R"), &root),
+        base.join("other/only_there.R")
+    );
+    assert_eq!(
+        requested_path(Path::new("alias/../only_here.R"), &root),
+        base.join("other/only_here.R")
+    );
     // Without a symlink, `..` still collapses lexically.
     assert_eq!(
         requested_path(Path::new("sub/../data.R"), &root),
