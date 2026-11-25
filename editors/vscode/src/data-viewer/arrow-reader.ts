@@ -58,6 +58,7 @@ import { readSync } from 'node:fs';
 import { AsyncRecordBatchFileReader, makeData, makeVector, Type } from 'apache-arrow';
 import type { DataType } from 'apache-arrow';
 import {
+    encodeInt64,
     encodeNumber,
     encodeString,
     encodeDate,
@@ -792,7 +793,7 @@ export class ArrowSliceReader {
                     case 1: return dv.getInt8(0);
                     case 2: return dv.getInt16(0, true);
                     case 4: return dv.getInt32(0, true);
-                    case 8: return Number(dv.getBigInt64(0, true));
+                    case 8: return encodeInt64(dv.getBigInt64(0, true));
                 }
                 break;
             case 'float':
@@ -1104,7 +1105,7 @@ export function encodeArrowCell(child: any, row: number, arrowType: string): Cel
         const v = child.get(row);
         if (v === null || v === undefined) return null;
         // Int64 columns yield bigint; Cell type and JSON.stringify can't carry it.
-        return typeof v === 'bigint' ? Number(v) : (v as number);
+        return typeof v === 'bigint' ? encodeInt64(v) : (v as number);
     }
     if (arrowType.startsWith('Float')) {
         const v = child.get(row);

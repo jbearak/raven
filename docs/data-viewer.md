@@ -107,6 +107,7 @@ On by default in new panels. When on, non-integer numeric columns are rounded to
 
 - A nonzero value never shows as zero. A value that would round to zero, or one of 1e15 or more in size, switches to scientific notation (`1.23e-10`).
 - A whole number in a decimal column (for example `5` among `1.5` and `2.25`) shows as `5`, not `5.000`, which avoids the misleading trailing zeros common in SPSS and SAS files. It's padded so the decimal points still line up.
+- A `bit64::integer64` value shows every digit, with Format on or off. `9007199254740993` is shown, copied, and found as itself, never as its neighbour `9007199254740992`.
 - A number too wide for its column shows `###` rather than its leading digits. Hover over it for the full value, or widen the column.
 - With Format off, numbers show at full precision, with R-style exponents (`1e-07`).
 
@@ -258,6 +259,8 @@ If the column already has a filter, the menu item reads Edit filter…, and the 
 
 For numeric `between` and `not between`, the editor shows a histogram of the column with draggable range handles beside the number fields. The histogram is computed the first time you open that column's filter, not when the table loads, so on a very large frame it may appear a moment after the editor opens. It is cached after that, and opening a table never waits for histograms.
 
+On a `bit64::integer64` column, a bound is compared as you typed it, digit for digit, including one with a fraction or an exponent: `< 9007199254740992.5` keeps `9007199254740992`.
+
 For factor columns, the editor shows a searchable checklist of levels when the levels are available to the panel; columns with very many levels fall back to a free-text value list. For labelled numeric columns, the editor defaults to a searchable checklist of the labelled values, each shown as label plus code, and also offers the numeric predicates in the condition dropdown.
 
 `matches regex` uses JavaScript regular-expression syntax, not PCRE or R regex syntax. A Case sensitive toggle controls whether all character predicates match case-sensitively.
@@ -355,6 +358,7 @@ Most numbers in a summary are exact. On very large or very varied columns, a few
 - Percentiles are exact up to 100,000 values, or once the column has been sorted in this panel. Beyond that they come from a random sample of 100,000 values.
 - Distinct counts are exact for factors, and for other columns up to 100,000 distinct values. Beyond that they're estimated, usually within 1 to 2%.
 - Most-common values have exact counts up to 100,000 distinct values. Beyond that, each count shows how far off it can be, as `≈ 4,210 ± 12`. When those margins mean two values could be in either order, the list says "approximate order".
+- On a `bit64::integer64` column, those counts and margins are for each whole integer, however large: two IDs that differ only in their last digits are counted apart.
 
 ### Value counts
 

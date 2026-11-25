@@ -60,7 +60,7 @@ import { isNullAt } from './sort';
 import {
     BigIntCounter,
     guaranteedOrder,
-    hashNumber,
+    hashKey,
     hashString,
     HyperLogLog,
     NumberCounter,
@@ -69,7 +69,7 @@ import {
     Reservoir,
     SpaceSaving,
 } from './sketches';
-import { encodeDate, encodeNumber, encodeTimestampMicros } from './wire-format';
+import { encodeDate, encodeInt64, encodeNumber, encodeTimestampMicros } from './wire-format';
 import type { Cell } from './wire-format';
 
 export type ProfileOptions = {
@@ -171,7 +171,7 @@ async function profileNumeric(
     let hll: HyperLogLog | undefined;
     // Space-Saving past the cap only where top values are shown.
     const wantTop = kind === 'labelled';
-    let ss: SpaceSaving<number> | undefined;
+    let ss: SpaceSaving<CountKey> | undefined;
     const reservoir = new Reservoir(opts.reservoirSize ?? RESERVOIR_SIZE);
     const declared = kind === 'labelled' ? declaredCounter(col) : undefined;
     let na = 0, nan = 0, posInf = 0, negInf = 0, finite = 0;
@@ -217,15 +217,16 @@ async function profileNumeric(
                 if (counter.add(raw, x)) continue;
                 // Overflow: seed the sketches from the exact counts so far.
                 hll = new HyperLogLog();
-                const seen = counter.asNumbers();
-                for (const [k] of seen) hll.addHash(hashNumber(k));
+                const seen = counter.keyedEntries();
+                for (const [k] of seen) hll.addHash(hashKey(k));
                 if (wantTop) {
-                    ss = new SpaceSaving<number>(SPACE_SAVING_COUNTERS);
+                    ss = new SpaceSaving<CountKey>(SPACE_SAVING_COUNTERS);
                     ss.seed(seen);
                 }
             }
-            hll.addHash(hashNumber(x));
-            ss?.add(x);
+            const key = counter.key(raw, x);
+            hll.addHash(hashKey(key));
+            ss?.add(key);
         }
     });
 
@@ -317,21 +318,26 @@ async function profileNumeric(
         nan,
         distinct,
         infinite: posInf + negInf,
-        ...(present > 0 ? {
+        // Int64 / Uint64: the exact extremes (`min` / `max` are doubles,
+        // and neighbours past 2^53 round to the same one).
+        ...(present > 0 ? (bmin !== undefined && bmax !== undefined ? {
+            min: encodeInt64(bmin),
+            max: encodeInt64(bmax),
+        } : {
             min: domainCell(domain, min, rawMin),
             max: domainCell(domain, max, rawMax),
-        } : {}),
+        }) : {}),
         ...(domain === 'number' ? { mean, sd, quantiles } : {}),
         histogram,
     };
     if (domain === 'micros') profile.timeZone = col.timeZone ?? 'UTC';
 
     let counts: CountSummary | undefined;
-    const labelOf = (v: number): string | undefined => col.valueLabels?.[String(v)];
+    const labelOf = (v: CountKey): string | undefined => col.valueLabels?.[String(v)];
     if (exact) {
         const entries: CountedEntry[] = [];
         for (const { value, count } of counter.sortedEntries()) {
-            const label = kind === 'labelled' ? labelOf(value as number) : undefined;
+            const label = kind === 'labelled' ? labelOf(value) : undefined;
             entries.push(label !== undefined ? { value, label, count, error: 0 } : { value, count, error: 0 });
         }
         counts = { columnIndex, exact: true, entries, floor: 0, distinct, present, na: na + nan };
@@ -646,6 +652,16 @@ function withLabel<K extends string | number | boolean>(
     return label !== undefined ? { ...e, label } : { ...e };
 }
 
+/** What a numeric value is counted under once it leaves the column: the
+ *  double, or for a 64-bit integer a double can't hold exactly its
+ *  decimal text (distinct integer64 values past 2^53 share a double). */
+type CountKey = number | string;
+
+function int64Key(k: bigint): CountKey {
+    const n = Number(k);
+    return Number.isSafeInteger(n) ? n : k.toString();
+}
+
 /** Exact value counts for a numeric column: on the double, or for a
  *  64-bit integer column on the exact `bigint` (as doubles, distinct
  *  integer64 values past 2^53 would merge). */
@@ -654,37 +670,35 @@ type ExactCounter = {
     /** Count one value (`raw` from the column, `x` its double); false
      *  once the cap is reached with a new value. */
     add(raw: number | bigint, x: number): boolean;
-    /** The counts as doubles, merged, to seed the sketches past the cap. */
-    asNumbers(): [number, number][];
-    /** Count-descending, ties by value. A 64-bit value a double can't
-     *  hold exactly is its decimal string. */
-    sortedEntries(): { value: number | string; count: number }[];
+    /** The key of one value, as the sketches past the cap count it. */
+    key(raw: number | bigint, x: number): CountKey;
+    /** The counts so far by {@link key}, to seed the sketches past the
+     *  cap. One entry per distinct value: nothing is merged. */
+    keyedEntries(): [CountKey, number][];
+    /** Count-descending, ties by value. */
+    sortedEntries(): { value: CountKey; count: number }[];
 };
 
 function exactCounter(arrowType: string, domain: NumericDomain, cap: number): ExactCounter {
     if (domain === 'number' && /^(Int|Uint)64$/.test(arrowType)) {
         const c = new BigIntCounter(cap);
+        const big = (raw: number | bigint, x: number): bigint => (typeof raw === 'bigint' ? raw : BigInt(x));
         return {
             get size() { return c.size; },
-            add: (raw, x) => c.add(typeof raw === 'bigint' ? raw : BigInt(x)),
-            asNumbers: () => {
-                const m = new Map<number, number>();
-                for (const [k, n] of c.entries()) m.set(Number(k), (m.get(Number(k)) ?? 0) + n);
-                return [...m];
-            },
+            add: (raw, x) => c.add(big(raw, x)),
+            key: (raw, x) => int64Key(big(raw, x)),
+            keyedEntries: () => Array.from(c.entries(), ([k, n]) => [int64Key(k), n]),
             sortedEntries: () => [...c.entries()]
                 .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-                .map(([k, count]) => {
-                    const n = Number(k);
-                    return { value: Number.isSafeInteger(n) ? n : k.toString(), count };
-                }),
+                .map(([k, count]) => ({ value: int64Key(k), count })),
         };
     }
     const c = new NumberCounter(cap);
     return {
         get size() { return c.size; },
         add: (_raw, x) => c.add(x),
-        asNumbers: () => [...c.entries()],
+        key: (_raw, x) => x,
+        keyedEntries: () => [...c.entries()],
         sortedEntries: () => [...c.entries()]
             .sort((a, b) => b[1] - a[1] || a[0] - b[0])
             .map(([value, count]) => ({ value, count })),
@@ -778,7 +792,7 @@ export async function countValues(
     const cap = opts.exactCap ?? EXACT_DISTINCT_CAP;
     const domain = numericDomain(col.arrowType);
     const counter = exactCounter(col.arrowType, domain, cap);
-    let ss: SpaceSaving<number> | undefined;
+    let ss: SpaceSaving<CountKey> | undefined;
     let hll: HyperLogLog | undefined;
     let na = 0;
     await scan(reader, columnIndex, opts, (child, length) => {
@@ -795,14 +809,15 @@ export async function countValues(
             if (x !== x) { na++; continue; }
             if (!ss) {
                 if (counter.add(raw, x)) continue;
-                const seen = counter.asNumbers();
-                ss = new SpaceSaving<number>(SPACE_SAVING_COUNTERS);
+                const seen = counter.keyedEntries();
+                ss = new SpaceSaving<CountKey>(SPACE_SAVING_COUNTERS);
                 ss.seed(seen);
                 hll = new HyperLogLog();
-                for (const [k] of seen) hll.addHash(hashNumber(k));
+                for (const [k] of seen) hll.addHash(hashKey(k));
             }
-            ss.add(x);
-            hll!.addHash(hashNumber(x));
+            const key = counter.key(raw, x);
+            ss.add(key);
+            hll!.addHash(hashKey(key));
         }
     });
     const present = reader.nrow - na;

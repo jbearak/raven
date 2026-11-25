@@ -23,8 +23,9 @@
  *   - **Int64 / Uint64 are exact**: a numeric predicate on such a column
  *     compares the stored integer with the bound's real value
  *     ({@link int64Intervals}); a bound a double can't hold arrives as
- *     decimal text (`NumBound`). Nothing is rounded to double, so
- *     `= 2^53` does not keep 2^53 + 1. Histogram bins are assigned the
+ *     decimal text (`NumBound`), fraction and exponent included, and is
+ *     read digit by digit. Nothing is rounded to double, so `= 2^53`
+ *     does not keep 2^53 + 1 and `< 2^53 + 0.5` keeps 2^53. Histogram bins are assigned the
  *     same way (`histograms.ts` `binIndex`), so a brush still filters to
  *     the rows its bars count.
  *   - **NA / NaN semantics**: missing rows fail any predicate unless
@@ -390,8 +391,6 @@ export function isInt64Type(arrowType: string): boolean {
     return /^U?[Ii]nt64$/.test(arrowType);
 }
 
-const INT_TEXT = /^[+-]?[0-9]+$/;
-
 /** A numeric bound as a double: the number itself, or numeric text read
  *  as one. `undefined` when it is no number (a `null` from a lossy
  *  transport, other text). */
@@ -402,12 +401,44 @@ export function numBoundValue(b: unknown): number | undefined {
     return Number.isNaN(n) ? undefined : n;
 }
 
+/** Decimal text: a sign, digits with an optional point, an optional
+ *  exponent (`-12.50`, `.5`, `1e3`, `2.5E-3`). */
+const DECIMAL_TEXT = /^([+-]?)([0-9]*)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?$/;
+
+/**
+ * The exact floor and ceiling of a decimal number written as text, read
+ * digit by digit. A double can't stand in: `9007199254740992.5` rounds to
+ * 2^53, an integer, before it is ever compared. Past 10^20 in size, which
+ * no 64-bit integer reaches, both are `±Infinity`, so the work is bounded
+ * however large the exponent. `undefined` when the text is no decimal
+ * number.
+ */
+function decimalFloorCeil(text: string): { floor: bigint | number; ceil: bigint | number } | undefined {
+    const m = DECIMAL_TEXT.exec(text);
+    if (!m || (m[2] === '' && (m[3] ?? '') === '')) return undefined;
+    const negative = m[1] === '-';
+    const digits = m[2] + (m[3] ?? '');
+    const leadingZeros = /^0*/.exec(digits)![0].length;
+    const significant = digits.slice(leadingZeros);
+    if (significant === '') return { floor: 0n, ceil: 0n };
+    // How many of the significant digits sit before the decimal point
+    // (zero or negative for a size below 1).
+    const whole = m[2].length - leadingZeros + Number(m[4] ?? 0);
+    if (whole > 20) {
+        const inf = negative ? -Infinity : Infinity;
+        return { floor: inf, ceil: inf };
+    }
+    const q = whole <= 0 ? 0n : BigInt(significant.slice(0, whole).padEnd(whole, '0'));
+    const r = whole <= 0 || /[1-9]/.test(significant.slice(whole)) ? 1n : 0n;
+    return negative ? { floor: -q - r, ceil: -q } : { floor: q, ceil: q + r };
+}
+
 /** A bound's exact floor and ceiling. Infinite bounds stay `±Infinity`;
  *  `undefined` when the bound is no number, or NaN. */
 function boundFloorCeil(b: unknown): { floor: bigint | number; ceil: bigint | number } | undefined {
-    if (typeof b === 'string' && INT_TEXT.test(b.trim())) {
-        const v = BigInt(b.trim());
-        return { floor: v, ceil: v };
+    if (typeof b === 'string') {
+        const exact = decimalFloorCeil(b.trim());
+        if (exact) return exact;
     }
     const n = numBoundValue(b);
     if (n === undefined || Number.isNaN(n)) return undefined;

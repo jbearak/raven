@@ -16,6 +16,7 @@ import {
     Field,
     Float64,
     Int32,
+    Int64,
     Int8,
     RecordBatch,
     RecordBatchFileWriter,
@@ -32,6 +33,7 @@ import type { DataType } from 'apache-arrow';
 export type ColumnSpec =
     | { name: string; kind: 'dbl'; gen: (i: number) => number | null; fieldMd?: Record<string, string> }
     | { name: string; kind: 'int'; gen: (i: number) => number | null; fieldMd?: Record<string, string> }
+    | { name: string; kind: 'i64'; gen: (i: number) => bigint | null; fieldMd?: Record<string, string> }
     | { name: string; kind: 'lgl'; gen: (i: number) => boolean | null; fieldMd?: Record<string, string> }
     | { name: string; kind: 'chr'; gen: (i: number) => string | null; fieldMd?: Record<string, string> }
     | {
@@ -88,6 +90,7 @@ function arrowType(c: ColumnSpec, dictId: number): DataType {
     switch (c.kind) {
         case 'dbl': return new Float64();
         case 'int': return new Int32();
+        case 'i64': return new Int64();
         case 'lgl': return new Bool();
         case 'chr': return new Utf8();
         case 'date': return new DateDay();
@@ -117,7 +120,7 @@ function columnData(c: ColumnSpec, type: any, start: number, len: number, dictio
             }
             return makeData({ type, length: len, nullCount: nulls, nullBitmap: nulls ? valid : undefined, data: values as any });
         }
-        case 'dttm': {
+        case 'dttm': case 'i64': {
             const values = new BigInt64Array(len);
             for (let i = 0; i < len; i++) {
                 const v = c.gen(start + i);

@@ -318,6 +318,9 @@ type EdgeCase = {
     hide?: number[];
     /** Flavors that must refuse the view (generator error), not emit code. */
     refuse?: CodeFlavor[];
+    /** The `id`s the view must show, stated independently of the viewer's
+     *  engine (which otherwise supplies the expectation). */
+    rows?: number[];
 };
 
 /** `preamble` is R run before the cases, after dplyr and data.table load
@@ -327,6 +330,7 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
         const results = new Map<string, string>();
         const want = new Map<string, string>();
         const errors = new Map<string, string>();
+        const viewerRows = new Map<string, number[]>();
         beforeAll(async () => {
             const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-rcode-edge-'));
             const rds = join(tmp, 'df.rds');
@@ -351,6 +355,7 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
                 const perm = await computePermutation(rd, keys, { ...ctx, stringOrder: 'c', locale: LOCALE }, { rows });
                 const keep = cols.map((col, i) => (c.hide ?? []).includes(i) ? null : col.name).filter(n => n !== null);
                 want.set(c.name, `${Array.from(perm, r => r + 1).join(',')}\t${keep.join(',')}`);
+                if (c.rows) viewerRows.set(c.name, Array.from(perm, r => r + 1));
                 for (const obj of objects) {
                     for (const flavor of FLAVORS) {
                         const res = generateRCode({
@@ -377,6 +382,9 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
         }, 120_000);
 
         for (const c of cases) {
+            if (c.rows) {
+                test(`viewer: ${c.name}`, () => { expect(viewerRows.get(c.name)).toEqual(c.rows!); });
+            }
             for (const obj of objects) {
                 for (const flavor of FLAVORS) {
                     test(`${obj} ${flavor}: ${c.name}`, () => {
@@ -465,6 +473,22 @@ df$neg <- bit64::as.integer64(c("-1", "-2", NA))`,
         { name: 'big > 1e30', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: 1e30 } }] },
         { name: 'labelled = odd code', filters: [{ ci: 3, p: { kind: 'numCompare', op: '=', value: '9007199254740993' } }] },
         { name: 'labelled = even code', filters: [{ ci: 3, p: { kind: 'numCompare', op: '=', value: 9007199254740992 } }] },
+        // A bound typed with a fraction or an exponent is decimal text: read
+        // as a double, 2^53 + 0.5 is 2^53 and `<` would leave row 1 out.
+        { name: 'big < 2^53 + 0.5, typed', filters: [{ ci: 1, p: { kind: 'numCompare', op: '<', value: '9007199254740992.5' } }], rows: [1] },
+        { name: 'big <= 2^53 + 0.5, typed', filters: [{ ci: 1, p: { kind: 'numCompare', op: '<=', value: '9007199254740992.5' } }], rows: [1] },
+        { name: 'big > 2^53 + 0.5, typed', filters: [{ ci: 1, p: { kind: 'numCompare', op: '>', value: '9007199254740992.5' } }], rows: [2, 3] },
+        { name: 'big = 2^53 + 0.5, typed', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: '9007199254740992.5' } }], rows: [] },
+        { name: 'big != 2^53 + 0.5, typed', filters: [{ ci: 1, p: { kind: 'numCompare', op: '!=', value: '9007199254740992.5' } }], rows: [1, 2, 3] },
+        { name: 'big = 2^53 + 1 in scientific notation', filters: [{ ci: 1, p: { kind: 'numCompare', op: '=', value: '9.007199254740993e15' } }], rows: [2, 3] },
+        { name: 'big between 2^53 + 0.5 and 2^53 + 1.5, typed', filters: [{ ci: 1, p: { kind: 'numBetween', lo: '9007199254740992.5', hi: '9007199254740993.5', inclusive: true } }], rows: [2, 3] },
+        { name: 'big not between 2^53 + 0.5 and 2^53 + 1.5, typed', filters: [{ ci: 1, p: { kind: 'numNotBetween', lo: '9007199254740992.5', hi: '9007199254740993.5', inclusive: true } }], rows: [1] },
+        { name: 'small >= 2.5, typed', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>=', value: '2.5' } }], rows: [2] },
+        { name: 'small != 2.5 or missing, typed', filters: [{ ci: 2, p: { kind: 'numCompare', op: '!=', value: '2.5' }, includeMissing: true }], rows: [1, 2, 3] },
+        { name: 'small > a negative number too small for a double', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>', value: '-1e-10000' } }], rows: [1, 2] },
+        { name: 'small < a positive number too small for a double', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: '1e-10000' } }], rows: [] },
+        { name: 'small < 1e30, typed', filters: [{ ci: 2, p: { kind: 'numCompare', op: '<', value: '1e30' } }], rows: [1, 2] },
+        { name: 'neg > -1.5, typed', filters: [{ ci: 4, p: { kind: 'numCompare', op: '>', value: '-1.5' } }], rows: [1] },
         { name: 'small >= 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '>=', value: 2.5 } }] },
         { name: 'small != 2.5', filters: [{ ci: 2, p: { kind: 'numCompare', op: '!=', value: 2.5 } }] },
         { name: 'small != 2.5 or missing', filters: [{ ci: 2, p: { kind: 'numCompare', op: '!=', value: 2.5 }, includeMissing: true }] },

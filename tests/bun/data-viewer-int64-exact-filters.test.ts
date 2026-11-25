@@ -89,6 +89,42 @@ describe('integer64 comparison and range filters are exact', () => {
         ['between -Inf and 3', { kind: 'numBetween', lo: -Infinity, hi: 3, inclusive: true }, [3, 5]],
         ['a reversed range is empty', { kind: 'numBetween', lo: 5, hi: 1, inclusive: true }, []],
         ['a null bound matches nothing', { kind: 'numCompare', op: '!=', value: null as unknown as number }, []],
+        // A bound typed with a fraction or an exponent arrives as decimal
+        // text and is read digit by digit: as a double, 2^53 + 0.5 is 2^53.
+        ['< 2^53 + 0.5 keeps 2^53', { kind: 'numCompare', op: '<', value: '9007199254740992.5' }, [0, 3, 5]],
+        ['<= 2^53 + 0.5', { kind: 'numCompare', op: '<=', value: '9007199254740992.5' }, [0, 3, 5]],
+        ['> 2^53 + 0.5', { kind: 'numCompare', op: '>', value: '9007199254740992.5' }, [1, 2]],
+        ['>= 2^53 + 0.5', { kind: 'numCompare', op: '>=', value: '9007199254740992.5' }, [1, 2]],
+        ['= 2^53 + 0.5 is no integer', { kind: 'numCompare', op: '=', value: '9007199254740992.5' }, []],
+        ['!= 2^53 + 0.5', { kind: 'numCompare', op: '!=', value: '9007199254740992.5' }, [0, 1, 2, 3, 5]],
+        ['= 2^53 + 1 in scientific notation', { kind: 'numCompare', op: '=', value: '9.007199254740993e15' }, [1]],
+        ['= 2^53 + 1 with a zero fraction', { kind: 'numCompare', op: '=', value: '+9007199254740993.000' }, [1]],
+        ['> 9007199254740.9925e3 (2^53 + 0.5 again)', { kind: 'numCompare', op: '>', value: '9007199254740.9925e3' }, [1, 2]],
+        ['between 2^53 + 0.5 and 2^53 + 1.5', { kind: 'numBetween', lo: '9007199254740992.5', hi: '9007199254740993.5', inclusive: true }, [1]],
+        ['between, exclusive, with fractional ends', { kind: 'numBetween', lo: '9007199254740991.5', hi: '9007199254740993.5', inclusive: false }, [0, 1]],
+        ['a half-open range with fractional ends', { kind: 'numBetween', lo: '2.5', hi: '9007199254740992.5', inclusive: true, upperInclusive: false }, [0, 5]],
+        ['not between 2^53 + 0.5 and 2^53 + 1.5', { kind: 'numNotBetween', lo: '9007199254740992.5', hi: '9007199254740993.5', inclusive: true }, [0, 2, 3, 5]],
+        ['a reversed fractional range is empty', { kind: 'numBetween', lo: '5.5', hi: '1.5', inclusive: true }, []],
+        ['> -7.5, typed', { kind: 'numCompare', op: '>', value: '-7.5' }, [0, 1, 2, 3, 5]],
+        ['< -6.5, typed', { kind: 'numCompare', op: '<', value: '-6.5' }, [3]],
+        ['>= -7.0', { kind: 'numCompare', op: '>=', value: '-7.0' }, [0, 1, 2, 3, 5]],
+        ['> .5', { kind: 'numCompare', op: '>', value: '.5' }, [0, 1, 2, 5]],
+        ['<= 3.', { kind: 'numCompare', op: '<=', value: '3.' }, [3, 5]],
+        // Below every double, on either side of zero.
+        ['> 1e-10000', { kind: 'numCompare', op: '>', value: '1e-10000' }, [0, 1, 2, 5]],
+        ['>= -1e-10000', { kind: 'numCompare', op: '>=', value: '-1e-10000' }, [0, 1, 2, 5]],
+        ['< 1e-10000', { kind: 'numCompare', op: '<', value: '1e-10000' }, [3]],
+        ['= 0e-10000 is zero', { kind: 'numCompare', op: '!=', value: '0.000e-10000' }, [0, 1, 2, 3, 5]],
+        // Past every 64-bit integer, however large the exponent.
+        ['< 1e30, typed', { kind: 'numCompare', op: '<', value: '1e30' }, [0, 1, 2, 3, 5]],
+        ['> 1e30, typed', { kind: 'numCompare', op: '>', value: '1e30' }, []],
+        ['!= 1e999999999999999999999', { kind: 'numCompare', op: '!=', value: '1e999999999999999999999' }, [0, 1, 2, 3, 5]],
+        ['= -1e400', { kind: 'numCompare', op: '=', value: '-1e400' }, []],
+        ['>= -1e400', { kind: 'numCompare', op: '>=', value: '-1e400' }, [0, 1, 2, 3, 5]],
+        ['between -1e400 and 3.5', { kind: 'numBetween', lo: '-1e400', hi: '3.5', inclusive: true }, [3, 5]],
+        // Not a number at all: nothing, `!=` included.
+        ['a half-written exponent matches nothing', { kind: 'numCompare', op: '!=', value: '1e' }, []],
+        ['a lone point matches nothing', { kind: 'numCompare', op: '!=', value: '.' }, []],
     ];
     for (const [name, p, want] of cases) {
         test(name, async () => { expect(await rows(0, p)).toEqual(want); });
@@ -105,6 +141,13 @@ describe('integer64 comparison and range filters are exact', () => {
         expect(await rows(1, { kind: 'numBetween', lo: P53, hi: P53, inclusive: true })).toEqual([0]);
         expect(await rows(1, { kind: 'setIn', values: ['9007199254740993'] })).toEqual([1]);
         expect(await rows(1, { kind: 'setIn', values: [P53] })).toEqual([0]);
+    });
+
+    test('an unsigned column takes fractional bounds past 2^63', async () => {
+        expect(await rows(2, { kind: 'numCompare', op: '>=', value: '18446744073709551614.5' })).toEqual([0]);
+        expect(await rows(2, { kind: 'numCompare', op: '<', value: '18446744073709551614.5' })).toEqual([1, 2, 3, 5]);
+        expect(await rows(2, { kind: 'numCompare', op: '<=', value: '1.8446744073709551615e19' })).toEqual([0, 1, 2, 3, 5]);
+        expect(await rows(2, { kind: 'numCompare', op: '<', value: '-0.5' })).toEqual([]);
     });
 
     test('an unsigned column compares past 2^63', async () => {
@@ -127,18 +170,53 @@ describe('the filter popover keeps an integer64 bound exact', () => {
             .toEqual({ kind: 'numBetween', lo: '9007199254740993', hi: '9223372036854775807', inclusive: true });
     });
 
-    test('everything a double holds exactly stays a number', () => {
+    test('a whole number a double holds exactly stays a number', () => {
         const opts = { setUsesChecklist: false, int64: true };
         expect(buildPredicate('numCompare', form('3'), opts)).toEqual({ kind: 'numCompare', op: '=', value: 3 });
         expect(buildPredicate('numCompare', form('9007199254740992'), opts)).toEqual({ kind: 'numCompare', op: '=', value: P53 });
-        expect(buildPredicate('numCompare', form('2.5'), opts)).toEqual({ kind: 'numCompare', op: '=', value: 2.5 });
-        expect(buildPredicate('numCompare', form('1e3'), opts)).toEqual({ kind: 'numCompare', op: '=', value: 1000 });
+        expect(buildPredicate('numCompare', form('Infinity'), opts)).toEqual({ kind: 'numCompare', op: '=', value: Infinity });
         expect(buildPredicate('numCompare', form('abc'), opts)).toBeNull();
+        // Trailing junk is read as before (`parseFloat` takes the prefix).
+        expect(buildPredicate('numCompare', form('12abc'), opts)).toEqual({ kind: 'numCompare', op: '=', value: 12 });
+    });
+
+    test('a fraction or an exponent stays the text that was typed', () => {
+        const opts = { setUsesChecklist: false, int64: true };
+        for (const [typed, kept] of [
+            ['9007199254740992.5', '9007199254740992.5'], [' -2.50 ', '-2.50'], ['2.5', '2.5'], ['.5', '.5'], ['3.', '3.'],
+            ['1e3', '1e3'], ['9.007199254740993E15', '9.007199254740993E15'], ['+1.5e-3', '+1.5e-3'],
+        ]) {
+            expect(buildPredicate('numCompare', form(typed), opts)).toEqual({ kind: 'numCompare', op: '=', value: kept });
+        }
+        const s = { ...defaultFormState(), numBetween: { lo: '2.5', hi: '9007199254740992.5', inclusive: true } };
+        expect(buildPredicate('numNotBetween', s, opts))
+            .toEqual({ kind: 'numNotBetween', lo: '2.5', hi: '9007199254740992.5', inclusive: true });
     });
 
     test('other columns still parse to a double', () => {
         expect(buildPredicate('numCompare', form('9007199254740993'), { setUsesChecklist: false }))
             .toEqual({ kind: 'numCompare', op: '=', value: P53 });
+        expect(buildPredicate('numCompare', form('2.5'), { setUsesChecklist: false })).toEqual({ kind: 'numCompare', op: '=', value: 2.5 });
+        expect(buildPredicate('numCompare', form('1e3'), { setUsesChecklist: false })).toEqual({ kind: 'numCompare', op: '=', value: 1000 });
+    });
+
+    test('typed in the popover, a fractional bound filters the rows it should', async () => {
+        const p = buildPredicate('numCompare', { ...defaultFormState(), numCompare: { op: '<', value: '9007199254740992.5' } },
+            { setUsesChecklist: false, int64: true })!;
+        // As the host and the saved state see it: through JSON.
+        expect(await rows(0, JSON.parse(JSON.stringify(p)))).toEqual([0, 3, 5]);
+    });
+
+    test('a fractional bound reopens and re-applies unchanged, shows in the chip, and survives a thumb drag', () => {
+        const p: FilterPredicate = { kind: 'numBetween', lo: '2.5', hi: '9007199254740992.5', inclusive: true };
+        expect(seedFromEntry(p, true).numBetween).toEqual({ lo: '2.5', hi: '9007199254740992.5', inclusive: true });
+        expect(buildPredicate(predicateToKindValue(p), seedFromEntry(p, true), { setUsesChecklist: false, int64: true })).toEqual(p);
+        const col: ColumnSchema = { name: 'big', arrowType: 'Int64', dictionaryShipped: false, isInteger: true };
+        expect(summarizePredicate(p, col)).toBe('big 2.5–9007199254740992.5');
+        expect(summarizePredicate({ kind: 'numCompare', op: '<', value: '9007199254740992.5' }, col)).toBe('big < 9007199254740992.5');
+        // The low thumb moves to 7; the high one sits at the double the text reads as.
+        expect(brushNumBetween(seedFromEntry(p, true).numBetween, 7, parseFloat('9007199254740992.5'), true))
+            .toEqual({ lo: '7', hi: '9007199254740992.5', inclusive: true });
     });
 
     test('a text bound reopens and re-applies unchanged, and shows in the chip', () => {
@@ -213,6 +291,11 @@ describe('Copy as R code compares an integer64 as integer64', () => {
         expect(code({ kind: 'numCompare', op: '!=', value: 3 })).toContain(`big != ${i64('3')}`);
         expect(code({ kind: 'numCompare', op: '>', value: P53 })).toContain(`big >= ${i64('9007199254740993')}`);
         expect(code({ kind: 'numCompare', op: '<', value: 3 })).toContain(`big <= ${i64('2')}`);
+        // A typed fractional bound moves to the integer that means the same.
+        expect(code({ kind: 'numCompare', op: '<', value: '9007199254740992.5' })).toContain(`big <= ${i64('9007199254740992')}`);
+        expect(code({ kind: 'numCompare', op: '>=', value: '9007199254740992.5' })).toContain(`big >= ${i64('9007199254740993')}`);
+        expect(code({ kind: 'numCompare', op: '=', value: '9007199254740992.5' })).toContain('FALSE');
+        expect(code({ kind: 'numCompare', op: '=', value: '9.007199254740993e15' })).toContain(`big == ${i64('9007199254740993')}`);
         expect(code({ kind: 'numBetween', lo: 1, hi: '9007199254740993', inclusive: true }))
             .toContain(`big >= ${i64('1')} & big <= ${i64('9007199254740993')}`);
         expect(code({ kind: 'numBetween', lo: 1, hi: 5, inclusive: true, upperInclusive: false }))

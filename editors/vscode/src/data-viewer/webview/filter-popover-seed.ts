@@ -167,15 +167,19 @@ function effectiveSetValues(s: FormState, setUsesChecklist: boolean): (string | 
 }
 
 /** A typed numeric bound, or null when it isn't a number. On an Int64 /
- *  Uint64 column, an integer a double can't hold exactly stays decimal
- *  text, so the filter compares the integer that was typed
- *  (`9007199254740993`, not the 2^53 it would round to). */
+ *  Uint64 column, a bound a double may not hold exactly stays decimal
+ *  text, so the filter compares what was typed: an integer past 2^53
+ *  (`9007199254740993`, not the 2^53 it would round to), and any bound
+ *  with a fraction or an exponent (`9007199254740992.5` is 2^53 as a
+ *  double, which `<` would then leave out). */
 export function parseBound(text: string, int64 = false): NumBound | null {
     const t = text.trim();
     if (int64 && /^[+-]?[0-9]+$/.test(t)) {
         const exact = BigInt(t);
         const n = Number(t);
         if (!Number.isFinite(n) || BigInt(n) !== exact) return exact.toString();
+    } else if (int64 && /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/.test(t)) {
+        return t;
     }
     const v = parseFloat(text);
     return isNaN(v) ? null : v;
