@@ -955,10 +955,18 @@ impl ForwardSource {
     pub fn exempt_from_missing_file_diagnostics(&self) -> bool {
         self.resolved_uri.is_some()
             || (self.system_file.is_some() && self.path.is_empty())
-            || (!self.is_sys_source
-                && !self.is_directive
-                && self.tar_source_ordinal.is_none()
-                && super::source_detect::is_url_source_path(&self.path))
+            || self.is_url_source_call()
+    }
+
+    /// An AST-detected `source()` call that reads a URL
+    /// (`source("https://...")`): R reads it, but Raven doesn't resolve a URL
+    /// to a file, so it gets no graph edge either.
+    pub(crate) fn is_url_source_call(&self) -> bool {
+        !self.is_sys_source
+            && !self.is_directive
+            && self.tar_source_ordinal.is_none()
+            && self.resolved_uri.is_none()
+            && super::source_detect::is_url_source_path(&self.path)
     }
 
     /// Check if symbols from this source lend outward as global bindings.

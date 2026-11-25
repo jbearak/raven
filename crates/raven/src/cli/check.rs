@@ -464,20 +464,14 @@ pub async fn run(args: CheckArgs) -> i32 {
 }
 
 async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
-    // Workspace root: --workspace (resolved against CWD if relative), else CWD.
-    // Canonicalize so `Url::from_file_path` gets an absolute path and the
-    // relative paths in output are stable.
-    let abs_workspace = match args.workspace {
-        Some(ref p) if p.is_absolute() => p.clone(),
-        Some(ref p) => cwd.join(p),
-        None => cwd.to_path_buf(),
-    };
-    let root = std::fs::canonicalize(&abs_workspace).unwrap_or(abs_workspace);
-
-    let Ok(workspace_url) = Url::from_file_path(&root) else {
-        eprintln!("raven check: invalid workspace path: {}", root.display());
-        return EXIT_OPERATOR_ERROR;
-    };
+    // Workspace root: --workspace (resolved against CWD if relative), else CWD,
+    // canonicalized. One that isn't a directory would scan as an empty
+    // workspace and report "0 issues", so it is an operator error.
+    let (root, workspace_url) =
+        match resolve_workspace_root("raven check", args.workspace.as_deref(), cwd) {
+            Ok(resolved) => resolved,
+            Err(code) => return code,
+        };
 
     // Config, workspace scan, package mode, R detection, and `system.file()`
     // resolution: the setup `raven graph` shares (see `prepare_workspace`).
@@ -674,7 +668,7 @@ fn build_indexed_state(
 }
 
 /// The canonical workspace root and its URL for `--workspace` (relative to
-/// `cwd`; default `cwd`), for `raven graph` and `raven parse`. A root that
+/// `cwd`; default `cwd`), for `raven check`, `raven graph` and `raven parse`. A root that
 /// isn't a directory would scan as an empty workspace, so it is an operator
 /// error, printed as `{command}: ...`.
 pub(crate) fn resolve_workspace_root(
@@ -2245,6 +2239,23 @@ mod tests {
             quiet: true,
             color: ColorChoice::Never,
             report_uninstalled: false,
+        }
+    }
+
+    /// A `--workspace` that doesn't exist or is a file would scan as an empty
+    /// workspace and pass a CI gate with "0 issues"; it is an operator error.
+    #[test]
+    fn workspace_that_is_not_a_directory_is_an_operator_error() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("script.R");
+        fs::write(&file, "x <- 1\n").unwrap();
+        for workspace in [dir.path().join("missing"), file] {
+            assert_eq!(
+                run_with_cwd_blocking(base_args(&workspace), dir.path()),
+                EXIT_OPERATOR_ERROR,
+                "{}",
+                workspace.display()
+            );
         }
     }
 

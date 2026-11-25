@@ -36,7 +36,7 @@ use crate::cli::check::{
 };
 use crate::cli::graph::{display_fs_path, display_path};
 use crate::cli::shared::{
-    EXIT_OK, EXIT_OPERATOR_ERROR, absolute_path, collect_r_file_paths_with_exclusions, is_r_file,
+    EXIT_OK, EXIT_OPERATOR_ERROR, absolute_path, is_r_file, output_failed, stdout_writer,
 };
 
 pub use document::SCHEMA_VERSION;
@@ -117,7 +117,8 @@ Exit codes:
       printed in its place and every other document was still printed
   1   A usage error (unknown flag / bad option value)
   2   Operator error while running (config load failure, workspace not a
-      directory)
+      directory, a directory that can't be listed, output that couldn't be
+      written)
 ",
         env!("CARGO_PKG_VERSION")
     );
@@ -159,7 +160,7 @@ pub async fn run(args: ParseArgs) -> i32 {
     // scanned file's: a requested file resolves names through what its callers
     // attach.
     maybe_load_sysdata_fallback(&mut prepared.state).await;
-    let requests = requests(&args.files, &root, &prepared);
+    let (requests, unlisted) = requests(&args.files, &root, &prepared);
     let mut warm: Vec<PathBuf> = prepared.scan.discovered.clone();
     warm.extend(requests.iter().filter_map(|request| match &request.target {
         Target::RFile(path) => Some(path.clone()),
@@ -184,27 +185,10 @@ pub async fn run(args: ParseArgs) -> i32 {
         let line = serde_json::to_string(&document).expect("parse document serializes");
         (line, document.is_error())
     });
-    print_documents(stdout_writer(), documents)
-}
-
-/// Where the documents go: stdout, through a handle whose write errors all
-/// come back. `std::io::Stdout` reports a write to a descriptor that isn't
-/// open for writing (`raven parse 1</dev/null`, `EBADF`) as a success, on
-/// purpose, so on Unix the documents are written through a duplicate of the
-/// descriptor as a plain file. Nothing else writes to stdout during a run.
-///
-/// A stdout closed before the run (`1>&-`) can't be told from `>/dev/null`:
-/// Rust's runtime reopens a closed standard descriptor on `/dev/null` before
-/// `main`.
-fn stdout_writer() -> Box<dyn std::io::Write> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsFd as _;
-        if let Ok(fd) = std::io::stdout().as_fd().try_clone_to_owned() {
-            return Box::new(std::fs::File::from(fd));
-        }
-    }
-    Box::new(std::io::stdout().lock())
+    let code = print_documents(stdout_writer(), documents);
+    // A directory that couldn't be listed hid files that should have been
+    // printed: an operator error, as in `raven lint`.
+    if unlisted { EXIT_OPERATOR_ERROR } else { code }
 }
 
 /// Writes each document's JSON line, with whether it is an error document,
@@ -223,23 +207,13 @@ fn print_documents(
             code = EXIT_UNREADABLE;
         }
         if let Err(error) = writeln!(out, "{line}") {
-            return output_failed(&error, code);
+            return output_failed("raven parse", &error, code);
         }
     }
     match out.flush() {
         Ok(()) => code,
-        Err(error) => output_failed(&error, code),
+        Err(error) => output_failed("raven parse", &error, code),
     }
-}
-
-/// The exit code after stdout failed: `code` for a closed pipe, otherwise an
-/// operator error, reported on stderr.
-fn output_failed(error: &std::io::Error, code: i32) -> i32 {
-    if error.kind() == std::io::ErrorKind::BrokenPipe {
-        return code;
-    }
-    eprintln!("raven parse: cannot write output: {error}");
-    EXIT_OPERATOR_ERROR
 }
 
 /// One requested file: its printed `path` and what to do with it.
@@ -262,37 +236,49 @@ fn printed_path(path: &Path, root: &Path) -> String {
     }
 }
 
-/// The requested files, in output order. With no FILES: every `.R`/`.r` file
-/// the workspace scan discovered, sorted by printed path. Otherwise each
-/// FILE in order; a directory stands for its R files (discovery walk, with
-/// exclusions), sorted by printed path.
-fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> Vec<Request> {
-    let r_files = |paths: Vec<PathBuf>| {
-        let mut found: Vec<Request> = paths
-            .into_iter()
-            .filter(|path| is_r_file(path))
-            .map(|path| Request {
-                path: printed_path(&path, root),
-                target: Target::RFile(path),
-            })
-            .collect();
-        found.sort_by(|a, b| a.path.cmp(&b.path));
-        found
+/// The requested files, in output order, and whether a directory walk
+/// couldn't list a directory (each failure is printed to stderr). With no
+/// FILES: the workspace root's R files, as for `raven parse .`. The scan's
+/// own file list isn't used: it also holds files admitted only to resolve
+/// names (an `import::from()` module outside the root), which aren't
+/// requested. Otherwise each FILE in order; a directory stands for its R files
+/// (discovery walk, with exclusions), sorted by printed path.
+fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> (Vec<Request>, bool) {
+    let workspace = [root.to_path_buf()];
+    let files = if files.is_empty() {
+        &workspace[..]
+    } else {
+        files
     };
-    if files.is_empty() {
-        return r_files(prepared.scan.discovered.clone());
-    }
     let mut out = Vec::new();
+    let mut unlisted = false;
     for file in files {
         let path = requested_path(file, root);
         if path.is_dir() {
             let mut walked = Vec::new();
-            collect_r_file_paths_with_exclusions(
+            let exclusions = prepared
+                .state
+                .workspace_exclusions
+                .for_discovery_directory(&path);
+            let errors = crate::state::collect_files_matching_for_discovery_with_entry_errors(
                 &path,
                 &mut walked,
-                &prepared.state.workspace_exclusions,
+                is_r_file,
+                &exclusions,
             );
-            out.extend(r_files(walked));
+            for (dir, error) in errors {
+                eprintln!("raven parse: cannot read dir {}: {error}", dir.display());
+                unlisted = true;
+            }
+            let mut found: Vec<Request> = walked
+                .into_iter()
+                .map(|path| Request {
+                    path: printed_path(&path, root),
+                    target: Target::RFile(path),
+                })
+                .collect();
+            found.sort_by(|a, b| a.path.cmp(&b.path));
+            out.extend(found);
         } else {
             out.push(Request {
                 path: printed_path(&path, root),
@@ -304,7 +290,7 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> Vec
             });
         }
     }
-    out
+    (out, unlisted)
 }
 
 /// Where a FILE argument points. Relative FILES resolve against the workspace
@@ -314,10 +300,37 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> Vec
 /// canonical root but its canonical form is (an absolute path through an
 /// alias of the root, such as macOS's `/var` for `/private/var`) is the
 /// canonical form used.
+///
+/// A `..` after a symlinked directory (`alias/../data.R`) leaves the link's
+/// target, not the link, so collapsing it lexically can name another file than
+/// the one the OS opens. So the path up to its last `..` is resolved as the OS
+/// resolves it; when that directory differs from the collapsed one, the rest
+/// of the path is taken under it, in canonical form, whether or not the file
+/// exists there (a missing file gets its error document at the place the OS
+/// looked).
 fn requested_path(file: &Path, root: &Path) -> PathBuf {
     let absolute = absolute_path(root, file);
-    let lexical =
-        crate::cross_file::path_resolve::normalize_path_public(&absolute).unwrap_or(absolute);
+    let lexical = crate::cross_file::path_resolve::normalize_path_public(&absolute)
+        .unwrap_or_else(|| absolute.clone());
+    let components: Vec<_> = absolute.components().collect();
+    if let Some(last) = components
+        .iter()
+        .rposition(|component| *component == std::path::Component::ParentDir)
+    {
+        let prefix: PathBuf = components[..=last].iter().collect();
+        let rest: PathBuf = components[last + 1..].iter().collect();
+        let collapsed = crate::cross_file::path_resolve::normalize_path_public(&prefix)
+            .and_then(|collapsed| std::fs::canonicalize(collapsed).ok());
+        if let Ok(opened) = std::fs::canonicalize(&prefix)
+            && collapsed.as_ref() != Some(&opened)
+        {
+            return if rest.as_os_str().is_empty() {
+                opened
+            } else {
+                opened.join(rest)
+            };
+        }
+    }
     if lexical.starts_with(root) {
         return lexical;
     }

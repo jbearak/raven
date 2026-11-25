@@ -359,7 +359,7 @@ The text format is for reading and may change between releases. For scripts, use
 - `--no-config`: ignore `raven.toml` and `.lintr` and use Raven's built-in defaults.
 - `--format text|json`: output format, default `text`. `sarif` isn't accepted, because the graph isn't a list of findings.
 
-`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config or a `--workspace` that isn't a directory exits `2`.
+`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config or a `--workspace` that isn't a directory exits `2`. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, also exits `2`, with the reason on stderr. A closed pipe, as in `raven graph | head`, only ends the output and still exits `0`.
 
 ### Graph JSON
 
@@ -370,7 +370,7 @@ Paths are relative to the canonical workspace root with `/` separators, or absol
 Every line number is 0-based and every character counts UTF-16 code units, as in the editor protocol. That holds for `call_site.position`, `directive.line`, and `position` in `dropped`, so a directive on a file's first line has `line: 0`. A backward directive's `line=N` is 1-based as you write it: `# raven: sourced-by ../main.R line=3` gives a call site whose `position.line` is `2`.
 
 - `package_mode`: Raven analyzed the workspace as an R package.
-- `complete`: every file the workspace scan found went through graph building. When it's `false`, `warnings` says how many files couldn't be read or processed and how many the index's capacity evicted. An oversized file still counts.
+- `complete`: the workspace scan listed every directory it walked, and every file it found went through graph building. When it's `false`, `warnings` names the directories that couldn't be listed, such as one without read permission, and says how many files couldn't be read or processed and how many the index's capacity evicted. An oversized file still counts.
 - `warnings`: sentences for people, covering incomplete files, files without full text (backward call sites into them may be unfound), failed `list.files()` batches, and any mismatch between the graph and its records.
 - `files`: every indexed file and every edge endpoint, each with `path`, `indexed`, `exists`, `self_contained`, `syntax_errors`, and `working_directory` (`null`, or `{"raw", "resolved"}` for a `# raven: cd`).
 
@@ -400,6 +400,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 - `superseded`: a forward directive stands in for the call. A `line=N` directive covers a call to the same file on line N; a call to another file on that line keeps its own edge. A plain `# raven: source` directive followed by a `line=eof` directive for the same file covers a later call to that file.
 - `duplicate`: merged with an identical edge, such as a repeated directive.
 - `no_path_context`: Raven couldn't resolve any path in the file. It shouldn't happen for files on disk.
+- `url`: a `source()` call that reads a URL, such as `source("https://example.com/setup.R")`. R reads it, but Raven doesn't resolve a URL to a file.
 
 ### Graph limits
 
@@ -428,7 +429,7 @@ $ raven parse clean.R
 
 ### Parse options
 
-- `FILES`: the files to print, in the order given. Relative paths resolve against the workspace root, as `raven check`'s do. A directory stands for the R files under it, sorted by path, with `.gitignore` and `[workspace].exclude` applied. With no `FILES`, Raven prints every `.R` and `.r` file in the workspace, sorted by `path` in byte order.
+- `FILES`: the files to print, in the order given. Relative paths resolve against the workspace root, as `raven check`'s do. A directory stands for the R files under it, sorted by path, with `.gitignore` and `[workspace].exclude` applied. With no `FILES`, Raven prints every `.R` and `.r` file in the workspace, sorted by `path` in byte order, as `raven parse .` does. A file outside the workspace that Raven reads only to resolve names, such as an `import::from()` module, isn't printed unless you name it.
 - `--workspace DIR`, `--config PATH`, `--no-config`: as for [`raven graph`](#graph-options).
 - `--format json`: the default and, for now, the only format. Any other value is a usage error.
 
@@ -441,7 +442,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 - `0`: every requested file has a parsed document. A file with syntax errors still gets a full document.
 - `3`: at least one file couldn't be read or decoded. Its error document is printed in its place, and every other document is still printed.
 - `1`: a usage error, such as an unknown flag or a `--format` other than `json`.
-- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
+- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. So is a directory that can't be listed or whose entries can't be examined, such as one without read or search permission: the files Raven could find are still printed, and the directory is named on stderr. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
 
 <!-- example: parse-unreadable -->
 ```console
@@ -468,7 +469,7 @@ Every `range` has a `start` and an `end` position, and the end is exclusive. A p
 
 A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `package_data`, `line_count`, `statements`, `comments`, and `errors`.
 
-- `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root.
+- `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root. A `FILE` with `..` after a symlinked directory, such as `alias/../data.R`, names the file in the directory the system resolves, in its canonical spelling, not the file that dropping `alias/..` would name.
 - `encoding`: `name` (`UTF-8`, `UTF-16LE`, or `UTF-16BE`), `bom` (whether a byte-order mark was present and stripped), and `line_endings` (`lf`, `crlf`, `cr`, `mixed`, or `none` for a file without one). Raven reads files as `raven check` does, as described in [File encoding](#file-encoding). A file that isn't valid in its encoding gets the error document, with a message naming the first invalid byte's offset. Raven never substitutes replacement characters.
 - `package_data`: which sources of package export names the run had. See [Package data](#package-data).
 - `line_count`: the number of lines. A final line ending doesn't start another line, so `a\nb\n` has 2 lines and an empty file has 0.
@@ -634,7 +635,7 @@ The fields:
 - `unpaired`: an `-end` with no open block, which does nothing, or a `-start` that nothing closes. Raven honors that `-start` through the last line.
 - `chunk_only`: `# raven: ignore-chunk`, which works only in R Markdown and Quarto chunks.
 
-An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and `@lsp-` blocks pair with each other, and `# nolint start` and `# nolint end` with each other.
+An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and `@lsp-` blocks pair with each other, as `raven check` pairs them. A `# nolint start` or `# nolint end` pairs as `raven lint` reads blocks: one block is open at a time, and any `-end` or `# nolint end` closes it, so `# raven: ignore-end` closes an open `# nolint start`.
 
 ### Name resolution
 

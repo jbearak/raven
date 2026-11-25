@@ -84,6 +84,90 @@ fn workspace_mode_prints_one_document_per_line_sorted_by_path() {
     assert_eq!(docs[2]["line_count"], 2);
 }
 
+/// A module the workspace admits only to resolve names (here an
+/// `import::from()` target outside the root, found through an inherited
+/// `# raven: cd`) isn't one of the workspace's files, so it isn't printed.
+#[test]
+fn workspace_mode_prints_only_the_workspace_files() {
+    let (tmp, ws) = workspace();
+    write(
+        &ws,
+        "main.R",
+        b"# raven: cd ../shared\nsource(\"../ws/child.R\")\n",
+    );
+    write(&ws, "child.R", b"import::from(\"x.R\", .all = TRUE)\n");
+    write(tmp.path(), "shared/x.R", b"secret <- function() 42\n");
+    let output = parse_in(&ws, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(paths(&documents(&output)), ["child.R", "main.R"]);
+}
+
+/// A symlink whose target sits behind a directory that can't be searched
+/// hides that target: the run is an operator error that names the link.
+#[cfg(unix)]
+#[test]
+fn symlink_into_unsearchable_directory_names_the_link() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (tmp, ws) = workspace();
+    write(&ws, "top.R", b"x <- 1\n");
+    write(tmp.path(), "vault/inner/a.R", b"y <- 1\n");
+    std::os::unix::fs::symlink(tmp.path().join("vault/inner"), ws.join("link")).unwrap();
+    let vault = tmp.path().join("vault");
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::metadata(ws.join("link")).is_ok() {
+        // Running as root: permissions don't stop the walk.
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let output = parse_in(&ws, &[]);
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(paths(&documents(&output)), ["top.R"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("/link: "), "{stderr}");
+}
+
+/// A directory that can't be listed (mode 0000), or whose entries can't be
+/// examined (mode 0400: names but not whether each is a directory), hides
+/// files that should have been printed: the rest are still printed, and the
+/// run is an operator error.
+#[cfg(unix)]
+#[test]
+fn unlistable_directory_is_an_operator_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for mode in [0o000, 0o400] {
+        let (_tmp, ws) = workspace();
+        write(&ws, "top.R", b"x <- 1\n");
+        write(&ws, "locked/sub/a.R", b"y <- 1\n");
+        write(&ws, "locked/b.R", b"z <- 1\n");
+        let locked = ws.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap();
+        if std::fs::metadata(locked.join("sub")).is_ok() {
+            // Running as root: permissions don't stop the walk.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let outputs = [parse_in(&ws, &["locked"]), parse_in(&ws, &[])];
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Under 0400 the direct file is listed; it then can't be read, so it
+        // gets its error document.
+        let listed: &[&str] = if mode == 0o400 { &["locked/b.R"] } else { &[] };
+        let in_root: Vec<&str> = listed.iter().copied().chain(["top.R"]).collect();
+        for (output, printed) in outputs.iter().zip([listed, &in_root[..]]) {
+            assert_eq!(output.status.code(), Some(2), "{mode:o}: {output:?}");
+            assert_eq!(paths(&documents(output)), printed, "{mode:o}");
+            // The directory is named once, whatever it holds.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.matches("raven parse: cannot read dir").count(),
+                1,
+                "{mode:o}: {stderr}"
+            );
+            assert!(stderr.contains("locked: "), "{mode:o}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn unreadable_files_get_error_documents_in_order_and_exit_3() {
     let (_tmp, ws) = workspace();
