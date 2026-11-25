@@ -450,6 +450,12 @@ export function formatCell(
             case '-inf': return plain('-Inf');
             case 'date': return plain(cell.v);
             case 'trunc': return plain(cell.v);
+            case 'i64': {
+                // The exact digits whatever Format says (an integer has
+                // no decimals to round); value labels are keyed by them.
+                const label = o.labelsOn ? col?.valueLabels?.[cell.v] : undefined;
+                return label !== undefined ? { ...plain(label), isLabel: true } : plain(cell.v);
+            }
             case 'tsx': return {
                 text: OUT_OF_RANGE_TEXT,
                 missing: true,

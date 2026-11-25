@@ -19,6 +19,7 @@ export type Cell =
     | { _: 'nan' }
     | { _: 'inf' }
     | { _: '-inf' }
+    | { _: 'i64'; v: string }       // 64-bit integer a double can't hold exactly, as decimal text
     | { _: 'date'; v: string }      // YYYY-MM-DD
     | { _: 'ts'; ms: number; us: number } // floor(µs/1000) and µs − 1000·ms
     | { _: 'tsx'; s: string }       // timestamp outside the JS Date range
@@ -97,6 +98,20 @@ export function encodeNumber(x: number | null): Cell {
     if (x === Infinity) return { _: 'inf' };
     if (x === -Infinity) return { _: '-inf' };
     return x;
+}
+
+/**
+ * A 64-bit integer (Arrow Int64 / Uint64, R's `bit64::integer64`). One a
+ * double holds exactly travels as a number, like any other integer. Past
+ * ±(2^53 − 1) a double holds only some integers, so `Number(v)` would
+ * show a neighbour's digits (2^53 + 1 as `9007199254740992`); those
+ * travel as `{ _: 'i64', v }` with the exact decimal text, which is what
+ * the grid draws, copies and searches.
+ */
+export function encodeInt64(x: bigint | null): Cell {
+    if (x === null) return null;
+    const n = Number(x);
+    return Number.isSafeInteger(n) ? n : { _: 'i64', v: x.toString() };
 }
 
 export function encodeString(x: string | null): Cell {

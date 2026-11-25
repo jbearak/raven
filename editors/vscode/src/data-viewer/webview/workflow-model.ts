@@ -74,6 +74,9 @@ export function summarizeSelection(
                 if (cell._ === 'nan') { na++; continue; }
                 if (cell._ === 'inf') { count++; sum += Infinity; continue; }
                 if (cell._ === '-inf') { count++; sum -= Infinity; continue; }
+                // A 64-bit integer past 2^53: summed as a double, like the
+                // rest (the status line shows four significant digits).
+                if (cell._ === 'i64') { count++; sum += Number(cell.v); continue; }
             }
         }
     }
