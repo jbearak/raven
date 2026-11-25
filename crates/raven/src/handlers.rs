@@ -23306,9 +23306,9 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
 /// (built-in table first, via [`package_arg_policy`]), from the first package
 /// that declares either.
 ///
-/// An infix operator cannot be namespace-qualified, so the provider is found
-/// the way R's search path would, from the call at `operator_start` (the
-/// operator token's start byte): a binding the call's scope reaches first
+/// An infix operator cannot be namespace-qualified, so the provider is looked
+/// up from the call at `operator_start` (the operator token's start byte),
+/// approximating R's lookup: a binding the call's scope reaches first
 /// that is not a package's (an enclosing function's `` `op` <- ``, a sourced
 /// file's) shadows every package ([`InfixSite::Shadowed`]); a top-level
 /// `` `op` <- pkg::`op` `` alias names the provider outright; any other
@@ -23321,6 +23321,43 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
 ///
 /// Without [`NseAnalysis::infix_sites`] (the collector tests that build an
 /// analysis by hand), the attached packages are the file-wide in-play set.
+///
+/// # What the lookup does not decide
+///
+/// The candidates are not R's search path. [`attached_at`] lists the
+/// packages scope can see at the call in Raven's own order (the file-wide
+/// in-play packages, then the rest by name), with namespace imports and
+/// attached packages together, and the first candidate that declares `op`
+/// wins. The alias map holds one entry per name. So in three kinds of
+/// program this lookup applies a declaration where R calls another function,
+/// or finds none, and an operand R may stop on goes unreported (issue #883).
+/// A fix for each was written and cut from PR #881, because each reported
+/// operands in programs R runs:
+///
+/// - **A package attached later masks the declaring one.** R's order depends
+///   on which package was attached first and where (another file, a
+///   `Depends:` entry, a namespace import rather than an attach), on
+///   `library()` arguments such as `exclude` and `pos`, and on code Raven
+///   doesn't model: a helper that attaches, `detach()`, conflicted.
+/// - **A namespace-only load counts.** `loadNamespace("pkg")` puts `pkg` in
+///   scope's `loaded_packages`, which [`attached_at`] reads. When nothing
+///   attaches `pkg`, R fails to find the operator before it evaluates an
+///   operand, and the declaration still suppresses an operand here. (Nothing
+///   reports an operator R can't find, declared or not.) When something does
+///   attach it out of sight (`attachNamespace(ns)`,
+///   `library(pkg, character.only = TRUE)`, a helper), R runs the program.
+/// - **A later alias governs an earlier call.** When the file's last
+///   top-level binding of `` `op` `` is `` pkg::`op` ``,
+///   `local_callee_aliases` holds it, and it applies to calls written above
+///   it as well: every site that isn't [`InfixSite::Shadowed`], once `pkg`'s
+///   declaration is in the package cache. A call written above the binding
+///   can be evaluated after it (a function body, a loop, a promise), and
+///   nothing here knows when a call is evaluated.
+///
+/// [`resolve_call_arg_policy`] has the same three gaps for an ordinary call:
+/// it reads the file-wide in-play packages and the same alias map.
+/// `tests/package_declaration_choice.rs` holds the programs R runs that a
+/// narrower rule has to keep quiet.
 fn declared_infix_operator(
     op: &str,
     operator_start: usize,
