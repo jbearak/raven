@@ -275,27 +275,15 @@ async function acceptorFor(
     if (predicate.kind === 'dateCompare'
         || predicate.kind === 'dateBetween'
         || predicate.kind === 'dateNotBetween') {
-        // Convert ISO strings to the same numeric domain the underlying
-        // arrow values live in.
-        //
-        // apache-arrow's child.get(r) for Date32<DAY> (DateDay) returns
-        // ms-since-epoch — NOT day-count — even though the raw typed array
-        // stores days. loadNumeric therefore stores ms for all Date columns.
-        // Timestamp columns (bigint microseconds) coerce to Number ms * 1000
-        // via loadNumeric's bigint path, which loses sub-ms precision but is
-        // fine for user-typed ISO strings.
+        // Both sides in milliseconds since the epoch, which is what
+        // apache-arrow's `child.get(r)` returns for every Date and
+        // Timestamp column, whatever the stored unit: Date32<DAY> stores
+        // days and a microsecond Timestamp stores bigint microseconds,
+        // but `get` gives ms for both (fractional below a millisecond).
         const values = await loadNumeric(reader, columnIndex, signal);
-        const isTs = schema.arrowType.startsWith('Timestamp');
-        const toUnit = (iso: string): number => {
-            const ms = Date.parse(iso);
-            if (!Number.isFinite(ms)) return NaN;
-            if (isTs) return ms * 1000;
-            // Date32<DAY> / Date64: loadNumeric stores ms-since-epoch.
-            return ms;
-        };
         switch (predicate.kind) {
             case 'dateCompare': {
-                const v = toUnit(predicate.value);
+                const v = Date.parse(predicate.value);
                 // Unparseable ISO -> no-match, mirroring the invalid-regex
                 // fallback. Without this guard `!=` would keep every row,
                 // since `x !== NaN` is always true.
@@ -310,13 +298,13 @@ async function acceptorFor(
                 }
             }
             case 'dateBetween': {
-                const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);
+                const lo = Date.parse(predicate.lo), hi = Date.parse(predicate.hi);
                 return predicate.inclusive
                     ? (i) => values[i] >= lo && values[i] <= hi
                     : (i) => values[i] > lo && values[i] < hi;
             }
             case 'dateNotBetween': {
-                const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);
+                const lo = Date.parse(predicate.lo), hi = Date.parse(predicate.hi);
                 return predicate.inclusive
                     ? (i) => values[i] < lo || values[i] > hi
                     : (i) => values[i] <= lo || values[i] >= hi;
@@ -589,8 +577,8 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
-            // bigint values (timestamps; an Int64 / Uint64 set or date
-            // path) coerce to Number. Numeric predicates on Int64 /
+            // bigint values (an Int64 / Uint64 set or date path) coerce
+            // to Number. Numeric predicates on Int64 /
             // Uint64 columns don't come here: they compare the exact
             // integers (`loadInt64`).
             out[start + r] = typeof v === 'bigint' ? Number(v) : (v as number);

@@ -318,6 +318,9 @@ type EdgeCase = {
     hide?: number[];
     /** Flavors that must refuse the view (generator error), not emit code. */
     refuse?: CodeFlavor[];
+    /** The `id`s the view must show, stated independently of the viewer's
+     *  engine (which otherwise supplies the expectation). */
+    rows?: number[];
 };
 
 /** `preamble` is R run before the cases, after dplyr and data.table load
@@ -327,6 +330,7 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
         const results = new Map<string, string>();
         const want = new Map<string, string>();
         const errors = new Map<string, string>();
+        const viewerRows = new Map<string, number[]>();
         beforeAll(async () => {
             const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-rcode-edge-'));
             const rds = join(tmp, 'df.rds');
@@ -351,6 +355,7 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
                 const perm = await computePermutation(rd, keys, { ...ctx, stringOrder: 'c', locale: LOCALE }, { rows });
                 const keep = cols.map((col, i) => (c.hide ?? []).includes(i) ? null : col.name).filter(n => n !== null);
                 want.set(c.name, `${Array.from(perm, r => r + 1).join(',')}\t${keep.join(',')}`);
+                if (c.rows) viewerRows.set(c.name, Array.from(perm, r => r + 1));
                 for (const obj of objects) {
                     for (const flavor of FLAVORS) {
                         const res = generateRCode({
@@ -377,6 +382,9 @@ function edgeSuite(title: string, frameR: string, objects: string[], cases: Edge
         }, 120_000);
 
         for (const c of cases) {
+            if (c.rows) {
+                test(`viewer: ${c.name}`, () => { expect(viewerRows.get(c.name)).toEqual(c.rows!); });
+            }
             for (const obj of objects) {
                 for (const flavor of FLAVORS) {
                     test(`${obj} ${flavor}: ${c.name}`, () => {
@@ -431,6 +439,66 @@ edgeSuite('Copy as R code round trip: logical columns and data.table objects (re
         { name: 'hide b', hide: [1] },
         { name: 'hide all but id', hide: [1, 2] },
         { name: 'b is TRUE, hide b and s', filters: [{ ci: 1, p: { kind: 'bool', value: true } }], hide: [1, 2] },
+    ]);
+
+// Grouped and rowwise tibbles: the view is the flat table, so hiding a
+// grouping column must drop it (dplyr's select() keeps grouping columns
+// and moves them to the front). `plain` is the same data ungrouped.
+edgeSuite('Copy as R code round trip: grouped and rowwise tibbles (real R)',
+    `df <- dplyr::group_by(data.frame(id = 1:6, g = c("a", "b", "a", "b", "a", "b"),
+    h = c(1L, 1L, 2L, 2L, 1L, 1L), x = c(3, 1, 2, 6, 5, 4)), g, h)`,
+    ['df', 'rw', 'plain'],
+    [
+        { name: 'nothing hidden', rows: [1, 2, 3, 4, 5, 6] },
+        { name: 'hide one grouping column', hide: [1], rows: [1, 2, 3, 4, 5, 6] },
+        { name: 'hide both grouping columns', hide: [1, 2], rows: [1, 2, 3, 4, 5, 6] },
+        { name: 'hide a column that is not grouped by', hide: [3], rows: [1, 2, 3, 4, 5, 6] },
+        {
+            name: 'filter, sort and hide a grouping column',
+            filters: [{ ci: 3, p: { kind: 'numCompare', op: '>', value: 1 } }],
+            sort: [{ ci: 3, dir: 'desc' }], hide: [1], rows: [4, 5, 6, 1, 3],
+        },
+    ],
+    'rw <- dplyr::rowwise(dplyr::ungroup(df), g)\nplain <- as.data.frame(dplyr::ungroup(df))');
+
+// Date-times: the engine and the code compare the same instants. `t`
+// holds 2023-12-31, 2024-01-01, half a second later, NA and 2024-01-02
+// (UTC); a half second is exact in a double and in microseconds.
+edgeSuite('Copy as R code round trip: date-times (real R)',
+    `df <- data.frame(id = 1:5)
+df$t <- as.POSIXct(c(1703980800, 1704067200, 1704067200.5, NA, 1704153600), origin = "1970-01-01", tz = "UTC")`,
+    ['df', 'dtobj'],
+    [
+        { name: 't = midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '2024-01-01T00:00:00Z' } }], rows: [2] },
+        { name: 't != midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '!=', value: '2024-01-01T00:00:00Z' } }], rows: [1, 3, 5] },
+        { name: 't > midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '>', value: '2024-01-01T00:00:00Z' } }], rows: [3, 5] },
+        { name: 't < midnight', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<', value: '2024-01-01T00:00:00Z' } }], rows: [1] },
+        { name: 't <= half past', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<=', value: '2024-01-01T00:00:00.500Z' } }], rows: [1, 2, 3] },
+        { name: 't between, with an offset', filters: [{ ci: 1, p: { kind: 'dateBetween', lo: '2024-01-01T01:00:00+01:00', hi: '2024-01-02T00:00:00Z', inclusive: true } }], rows: [2, 3, 5] },
+        { name: 't not between, or missing', filters: [{ ci: 1, p: { kind: 'dateNotBetween', lo: '2024-01-01T00:00:00Z', hi: '2024-01-01T00:00:01Z', inclusive: true }, includeMissing: true }], rows: [1, 4, 5] },
+    ]);
+
+// Years past 9999 and before 0000: R reads neither `+010000-01-01` nor
+// `-000001-01-01`, so the code counts from the epoch instead. `d` holds
+// 9999-12-31, 10000-01-01, 10000-01-02 and NA; `t` the same instants at
+// midnight UTC; `bc` the first days of the years -1, 0 and 1.
+edgeSuite('Copy as R code round trip: years outside 0000 to 9999 (real R)',
+    `df <- data.frame(id = 1:4)
+df$d <- as.Date(c(2932896, 2932897, 2932898, NA), origin = "1970-01-01")
+df$t <- as.POSIXct(c(2932896, 2932897, 2932898, NA) * 86400, origin = "1970-01-01", tz = "UTC")
+df$bc <- as.Date(c(-719893, -719528, -719162, NA), origin = "1970-01-01")`,
+    ['df', 'dtobj'],
+    [
+        { name: 'd = 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '+010000-01-01' } }], rows: [2] },
+        { name: 'd >= 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '>=', value: '+010000-01-01' } }], rows: [2, 3] },
+        { name: 'd between 9999 and 10000', filters: [{ ci: 1, p: { kind: 'dateBetween', lo: '9999-12-31', hi: '+010000-01-01', inclusive: true } }], rows: [1, 2] },
+        { name: 'd not between, or missing', filters: [{ ci: 1, p: { kind: 'dateNotBetween', lo: '+010000-01-01', hi: '+010000-01-01', inclusive: true }, includeMissing: true }], rows: [1, 3, 4] },
+        { name: 'd after noon on 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '>', value: '+010000-01-01T12:00:00Z' } }], rows: [3] },
+        { name: 't = 10000-01-01', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '+010000-01-01T00:00:00Z' } }], rows: [2] },
+        { name: 't < 10000-01-01', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '<', value: '+010000-01-01T00:00:00Z' } }], rows: [1] },
+        { name: 't between 9999 and 10000', filters: [{ ci: 2, p: { kind: 'dateBetween', lo: '9999-12-31T00:00:00Z', hi: '+010000-01-01T00:00:00Z', inclusive: true } }], rows: [1, 2] },
+        { name: 'bc = year -1', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '=', value: '-000001-01-01' } }], rows: [1] },
+        { name: 'bc > year -1', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '>', value: '-000001-01-01' } }], rows: [2, 3] },
     ]);
 
 // integer64: set values are decimal strings the double can't hold

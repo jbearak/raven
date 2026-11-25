@@ -63,7 +63,34 @@ describe('generateRCode', () => {
             hiddenColumns: [3],
         });
         if (!('code' in r)) throw new Error(r.error);
-        expect(r.code).toContain('mtcars |>\n  filter(cyl %in% c(6, 8)) |>\n  arrange(desc(mpg), is.na(mpg) & !is.nan(mpg)) |>\n  select(-`my name`)');
+        expect(r.code).toContain('mtcars |>\n  ungroup() |>\n  filter(cyl %in% c(6, 8)) |>\n  arrange(desc(mpg), is.na(mpg) & !is.nan(mpg)) |>\n  select(-`my name`)');
+    });
+
+    test('dplyr: ungroup() only where a column is hidden (select() keeps grouping columns)', () => {
+        const sorted = gen({ sort: { keys: [{ columnIndex: 1, direction: 'asc' }], labelsOnWhenSorted: true } });
+        expect('code' in sorted && sorted.code).not.toContain('ungroup');
+        for (const flavor of ['base', 'data.table'] as const) {
+            const r = gen({ hiddenColumns: [3] }, flavor);
+            expect('code' in r && r.code).not.toContain('ungroup');
+        }
+    });
+
+    test('a date or date-time outside years 0000 to 9999 counts from the epoch', () => {
+        const cols = [col('d', 'Date32<DAY>'), col('t', 'Timestamp<MICROSECOND, UTC>')];
+        const code = (columnIndex: number, value: string) => {
+            const r = gen({
+                columns: cols,
+                filter: { entries: [{ id: 'a', columnIndex, predicate: { kind: 'dateCompare', op: '=', value }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+            });
+            if (!('code' in r)) throw new Error(r.error);
+            return r.code;
+        };
+        expect(code(0, '9999-12-31')).toContain('filter(d == as.Date("9999-12-31"))');
+        expect(code(0, '+010000-01-01')).toContain('filter(d == as.Date(2932897, origin = "1970-01-01"))');
+        expect(code(0, '-000001-01-01')).toContain('filter(d == as.Date(-719893, origin = "1970-01-01"))');
+        expect(code(1, '9999-12-31T23:59:59Z')).toContain('filter(t == as.POSIXct("9999-12-31 23:59:59", tz = "UTC"))');
+        expect(code(1, '+010000-01-01T00:00:00.5Z'))
+            .toContain('filter(t == as.POSIXct(253402300800.5, origin = "1970-01-01", tz = "UTC"))');
     });
 
     test('known NaN-free double sorts need no tie-break', () => {

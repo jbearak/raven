@@ -803,6 +803,14 @@ function dateCode(
     const lhs = isTs || wholeDays ? x : `as.POSIXct(${x})`;
     const lit = (v: number): string => {
         const iso = new Date(v).toISOString();
+        // A year outside 0000 to 9999 is `+010000-…` or `-000001-…` in
+        // ISO 8601, which R reads as neither a date nor a date-time, so
+        // the value is counted from the epoch instead.
+        if (/^[+-]/.test(iso)) {
+            return wholeDays
+                ? `as.Date(${rNumber(v / 86_400_000)}, origin = "1970-01-01")`
+                : `as.POSIXct(${rNumber(v / 1000)}, origin = "1970-01-01", tz = "UTC")`;
+        }
         if (wholeDays) return `as.Date(${rString(iso.slice(0, 10))})`;
         const frac = iso.slice(19, 23) === '.000' ? '' : iso.slice(19, 23);
         return `as.POSIXct(${rString(`${iso.slice(0, 10)} ${iso.slice(11, 19)}${frac}`)}, tz = "UTC")`;
@@ -1157,6 +1165,10 @@ function generate(input: CodeInput, flavor: CodeFlavor): CodeResult {
         }
         if (hidden.names) body.push(`select(-${rVector(hidden.names.map(rName))})`);
         else if (hidden.positions) body.push(`select(-${rVector(hidden.positions.map(String))})`);
+        // The view is the flat table. On a grouped or rowwise tibble
+        // select() keeps the grouping columns, hidden or not, so the
+        // grouping goes first (a no-op on any other data frame).
+        if (hidden.positions) body.unshift('ungroup()');
         if (body.length === 0) head = src0;
         const lines = header(ctx, ['', 'library(dplyr)', '']);
         lines.push(body.length === 0 ? head : `${head} |>\n  ${body.join(' |>\n  ')}`);

@@ -392,6 +392,7 @@ Choose Copy as R code (dplyr) from ⋯, or base R or data.table from the Copy as
 library(dplyr)
 
 mtcars |>
+  ungroup() |>
   filter(
     cyl %in% c(6, 8),
     mpg > 20
@@ -410,6 +411,8 @@ The code returns the same rows in the same order as the grid:
 - A column whose name is duplicated or empty is read by position, as in `dat[[3]]`, so a filter on the second of two `val` columns reads that column. dplyr can't filter or sort such a frame, so the dplyr choice says so and points you to base R or data.table. The same goes for a view that filters or sorts a column named like `...` or `..1`, or keeps one when other columns are hidden; such a column left alone doesn't stop dplyr.
 - A value picked on a `bit64::integer64` column is written exactly, as `bit64::as.integer64("9007199254740993")`, because a number in R code can't hold every 64-bit integer. Comparisons and ranges on such a column compare whole 64-bit integers too, in the viewer and in the code, so `big = 9007199254740993` keeps that value and not its neighbours. A bound with a fraction is written as the nearest integer that means the same (`big >= 2.5` becomes `big >= bit64::as.integer64("3")`). The base R code sorts such a column by its rank from `bit64::keypos()`, because base R's `order()` doesn't sort `integer64` values correctly.
 - The base R code also works when the object is a data.table.
+- The grid shows a grouped or rowwise tibble as a plain table, so hiding a column hides it even when the tibble is grouped by it. dplyr's `select()` keeps grouping columns, so the dplyr code calls `ungroup()` first whenever a column is hidden. The result is then ungrouped.
+- A date or date-time in a year past 9999 or before 0000 is written as a count from 1970-01-01, as in `as.Date(2932897, origin = "1970-01-01")`, because R can't read such a year from text.
 - A regular expression filter is written for R's `grepl(perl = TRUE)` so it matches what the viewer matches. For example, `.` and `\s` keep the viewer's meaning, and `$` matches only at the very end. A pattern that would match differently in R is left out, such as one that counts characters with `.` (emoji count as two characters in the viewer and one in R).
 - The comment at the top names the packages the code needs.
 
