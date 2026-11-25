@@ -916,8 +916,8 @@ fn file_row(
     row
 }
 
-/// `complete` and the warnings. `complete` means every file the scan
-/// discovered has a stored plan.
+/// `complete` and the warnings. `complete` means the scan listed every
+/// directory it walked and every file it discovered has a stored plan.
 fn completeness(
     prepared: &PreparedWorkspace,
     traced: &TracedGraph<'_>,
@@ -970,7 +970,21 @@ fn completeness(
             list(&evicted)
         ));
     }
-    let complete = failed.is_empty() && evicted.is_empty();
+    let mut unlisted: Vec<String> = scan
+        .unlisted
+        .iter()
+        .map(|(dir, error)| format!("{} ({error})", display_fs_path(dir, root)))
+        .collect();
+    unlisted.sort();
+    unlisted.dedup();
+    if !unlisted.is_empty() {
+        warnings.push(format!(
+            "{} director(ies) couldn't be listed, so files under them may be missing: {}",
+            unlisted.len(),
+            list(&unlisted)
+        ));
+    }
+    let complete = failed.is_empty() && evicted.is_empty() && unlisted.is_empty();
 
     let mut no_full_text: Vec<String> = artifacts
         .keys()
@@ -1367,6 +1381,36 @@ mod tests {
             report.warnings
         );
         assert_eq!(report.edges.len(), 1);
+    }
+
+    /// A directory the scan can't list hides its files from the graph, so the
+    /// graph is incomplete and says which directory.
+    #[cfg(unix)]
+    #[test]
+    fn unlistable_directory_is_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "a.R", "x <- 1\n");
+        write(tmp.path(), "locked/b.R", "y <- 1\n");
+        let locked = tmp.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions don't stop the listing.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let report = report(tmp.path(), true);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!report.complete);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("1 director(ies) couldn't be listed")
+                    && w.contains("locked (")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]

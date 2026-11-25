@@ -370,7 +370,7 @@ Paths are relative to the canonical workspace root with `/` separators, or absol
 Every line number is 0-based and every character counts UTF-16 code units, as in the editor protocol. That holds for `call_site.position`, `directive.line`, and `position` in `dropped`, so a directive on a file's first line has `line: 0`. A backward directive's `line=N` is 1-based as you write it: `# raven: sourced-by ../main.R line=3` gives a call site whose `position.line` is `2`.
 
 - `package_mode`: Raven analyzed the workspace as an R package.
-- `complete`: every file the workspace scan found went through graph building. When it's `false`, `warnings` says how many files couldn't be read or processed and how many the index's capacity evicted. An oversized file still counts.
+- `complete`: the workspace scan listed every directory it walked, and every file it found went through graph building. When it's `false`, `warnings` names the directories that couldn't be listed, such as one without read permission, and says how many files couldn't be read or processed and how many the index's capacity evicted. An oversized file still counts.
 - `warnings`: sentences for people, covering incomplete files, files without full text (backward call sites into them may be unfound), failed `list.files()` batches, and any mismatch between the graph and its records.
 - `files`: every indexed file and every edge endpoint, each with `path`, `indexed`, `exists`, `self_contained`, `syntax_errors`, and `working_directory` (`null`, or `{"raw", "resolved"}` for a `# raven: cd`).
 

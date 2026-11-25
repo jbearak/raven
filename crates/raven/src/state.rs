@@ -14052,6 +14052,9 @@ pub(crate) struct WorkspaceScanReport {
     /// `list.files()` source batches that failed closed, by calling file.
     pub(crate) failed_list_files_batches:
         Vec<(Url, crate::cross_file::tar_source::ListFilesBatchFailure)>,
+    /// Directories the walk couldn't list (or an entry it couldn't read),
+    /// with the error, so files under them may be missing from `discovered`.
+    pub(crate) unlisted: Vec<(PathBuf, String)>,
 }
 
 /// [`scan_workspace_with_box_context`], also reporting the discovered files,
@@ -14069,14 +14072,20 @@ pub(crate) fn scan_workspace_reporting(
 
     // Phase 1: Collect file paths (serial directory walk — fast, I/O-bound)
     let mut file_paths: Vec<PathBuf> = Vec::new();
+    let mut unlisted = Vec::new();
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            collect_files_matching_for_discovery(
+            let errors = collect_files_matching_for_discovery_with_errors(
                 &path,
                 &mut file_paths,
                 is_stat_model_extension,
                 exclusions,
+            );
+            unlisted.extend(
+                errors
+                    .into_iter()
+                    .map(|(dir, error)| (dir, error.to_string())),
             );
         }
     }
@@ -14245,6 +14254,7 @@ pub(crate) fn scan_workspace_reporting(
         discovered: file_paths,
         unprocessed,
         failed_list_files_batches,
+        unlisted,
     };
     (entries, report)
 }
