@@ -1080,7 +1080,7 @@ One cache lives outside the cross-file system: `compile_cached` in `crates/raven
 
 A `ScopeAtPosition` copies every visible symbol, about 3,500 from the default packages alone, so each one costs about 0.7 MB or more. `diagnostics_from_snapshot` shares a small per-pass map of them (`PassScopes` in `handlers.rs`) between the out-of-scope and undefined-variable collectors, and the map must stay small:
 
-- It keeps a full scope at each `source()` call, at the start of the file, and at each use in a file with no artifacts of its own (a rare fallback: there is then no scope stream to ask).
+- It keeps a full scope at each `source()` call, at the start of the file, and at each use in a file with no artifacts of its own. That last case is a rare fallback with no scope stream to ask.
 - At a use the scope stream can't resolve, the undefined-variable collector reads `ScopeStream::package_snapshot()` and drops it. A replacement call (`f(x) <- v`) builds a full scope to look its setter up, then drops it.
 - At a use the out-of-scope collector resolves for its package guard, the pass keeps only the three package sets of that scope and, for a replacement call, the setter it binds (`UseScope`). The undefined-variable collector reads them back at the same use, so both collectors answer from one resolution of the scope even when a package finishes loading between them. A use at the very start of the file keeps the full scope instead, because the undefined-variable collector reads that one anyway.
 
