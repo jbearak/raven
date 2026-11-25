@@ -65,6 +65,13 @@ pub struct ForeachIteratorGroup<'tree> {
     pub iterators: Vec<Node<'tree>>,
 }
 
+/// The foreach execution operators: foreach's `%do%` and `%dopar%`, doRNG's
+/// `%dorng%`, and doFuture's `%dofuture%`. The NSE collector also uses this set
+/// to ignore a package's declaration for one of them, so a package's own
+/// `%dot%` or `%done%` is not caught up in it.
+pub(crate) const FOREACH_EXECUTION_OPERATORS: [&str; 4] =
+    ["%do%", "%dopar%", "%dorng%", "%dofuture%"];
+
 /// Recognize whether `node` is a foreach execution expression.
 ///
 /// Returns the per-call iterator groups when `node` is a `binary_operator` whose
@@ -89,11 +96,11 @@ pub fn recognize_foreach_execution<'tree>(
     }
 
     // The infix operator token has kind `special`; its *text* distinguishes the
-    // foreach execution operators (enumerated in the `matches!` below) from every
+    // foreach execution operators ([`FOREACH_EXECUTION_OPERATORS`]) from every
     // other `%...%` operator, so match on the text.
     let operator = node.child_by_field_name("operator")?;
     let op_text = &text[operator.byte_range()];
-    if !matches!(op_text, "%do%" | "%dopar%" | "%dorng%" | "%dofuture%") {
+    if !FOREACH_EXECUTION_OPERATORS.contains(&op_text) {
         return None;
     }
 

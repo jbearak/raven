@@ -7151,6 +7151,15 @@ fn collect_case_mismatch_diagnostics_standalone(
         {
             continue;
         }
+        // A `line=N` directive covering this call with the same spelling
+        // resolves to the same file and already reports the same finding on
+        // the same line (issue #814 keeps the call in `meta.sources`). A
+        // differently spelled call keeps its own finding.
+        if meta.sources.iter().any(|directive| {
+            directive.is_line_directive_at_call(source) && directive.path == source.path
+        }) {
+            continue;
+        }
         let outcome = crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, &ctx);
         let Some(regime) = outcome.case_mismatch else {
             continue;
@@ -7614,6 +7623,32 @@ mod case_mismatch_collector_tests {
             diags.is_empty(),
             "missing file is unresolved-source-path, not case-mismatch: {diags:?}"
         );
+    }
+
+    /// A `line=N` directive and the `source()` call on line N with the same
+    /// spelling are one finding, as before #814 kept the call in
+    /// `meta.sources`. A call spelled differently keeps its own.
+    #[test]
+    fn line_directive_and_its_call_report_one_case_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("lib").join("u.R"), "y <- 2\n").unwrap();
+        let main = dir.path().join("g.R");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let count = |call_path: &str| {
+            let code = format!("# raven: source lib/U.R line=3\nx <- 1\nsource(\"{call_path}\")\n");
+            let meta = crate::cross_file::extract_metadata(&code);
+            collect_case_mismatch_diagnostics_standalone(
+                &uri,
+                &meta,
+                Some(&ws),
+                CaseMismatchSeverity::Auto,
+            )
+            .len()
+        };
+        assert_eq!(count("lib/U.R"), 1, "same spelling: one finding");
+        assert_eq!(count("LIB/U.R"), 2, "different spelling: one each");
     }
 
     // ---- Issue #535: backward-directive case mismatch ----
@@ -23265,7 +23300,8 @@ pub(crate) fn declarable_infix_operator<'t>(node: Node<'t>, text: &'t str) -> Op
 
 /// Infix operators whose evaluation Raven models itself: magrittr's pipes and
 /// exposition operator, zeallot / rlang destructuring, foreach's `%:%` and
-/// `%do%` family, and base R's (`%in%`, `%%`, `%o%`, …). A package
+/// execution operators ([`crate::foreach::FOREACH_EXECUTION_OPERATORS`]), and
+/// base R's (`%in%`, `%%`, `%o%`, …). A package
 /// declaration for one of these is ignored, the operator analogue of
 /// "built-ins win" in [`package_arg_policy`]: an installed sidecar must not be
 /// able to blank out every pipeline in a file.
@@ -23273,7 +23309,7 @@ fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
     matches!(
         op,
         "%>%" | "%<>%" | "%$%" | "%T>%" | "%!>%" | "%|>%" | "%<-%" | "%->%" | "%<~%" | "%:%"
-    ) || op.starts_with("%do")
+    ) || crate::foreach::FOREACH_EXECUTION_OPERATORS.contains(&op)
         || is_builtin(op)
         || analysis
             .base_exports
@@ -32771,6 +32807,41 @@ d[n > 1, older] := 1
         collect_with_library(tree.root_node(), code, &["pkgop"], &lib, &mut used);
         assert!(was_collected(&used, "piped_input"));
         assert!(was_collected(&used, "piped_arg"));
+    }
+
+    /// Only foreach's execution operators are claimed as modeled: a package's
+    /// `%dot%`, which merely begins with `%do`, keeps its declaration.
+    #[tokio::test]
+    async fn infix_declaration_applies_to_an_operator_named_like_do() {
+        let sidecar = r#"
+            [[function]]
+            name = "%dot%"
+            formals = ["data", "cond"]
+            captured = ["cond"]
+        "#;
+        let (_root, lib) =
+            library_with_declaring_package("dotpkg", &["\"%dot%\""], Some(sidecar)).await;
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.package_library_ready = true;
+        state.package_library = Arc::new(lib);
+        let code = "library(dotpkg)\nd <- 1\nd %dot% captured_col\n";
+        state.open_document(uri.clone(), code, Some(1));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics");
+        let undefined: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.as_ref()
+                    == Some(&NumberOrString::String(
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ))
+            })
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(undefined.is_empty(), "got {undefined:?}");
     }
 
     // ---- Package-declared bracket NSE (`[subset]` in `inst/raven/nse.toml`) ----
