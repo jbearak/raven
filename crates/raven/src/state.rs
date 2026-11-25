@@ -12920,10 +12920,11 @@ struct RoundSourceBatches<'a> {
     previous_open: &'a HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     /// Open overlays' incoming members are never reused.
     refresh_open: bool,
-    expanded: std::cell::RefCell<
-        HashMap<(bool, Url, Option<String>), Arc<crate::cross_file::CrossFileMetadata>>,
-    >,
+    /// Keyed by whether the file is open, its URI, and its directory.
+    expanded: std::cell::RefCell<HashMap<RoundBatchKey, Arc<crate::cross_file::CrossFileMetadata>>>,
 }
+
+type RoundBatchKey = (bool, Url, Option<String>);
 
 impl RoundSourceBatches<'_> {
     /// `metadata` (a round's value for `uri`) with its batch members expanded
