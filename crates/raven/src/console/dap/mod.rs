@@ -518,10 +518,36 @@ fn outbox() -> Option<&'static server::Outbox> {
     handle().and_then(|h| h.out.as_ref())
 }
 
+/// The current client's connection is gone (see [`server::start`]).
+///
+/// If it was showing a stop that nothing has ended, the stop is unattended
+/// again, and control connections are sent `stopped` for it: one that
+/// subscribed while the session lived was not told of the stop (see
+/// [`unattended_stop_reason`]), and would otherwise never attach. This runs
+/// at the end of every session, so the stop is announced only when it was
+/// abandoned:
+///
+/// * not after the session was ended (`ended`: its own `disconnect` or
+///   `terminate`, or the console's `terminated`), when the stop is being
+///   resumed or quit, or belongs to the next session;
+/// * not with a resume queued for the R thread (`resume`). Whoever consumes
+///   the resume ends the stop in that same critical section
+///   ([`leave_stop`]), so there is no moment when a stop about to be left
+///   looks abandoned.
+///
+/// The flags are cleared and the event queued in one critical section. A
+/// `subscribe` decides whether to replay the stop by reading the flags
+/// while it holds the subscribers lock, which the thread delivering the
+/// event needs: a subscriber either reads the stop as unattended, or is in
+/// the list by the time the event is delivered.
 fn on_close(shared: &Arc<Mutex<Shared>>) {
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let abandoned = s.connected && !s.ended && s.resume.is_none();
     s.connected = false;
     s.configured = false;
+    if abandoned && let Some(stop) = &s.stop {
+        push_control(json!({"event": "stopped", "reason": stop.reason}));
+    }
 }
 
 /// The key breakpoints and stops are matched on: the real path. On Windows
@@ -1118,7 +1144,8 @@ fn notify_breakpoints(changed: Vec<(String, LineBp)>) {
 
 /// Push an event to every `subscribe`d control connection. The writes
 /// happen on a thread of their own: an extension host that stops reading
-/// must never block the R thread.
+/// must never block the R thread. Only queues, taking no lock but the
+/// queue's, so it may be called with [`Shared`] locked.
 fn push_control(event: Value) {
     static TX: OnceLock<Mutex<mpsc::Sender<String>>> = OnceLock::new();
     let Some(h) = handle() else { return };
@@ -2094,7 +2121,12 @@ fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
 /// asked for one (checked when the break flag interrupts the editor).
 pub fn take_resume() -> Option<String> {
     let h = handle()?;
-    let mut cmd = lock(h).resume.take()?;
+    let mut cmd = {
+        let mut s = lock(h);
+        let cmd = s.resume.take()?;
+        leave_stop(&mut s);
+        cmd
+    };
     // Inspecting the last error, there is nothing to step through.
     if with_r(|r| r.inspecting).unwrap_or(false) {
         cmd = "c".into();
@@ -2110,6 +2142,24 @@ pub fn take_resume() -> Option<String> {
     Some(cmd)
 }
 
+/// R is about to be fed a resume command: the stop it reported is over.
+/// Forgets the stop and tells the control connections (`running`), so an
+/// editor still deciding whether to attach to that stop drops it now, not
+/// when R next reaches the top-level prompt (the code R resumes into may run
+/// for a long time, or stop again first).
+///
+/// Called with the lock held, by whoever consumes the resume, and the event
+/// is queued under it: control events about a stop are queued in the order
+/// the stop's state changed, so a `running` is never overtaken by the
+/// `stopped` it ends.
+fn leave_stop(s: &mut Shared) {
+    if s.stop.take().is_some() {
+        push_control(json!({"event": "running"}));
+    }
+}
+
+/// A resume command (`cmd`) is being fed to R's browser; the caller has
+/// already ended the stop ([`leave_stop`]).
 fn note_resume(cmd: &str) {
     if call_helper("on_resume", &[cmd]).as_deref() == Some("ok") && cmd == "s" {
         with_r(|r| r.jit_off = true);
@@ -2119,10 +2169,6 @@ fn note_resume(cmd: &str) {
         r.last_user_resume = Some(cmd.to_string());
         r.pending_hit = None;
     });
-    // Running again: nothing to show until the next stop.
-    if let Some(h) = handle() {
-        lock(h).stop = None;
-    }
     if let Some(out) = outbox() {
         out.event(
             "continued",
@@ -2146,7 +2192,9 @@ pub fn on_user_line(text: &str) -> Option<String> {
     if matches!(t, "n" | "s" | "f" | "c" | "cont" | "Q") {
         let cmd = if t == "cont" { "c" } else { t };
         if let Some(h) = handle() {
-            lock(h).resume = None;
+            let mut s = lock(h);
+            s.resume = None;
+            leave_stop(&mut s);
         }
         note_resume(cmd);
     }

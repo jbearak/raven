@@ -824,6 +824,8 @@ raven console --no-save -q     # R's options pass through unchanged
 
 On Unix, `--ipc` and `--dap` sockets are Unix sockets at `PATH`. On Windows they are named pipes named after `PATH` (`\\.\pipe\raven-` followed by `PATH` with every character other than letters, digits, `.`, `_` and `-` replaced by `-`), and the console creates an empty file at `PATH` once the pipe is listening. A `PATH` that already starts with `\\.\pipe\` is used as the pipe name.
 
+One console listens on a `PATH` at a time. A second `raven console` given a path that another console is listening on prints `cannot listen on PATH` and runs without that socket; the first console keeps its connections. On Unix the console holds a lock on `PATH.lock`, a file it creates beside the socket and leaves in place when it exits. A socket left behind by a console that was killed is replaced by the next console started on that path.
+
 Every other argument goes to R. If R's arguments name a program to run (`-e EXPR`, `-f FILE`, or `--file=FILE`), stdin or stdout isn't a terminal, or the console can't embed your R (for example R built without `--enable-R-shlib`), it runs plain R with the same arguments instead.
 
 ## `raven --stdio`

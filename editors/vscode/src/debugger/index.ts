@@ -35,6 +35,10 @@ import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
  *   a `terminated` it sent itself.
  * - A stop pushed while this console's previous session is still tearing
  *   down attaches as soon as that session is gone.
+ * - One session per console at a time. A launch holds its console's stops
+ *   back while it resolves and for `LAUNCH_CLAIM_MS` after; a stop that
+ *   attaches by itself once that has run out (the launch's `preLaunchTask`
+ *   is slow) keeps the console, and the launch is refused (`admit_launch`).
  * - F5 with an R file open and no launch.json sources that file in the
  *   console (a `launch` with `program`); the session itself is the same
  *   attach to the console.
@@ -49,8 +53,12 @@ export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
 let SOCKET_WAIT_MS = 10_000;
-/** Longest a new console's first send waits for its breakpoints. */
-const MIRROR_GATE_MS = 15_000;
+/**
+ * How long a new console's first send waits for its breakpoints, and how
+ * much longer it waits, once, for a mirror that is on its way to the console
+ * when that time is up (see `ConsoleLink.gate_deadline`).
+ */
+let MIRROR_GATE_MS = 15_000;
 
 /** The console's DAP socket lives next to its IPC socket. */
 export function dap_socket_for(ipc_socket: string): string {
@@ -76,8 +84,11 @@ const attach_after_end = new Set<string>();
 /** Sessions the console has ended (`terminated`) that VS Code is tearing down. */
 const ending = new Set<string>();
 const links = new Map<string, ConsoleLink>();
-/** Consoles a session is being started for (a stop can be heard twice). */
-const attaching = new Set<string>();
+/**
+ * Consoles a session is being started for (a stop can be heard twice), each
+ * with the number of that automatic attach (`auto_attach_seq`).
+ */
+const attaching = new Map<string, number>();
 /**
  * Consoles a launch (F5, launch.json, Raven commands) has chosen: held while
  * the launch resolves, then until its session starts or the claim expires
@@ -138,6 +149,26 @@ function end_claim(ipc: string): void {
         c.timer = undefined;
     }
     prune_claim(ipc);
+}
+
+/**
+ * Automatic attaches are numbered in the order they start, across consoles.
+ * The number rides on the attach's configuration (`AUTO_ATTACH`), so on its
+ * session too; a launch notes the latest number when it resolves
+ * (`ATTACH_SEEN`). `admit_launch` compares the two to tell an automatic
+ * attach that started after the launch resolved from one already there.
+ */
+let auto_attach_seq = 0;
+/**
+ * Private to this module, on debug configurations. Not settings: a value
+ * written in launch.json is overwritten or means nothing.
+ */
+const AUTO_ATTACH = 'ravenAutoAttach';
+const ATTACH_SEEN = 'ravenAutoAttachSeen';
+
+/** Test hook: a shorter send gate for consoles registered from now on. */
+export function _set_mirror_gate_for_test(ms: number): void {
+    MIRROR_GATE_MS = ms;
 }
 
 /** Test hook: shorter claim and socket waits. */
@@ -335,16 +366,41 @@ class ConsoleLink {
     private in_flight = false;
     private again = false;
     private closed = false;
+    /** Release the sends held for this console (idempotent). */
     private mirrored_once: () => void = () => undefined;
+    private gate_timer: ReturnType<typeof setTimeout> | undefined;
+    private readonly gate_ms = MIRROR_GATE_MS;
 
     constructor(readonly terminal: vscode.Terminal, readonly ipc: string) {
         // Code sent to a console before it knows the breakpoints would run
         // uninstrumented; hold sends until the first mirror lands.
         gate_sends(ipc, new Promise<void>((resolve) => {
-            this.mirrored_once = resolve;
-            setTimeout(resolve, MIRROR_GATE_MS);
+            this.mirrored_once = () => {
+                clearTimeout(this.gate_timer);
+                resolve();
+            };
         }));
+        this.gate_timer = setTimeout(() => this.gate_deadline(), this.gate_ms);
         void this.connect();
+    }
+
+    /**
+     * The held sends have waited `gate_ms` from the link's creation (the
+     * console may never listen, answer, or run the debugger, so the wait is
+     * bounded). A mirror on its way to the console right now is about to
+     * arm the breakpoints those sends need: the socket appeared late, or
+     * the debugger started during the first mirror's last retry and its
+     * replacement is still being applied. That mirror gets one more
+     * `gate_ms`, after which the sends go whatever is in flight (this runs
+     * once; the second timer releases them itself), so they are never held
+     * more than twice `gate_ms`.
+     */
+    private gate_deadline(): void {
+        if (this.in_flight) {
+            this.gate_timer = setTimeout(this.mirrored_once, this.gate_ms);
+            return;
+        }
+        this.mirrored_once();
     }
 
     private async connect(): Promise<void> {
@@ -369,8 +425,12 @@ class ConsoleLink {
                     this.mirror();
                 }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
-                // R is back at the prompt: a held stop is over.
-                if (msg.event === 'running') deferred_stops.delete(this.ipc);
+                // R left the stop (resumed, or back at the prompt): one
+                // held for a launch or for a session's teardown is over.
+                if (msg.event === 'running') {
+                    deferred_stops.delete(this.ipc);
+                    attach_after_end.delete(this.ipc);
+                }
                 // The debugger started after R ran its startup profiles: a
                 // mirror that gave up waiting for it is sent again.
                 if (msg.event === 'ready') this.mirror();
@@ -559,13 +619,15 @@ async function auto_attach(ipc: string): Promise<void> {
         deferred_stops.add(ipc);
         return;
     }
-    attaching.add(ipc);
+    const number = ++auto_attach_seq;
+    attaching.set(ipc, number);
     try {
         await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
             type: DEBUG_TYPE,
             request: 'launch',
             name: 'R console',
             consoleSocket: ipc,
+            [AUTO_ATTACH]: number,
         });
     } finally {
         attaching.delete(ipc);
@@ -668,7 +730,15 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
         try {
             const resolved = await resolve_configuration(config, hold);
             const chosen: unknown = resolved?.consoleSocket;
-            if (typeof chosen === 'string') claim_console(chosen);
+            if (resolved && typeof chosen === 'string') {
+                claim_console(chosen);
+                // Every time it resolves (a restart re-resolves an edited
+                // configuration): what `admit_launch` asks is whether an
+                // attach started since this resolution.
+                resolved[ATTACH_SEEN] = auto_attach_seq;
+                // Only `auto_attach` says what an automatic attach is.
+                delete resolved[AUTO_ATTACH];
+            }
             return resolved;
         } finally {
             // Also when resolution throws: an untimed hold must not outlive it.
@@ -677,7 +747,53 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
             reconsider_stops();
         }
     },
+    resolveDebugConfigurationWithSubstitutedVariables(_folder, config) {
+        return admit_launch(config);
+    },
 };
+
+/**
+ * A launch is about to get its session: VS Code calls this after the
+ * launch's `preLaunchTask` has run (debugService.ts `createSession`; the
+ * same order in VS Code 1.82, the oldest supported, and today), which can be
+ * long after the launch resolved and claimed its console.
+ *
+ * A claim lasts `LAUNCH_CLAIM_MS`, because VS Code doesn't say when a
+ * resolved launch is abandoned (its task failed or was cancelled) and a stop
+ * must not wait forever for one. So a stop reported during a longer task
+ * attaches by itself once the claim expires. If that session is still there
+ * when the launch finally arrives, both would connect to the console's one
+ * debug adapter: the launch would cut the session showing the stop off, and
+ * its `program` would be sent to an R that is stopped at `Browse>`. The
+ * launch is refused instead, and says so. Only for that: a launch that
+ * resolved after the attach began, or that finds a session another launch
+ * started, replaces the session, as before.
+ *
+ * Otherwise the launch claims its console again until its session starts,
+ * so a stop reported in between is left to it.
+ */
+function admit_launch(config: vscode.DebugConfiguration): vscode.DebugConfiguration | undefined {
+    const ipc: unknown = config.consoleSocket;
+    const seen: unknown = config[ATTACH_SEEN];
+    // An automatic attach's own configuration isn't marked as a launch.
+    if (typeof ipc !== 'string' || typeof seen !== 'number') return config;
+    // The automatic attach on this console, if any: still starting, or its
+    // session (one the console has ended is on its way out).
+    const session = sessions.get(ipc);
+    const live: unknown = session && !ending.has(session.id) ? session.configuration[AUTO_ATTACH] : undefined;
+    const since = (n: unknown) => typeof n === 'number' && n > seen;
+    if (since(attaching.get(ipc)) || since(live)) {
+        void vscode.window.showWarningMessage(
+            `Raven: R stopped in the debugger while "${config.name}" was waiting to start, and a debug session is showing that stop. `
+            + `"${config.name}" was not started${config.program ? ', and its program did not run' : ''}. `
+            + 'Start it again once R is back at the prompt.',
+        );
+        // `undefined` aborts quietly; `null` would open launch.json.
+        return undefined;
+    }
+    claim_console(ipc);
+    return config;
+}
 
 async function resolve_configuration(
     config: vscode.DebugConfiguration,
