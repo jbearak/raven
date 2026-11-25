@@ -14,6 +14,8 @@ struct Checkpoint {
     absent: &'static [&'static str],
     packages: &'static [&'static str],
     aliases: &'static [&'static str],
+    /// The line each named binding was defined on, stated independently.
+    defined_lines: &'static [(&'static str, u32)],
 }
 
 impl Checkpoint {
@@ -29,7 +31,14 @@ impl Checkpoint {
             absent,
             packages: &[],
             aliases: &[],
+            defined_lines: &[],
         }
+    }
+
+    /// State which definition each name resolves to, by its line.
+    fn defined_on(mut self, defined_lines: &'static [(&'static str, u32)]) -> Self {
+        self.defined_lines = defined_lines;
+        self
     }
 
     /// State packages both known and attached in these library-based fixtures.
@@ -82,6 +91,13 @@ fn assert_expected(scope: &ScopeAtPosition, expected: &Checkpoint, context: &str
         assert!(
             !scope.symbols.contains_key(name),
             "unexpected {name}: {context}"
+        );
+    }
+    for &(name, line) in expected.defined_lines {
+        assert_eq!(
+            scope.symbols.get(name).map(|symbol| symbol.defined_line),
+            Some(line),
+            "definition of {name}: {context}"
         );
     }
     let packages: HashSet<_> = scope
@@ -577,5 +593,283 @@ fn local_block_reads_the_parent_as_of_the_call_in_every_resolver() {
             Checkpoint::at((1, 0), &["early"], &["late"]),
             Checkpoint::at((1, 16), &["early"], &["late"]),
         ],
+    );
+}
+
+/// An `rm()` in a `local()` block hides its name for the rest of the block,
+/// whatever encloses it. That is wider than R, where the removal takes the
+/// block's own binding and an enclosing one shows again (issue #884). These
+/// fixtures pin it in every resolver. R stops at the read in some and accepts
+/// others, and no narrower rule tried so far told the two apart from the
+/// text, so a change to the rule has to account for each of them.
+#[test]
+fn block_removal_hides_the_name() {
+    // The removal is wrapped in another call or operator, or has an argument
+    // that can send it elsewhere. (R reads the top-level binding after the
+    // second, third and fourth.)
+    for removal in [
+        "evalq(rm(shadow), globalenv())",
+        "suppressWarnings(rm(shadow))",
+        "if (TRUE) { (rm(shadow)) }",
+        "rm(shadow) |> identity()",
+        "rm(shadow, inherits = TRUE)",
+        "rm(shadow, pos = \".GlobalEnv\")",
+        "rm(shadow, \"envir\" = as.environment(1))",
+    ] {
+        let code = format!("shadow <- 1\nlocal({{\n  {removal}\n  shadow\n}})\n");
+        for hoist in [true, false] {
+            assert_evaluation_contract(
+                &[("main.R", &code)],
+                hoist,
+                true,
+                &[Checkpoint::at((3, 2), &[], &["shadow"])],
+            );
+        }
+    }
+    // Something else in the file removes the name, could remove any name, or
+    // could rebind it without a timeline event.
+    for other in [
+        "rm(shadow, inherits = TRUE)",
+        "f <- rm",
+        "do.call(\"rm\", list(\"shadow\"))",
+        "eval(parse(text = code))",
+        "get(name)",
+        "e$shadow <- 1",
+        "assign(\"shadow\", 1)",
+    ] {
+        let code =
+            format!("shadow <- 1\n{other}\nlocal({{\n  shadow <- 2\n  rm(shadow)\n  shadow\n}})\n");
+        for hoist in [true, false] {
+            assert_evaluation_contract(
+                &[("main.R", &code)],
+                hoist,
+                true,
+                &[Checkpoint::at((5, 2), &[], &["shadow"])],
+            );
+        }
+    }
+    // Nothing outside the block binds the name for certain. (R reads the
+    // base `pi` in the last one.)
+    let absent: [(&str, (u32, u32), &'static [&'static str]); 3] = [
+        ("local({\n  y <- 2\n  rm(y)\n  y\n})\ny\n", (3, 2), &["y"]),
+        (
+            "if (FALSE) y <- 1\nlocal({\n  y <- 2\n  rm(y)\n  y\n})\n",
+            (4, 2),
+            &["y"],
+        ),
+        ("local({\n  pi <- 3\n  rm(pi)\n  pi\n})\n", (3, 2), &["pi"]),
+    ];
+    for (code, position, names) in absent {
+        for hoist in [true, false] {
+            assert_evaluation_contract(
+                &[("main.R", code)],
+                hoist,
+                true,
+                &[Checkpoint::at(position, &[], names)],
+            );
+        }
+    }
+    for hoist in [true, false] {
+        // `<<-` from the block replaced the top-level binding. (R reads the
+        // new one.)
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "shadow <- 1\nlocal({\n  shadow <- 2\n  shadow <<- 3\n  rm(shadow)\n  shadow\n})\nshadow\n",
+            )],
+            hoist,
+            true,
+            &[
+                Checkpoint::at((5, 2), &[], &["shadow"]),
+                Checkpoint::at((7, 0), &["shadow"], &[]).defined_on(&[("shadow", 3)]),
+            ],
+        );
+        // A branch may rebind the name at the top level. (R reads line 0.)
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "shadow <- 1\nif (FALSE) shadow <- 5\nlocal({\n  shadow <- 2\n  rm(shadow)\n  shadow\n})\n",
+            )],
+            hoist,
+            true,
+            &[Checkpoint::at((5, 2), &[], &["shadow"])],
+        );
+        // `<<-` from the block created the only top-level binding. (R reads it.)
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "local({\n  fresh <- 2\n  fresh <<- 3\n  rm(fresh)\n  fresh\n})\nfresh\n",
+            )],
+            hoist,
+            true,
+            &[
+                Checkpoint::at((4, 2), &[], &["fresh"]),
+                Checkpoint::at((6, 0), &["fresh"], &[]).defined_on(&[("fresh", 2)]),
+            ],
+        );
+        // One more block, or a function, encloses the block. (R reads the
+        // enclosing binding in the first two.)
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "x <- 1\nlocal({\n  x <- 2\n  local({\n    x <- 3\n    rm(x)\n    x\n  })\n  x\n})\n",
+            )],
+            hoist,
+            true,
+            &[
+                Checkpoint::at((6, 4), &[], &["x"]),
+                Checkpoint::at((8, 2), &["x"], &[]).defined_on(&[("x", 2)]),
+            ],
+        );
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "f <- function(x) {\n  local({\n    x <- 2\n    rm(x)\n    x\n  })\n}\n",
+            )],
+            hoist,
+            true,
+            &[Checkpoint::at((4, 4), &[], &["x"])],
+        );
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "f <- function(shadow) {\n  g <- function() {\n    shadow <- 2\n    rm(shadow)\n    shadow\n  }\n}\n",
+            )],
+            hoist,
+            true,
+            &[Checkpoint::at((4, 4), &[], &["shadow"])],
+        );
+        // The top-level binding isn't a function, so R finds nothing to call.
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "shadow <- 1\nlocal({\n  shadow <- function() 2\n  rm(shadow)\n  shadow()\n})\n",
+            )],
+            hoist,
+            true,
+            &[Checkpoint::at((4, 2), &[], &["shadow"])],
+        );
+        // A variable handed to code that may call it.
+        assert_evaluation_contract(
+            &[(
+                "main.R",
+                "shadow <- 1\nlocal({\n  shadow <- 2\n  rm(shadow)\n  sapply(1:2, shadow)\n})\n",
+            )],
+            hoist,
+            true,
+            &[Checkpoint::at((4, 14), &[], &["shadow"])],
+        );
+        // A file that sources another: the child could remove the name.
+        assert_evaluation_contract(
+            &[
+                (
+                    "main.R",
+                    "shadow <- 1\nsource(\"other.R\")\nlocal({\n  shadow <- 2\n  rm(shadow)\n  shadow\n})\n",
+                ),
+                ("other.R", "unrelated <- 1\n"),
+            ],
+            hoist,
+            false,
+            &[Checkpoint::at((5, 2), &[], &["shadow"])],
+        );
+    }
+}
+
+/// Where go-to-definition lands from `position` in `main.R`, as
+/// `(file name, line)`, with every file open and the source graph wired up.
+fn definition_target(files: &[(&str, &str)], position: (u32, u32)) -> Option<(String, u32)> {
+    let root = Url::parse("file:///definition-target/").unwrap();
+    let mut state = crate::state::WorldState::new();
+    state.workspace_scan_complete = true;
+    for &(path, code) in files {
+        let uri = root.join(path).unwrap();
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        state.cross_file_graph.update_file(
+            &uri,
+            &crate::cross_file::extract_metadata(code),
+            Some(&root),
+            |_| None,
+        );
+    }
+    let response = crate::handlers::goto_definition(
+        &state,
+        &root.join("main.R").unwrap(),
+        tower_lsp::lsp_types::Position::new(position.0, position.1),
+    )?;
+    let tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(location) = response else {
+        panic!("expected one location, got {response:?}");
+    };
+    let file = location.uri.path().rsplit('/').next().unwrap().to_owned();
+    Some((file, location.range.start.line))
+}
+
+/// The `(line, column)` of the last occurrence of `needle` in `code`.
+fn last_position_of(code: &str, needle: &str) -> (u32, u32) {
+    let offset = code.rfind(needle).unwrap();
+    let line = code[..offset].matches('\n').count() as u32;
+    let column = (offset - code[..offset].rfind('\n').map_or(0, |start| start + 1)) as u32;
+    (line, column)
+}
+
+/// Review inputs where a narrower removal rule moved go-to-definition to a
+/// binding R doesn't read. Each must land where it does today.
+#[test]
+fn removals_keep_their_definition_targets() {
+    let inherits =
+        "probe <- 1\nlocal({ rm(probe, inherits = TRUE); probe <- 2; rm(probe); print(probe) })\n";
+    assert_eq!(
+        definition_target(&[("main.R", inherits)], last_position_of(inherits, "probe")),
+        None
+    );
+    let closure = "local({\n  shadow <- 1\n  f <- function() {\n    local({\n      shadow <- 2\n      rm(shadow)\n      print(shadow)\n    })\n  }\n  rm(shadow)\n  f()\n})\n";
+    assert_eq!(
+        definition_target(
+            &[("main.R", closure)],
+            last_position_of(closure, "shadow)\n    })")
+        ),
+        None
+    );
+    let repeated = "shadow <- 1\nlocal({\n  shadow <- 2\n  rm(shadow, shadow)\n  rm(shadow, envir = globalenv())\n  print(shadow)\n})\n";
+    assert_eq!(
+        definition_target(
+            &[("main.R", repeated)],
+            last_position_of(repeated, "shadow")
+        ),
+        None
+    );
+    // R reads `shadow <- 3` here: the closure runs after the block rebinds
+    // the name.
+    let rebound = "f <- function() 0\nshadow <- 1\nlocal({\n  shadow <- 2\n  rm(shadow)\n  f <- function() print(shadow)\n  shadow <- 3\n  f()\n})\n";
+    assert_eq!(
+        definition_target(
+            &[("main.R", rebound)],
+            last_position_of(rebound, "shadow)\n  shadow <- 3")
+        ),
+        None
+    );
+    let backticked =
+        "shadow <- 1\nrm(`shadow`)\nlocal({\n  shadow <- 2\n  rm(shadow)\n  print(shadow)\n})\n";
+    assert_eq!(
+        definition_target(
+            &[("main.R", backticked)],
+            last_position_of(backticked, "shadow")
+        ),
+        None
+    );
+    let unrelated = "local({\n  other <- 0; rm(other)\n  source(\"child.R\", local = TRUE)\n  print(probe)\n})\n";
+    assert_eq!(
+        definition_target(
+            &[
+                ("main.R", unrelated),
+                (
+                    "child.R",
+                    "assign(\"probe\", 1, envir = .GlobalEnv)\nprobe <- 2\n"
+                ),
+            ],
+            last_position_of(unrelated, "probe")
+        ),
+        Some(("child.R".to_owned(), 1))
     );
 }
