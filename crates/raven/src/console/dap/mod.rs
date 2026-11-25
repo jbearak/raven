@@ -9,7 +9,10 @@
 //! * Requests that need R (scopes, variables, evaluate, setVariable,
 //!   function breakpoints) become [`Job`]s, drained by [`service`] on the R
 //!   thread at the console's service points: the line editor's idle callback
-//!   at a prompt, and the nested-read poll loop. Resume commands (`n`, `c`, …)
+//!   at a prompt, the nested-read poll loop, and every REPL prompt before
+//!   the console feeds it more input (a queued request or the next line of
+//!   one), so a breakpoint acknowledged while R ran binds before more code
+//!   runs. Resume commands (`n`, `c`, …)
 //!   are handed to the editor through the break flag, because they must
 //!   change the prompt.
 //! * No lock is held across an R call: [`Shared`] is locked only to copy
@@ -177,6 +180,11 @@ struct Shared {
     file_tickets: HashMap<String, u64>,
     next_id: u64,
     filters: Vec<String>,
+    /// The newest request applied to `filters`, and to the function
+    /// breakpoints (see [`breakpoint_ticket`]): what stops a mirror that
+    /// stalled reading a file from restoring older ones.
+    filters_ticket: u64,
+    functions_ticket: u64,
     configured: bool,
     connected: bool,
     stop: Option<Stop>,
@@ -188,8 +196,15 @@ struct Shared {
     rewrite_next: bool,
     /// Line breakpoints changed: the R thread re-syncs the `source()` hook.
     hooks_dirty: bool,
-    /// Virtual sources (deparsed functions) of the current stop.
+    /// Virtual sources (deparsed functions) by `sourceReference`, for the
+    /// life of the debug session: a reference VS Code holds (an open tab)
+    /// must name the same text at every later stop. The same text gets the
+    /// same reference; a new session (`initialize`) keeps only those of the
+    /// stop it will report.
     sources: HashMap<i64, String>,
+    /// The next `sourceReference` to hand out. Never reset, so a reference
+    /// from an earlier session is never reused for other text.
+    next_source_ref: i64,
     /// The session asked to step into code without source too
     /// (`justMyCode: false`).
     all_code: bool,
@@ -291,6 +306,34 @@ fn with_r<T>(f: impl FnOnce(&mut RState) -> T) -> Option<T> {
 /// The debugger has started (callable from any thread).
 pub fn ready() -> bool {
     handle().is_some()
+}
+
+static INIT_SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// The console is past the point where it starts the debugger, whether or
+/// not it did: called once on the R thread after `init` (or in its place
+/// when the console runs without `--dap`).
+pub fn init_settled() {
+    INIT_SETTLED.store(true, Ordering::SeqCst);
+}
+
+/// The debugger will never start in this console (R too old, its helpers
+/// failed, the console runs without `--dap`). Unlike `!ready()`, this is
+/// final: the extension stops waiting for it.
+pub fn unavailable() -> bool {
+    INIT_SETTLED.load(Ordering::SeqCst) && !ready()
+}
+
+/// Why R is stopped in the debugger, if it is and no live debug session
+/// shows the stop (callable from any thread). A session another window
+/// holds is left alone.
+pub fn unattended_stop_reason() -> Option<String> {
+    let h = handle()?;
+    let s = lock(h);
+    if s.connected && !s.ended {
+        return None;
+    }
+    s.stop.as_ref().map(|st| st.reason.clone())
 }
 
 /// The debugger is running in this console.
@@ -408,6 +451,9 @@ pub fn init(
     if call_helper("install_hook_only", &[]).as_deref() == Some("ok") {
         with_r(|r| r.hook_installed = true);
     }
+    // A breakpoint mirror sent while R was still starting was answered
+    // `not-ready`; the extension sends it again on this.
+    push_control(json!({"event": "ready"}));
     Ok(())
 }
 
@@ -544,6 +590,15 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 s.configured = false;
                 s.runs_program = false;
                 s.program_done = false;
+                // A new session: drop the old one's virtual sources, except
+                // those of a stop it will report (VS Code attaches after R
+                // has stopped).
+                let live: Vec<i64> = s
+                    .stop
+                    .iter()
+                    .flat_map(|st| st.frames.iter().filter_map(|f| f.source_ref))
+                    .collect();
+                s.sources.retain(|id, _| live.contains(id));
             }
             out.respond(&msg, capabilities());
             out.event("initialized", json!({}));
@@ -598,7 +653,10 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                         .collect()
                 })
                 .unwrap_or_default();
-            queue_job(Job::FunctionBreakpoints(Some(msg.clone()), names));
+            let mut s = lock_shared(shared);
+            s.functions_ticket = breakpoint_ticket();
+            s.jobs
+                .push_back(Job::FunctionBreakpoints(Some(msg.clone()), names));
         }
         "setExceptionBreakpoints" => {
             let filters: Vec<String> = args["filters"]
@@ -609,7 +667,11 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                         .collect()
                 })
                 .unwrap_or_default();
-            lock_shared(shared).filters = filters;
+            {
+                let mut s = lock_shared(shared);
+                s.filters_ticket = breakpoint_ticket();
+                s.filters = filters;
+            }
             out.respond(&msg, json!({}));
         }
         "threads" => out.respond(&msg, json!({"threads": [{"id": 1, "name": "R console"}]})),
@@ -1004,15 +1066,26 @@ pub fn set_file_breakpoints(
 }
 
 /// Function breakpoints and exception filters mirrored by the extension
-/// while no session exists.
-pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>) {
+/// while no session exists. `ticket` is the request's
+/// [`breakpoint_ticket`]: like a file's breakpoints, each is left alone when
+/// a newer request (a later mirror, or a session's own
+/// `setFunctionBreakpoints` / `setExceptionBreakpoints`) has set it since.
+/// The check and the queueing share one lock, so the R thread applies
+/// function breakpoints in ticket order.
+pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>, ticket: u64) {
+    let Some(h) = handle() else { return };
+    let mut s = lock(h);
     if let Some(f) = filters
-        && let Some(h) = handle()
+        && s.filters_ticket < ticket
     {
-        lock(h).filters = f;
+        s.filters_ticket = ticket;
+        s.filters = f;
     }
-    if let Some(names) = functions {
-        queue_job(Job::FunctionBreakpoints(None, names));
+    if let Some(names) = functions
+        && s.functions_ticket < ticket
+    {
+        s.functions_ticket = ticket;
+        s.jobs.push_back(Job::FunctionBreakpoints(None, names));
     }
 }
 
@@ -1855,20 +1928,18 @@ fn on_captured() -> Option<String> {
         release_held(Release::Announced { called_from: false });
         return Some("n\n".into());
     }
-    let mut sources: Vec<(i64, String)> = Vec::new();
+    // Each frame's virtual source text; its reference is assigned where the
+    // stop is published (see `source_ref_for`).
+    let mut fsrcs: Vec<Option<String>> = Vec::new();
     let mut frames: Vec<Frame> = serde_json::from_str::<Vec<Value>>(&frames_json)
         .unwrap_or_default()
         .iter()
         .map(|f| {
             let loc = f["loc"].as_array().cloned().unwrap_or_default();
             let num = |i: usize| loc.get(i).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let source_ref = f["fsrc"].as_str().map(|text| {
-                let id = 1000 + sources.len() as i64;
-                sources.push((id, text.to_string()));
-                id
-            });
+            fsrcs.push(f["fsrc"].as_str().map(String::from));
             Frame {
-                source_ref,
+                source_ref: None,
                 r_index: f["id"].as_i64().unwrap_or(0),
                 name: f["name"].as_str().unwrap_or("?").to_string(),
                 path: loc
@@ -1884,7 +1955,7 @@ fn on_captured() -> Option<String> {
         })
         .collect();
     if let (Some(top), Some((file, l))) = (frames.first_mut(), cur.as_ref())
-        && top.source_ref.is_none()
+        && fsrcs.first().is_none_or(Option::is_none)
         && (l[0] > 0 || top.line == 0)
     {
         top.path = if file.is_empty() || file.starts_with('<') {
@@ -1962,7 +2033,7 @@ fn on_captured() -> Option<String> {
     };
     let hit_ids: Vec<u64> = hit.into_iter().collect();
     let rewrite = reason == "exception" || reason == "pause";
-    let stop = Stop {
+    let mut stop = Stop {
         reason,
         description,
         hit_ids,
@@ -1971,7 +2042,14 @@ fn on_captured() -> Option<String> {
     };
     let configured = {
         let mut s = lock(h);
-        s.sources = sources.into_iter().collect();
+        // Under the lock that publishes the stop: an `initialize` that
+        // prunes the sources sees either the old stop or this one, with
+        // its references.
+        for (frame, text) in stop.frames.iter_mut().zip(&fsrcs) {
+            if let Some(text) = text {
+                frame.source_ref = Some(source_ref_for(&mut s, text));
+            }
+        }
         s.stop = Some(stop.clone());
         s.rewrite_next = rewrite;
         s.resume = None;
@@ -1991,6 +2069,18 @@ fn on_captured() -> Option<String> {
     }
     push_control(json!({"event": "stopped", "reason": stop.reason}));
     None
+}
+
+/// The `sourceReference` for a virtual source's text: the one it already
+/// has this session, or a new one.
+fn source_ref_for(s: &mut Shared, text: &str) -> i64 {
+    if let Some((&id, _)) = s.sources.iter().find(|(_, t)| t.as_str() == text) {
+        return id;
+    }
+    let id = 1000 + s.next_source_ref;
+    s.next_source_ref += 1;
+    s.sources.insert(id, text.to_string());
+    id
 }
 
 fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {

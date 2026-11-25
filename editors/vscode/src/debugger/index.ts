@@ -38,12 +38,17 @@ import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
  * - F5 with an R file open and no launch.json sources that file in the
  *   console (a `launch` with `program`); the session itself is the same
  *   attach to the console.
+ * - The `raven-r` debugger and the R breakpoint contributions are enabled
+ *   only while `raven.rConsoleEnabled` holds (package.json `when`). VS Code
+ *   still resolves an explicit launch.json `raven-r` configuration through
+ *   its providers, so with the console off `register_debugger_unavailable`
+ *   answers it with a message instead of a missing-adapter error.
  */
 
 export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
-const SOCKET_WAIT_MS = 10_000;
+let SOCKET_WAIT_MS = 10_000;
 /** Longest a new console's first send waits for its breakpoints. */
 const MIRROR_GATE_MS = 15_000;
 
@@ -71,6 +76,84 @@ const attach_after_end = new Set<string>();
 /** Sessions the console has ended (`terminated`) that VS Code is tearing down. */
 const ending = new Set<string>();
 const links = new Map<string, ConsoleLink>();
+/** Consoles a session is being started for (a stop can be heard twice). */
+const attaching = new Set<string>();
+/**
+ * Consoles a launch (F5, launch.json, Raven commands) has chosen: held while
+ * the launch resolves, then until its session starts or the claim expires
+ * (the timer). A stop heard meanwhile is the launch's to show: F5 can
+ * reattach a stopped persistent console, whose subscription then replays the
+ * stop, and the console replays it to the launch's session too.
+ */
+const launch_claims = new Map<string, { holds: number; timer?: ReturnType<typeof setTimeout> }>();
+let LAUNCH_CLAIM_MS = 10_000;
+/** Launches still choosing their console, which may be any of them. */
+let launches_choosing = 0;
+/**
+ * Consoles whose stop was held back for a claim or a launch still choosing.
+ * Reconsidered once neither applies, unless a session for it has started:
+ * the console pushes a stop only once.
+ */
+const deferred_stops = new Set<string>();
+
+function claim_of(ipc: string): { holds: number; timer?: ReturnType<typeof setTimeout> } {
+    let c = launch_claims.get(ipc);
+    if (!c) launch_claims.set(ipc, (c = { holds: 0 }));
+    return c;
+}
+
+/** Forget `ipc`'s entry once no launch holds it and no claim is timed. */
+function prune_claim(ipc: string): void {
+    const c = launch_claims.get(ipc);
+    if (c && c.holds === 0 && c.timer === undefined) launch_claims.delete(ipc);
+}
+
+/** One more launch resolving with `ipc` (no expiry; see `unhold_console`). */
+function hold_console(ipc: string): void {
+    claim_of(ipc).holds++;
+}
+
+function unhold_console(ipc: string): void {
+    const c = launch_claims.get(ipc);
+    if (c) c.holds = Math.max(0, c.holds - 1);
+    prune_claim(ipc);
+}
+
+/** Claim `ipc` for a resolved launch until its session starts. */
+function claim_console(ipc: string): void {
+    const c = claim_of(ipc);
+    clearTimeout(c.timer);
+    c.timer = setTimeout(() => {
+        c.timer = undefined;
+        prune_claim(ipc);
+        reconsider_stops();
+    }, LAUNCH_CLAIM_MS);
+}
+
+/** A session started for `ipc`: its timed claim is done (holds remain). */
+function end_claim(ipc: string): void {
+    const c = launch_claims.get(ipc);
+    if (c) {
+        clearTimeout(c.timer);
+        c.timer = undefined;
+    }
+    prune_claim(ipc);
+}
+
+/** Test hook: shorter claim and socket waits. */
+export function _set_launch_timeouts_for_test(claim_ms: number, socket_ms: number): void {
+    LAUNCH_CLAIM_MS = claim_ms;
+    SOCKET_WAIT_MS = socket_ms;
+}
+
+function reconsider_stops(): void {
+    if (launches_choosing > 0) return;
+    for (const ipc of deferred_stops) {
+        if (launch_claims.has(ipc)) continue;
+        deferred_stops.delete(ipc);
+        void auto_attach(ipc);
+    }
+}
 
 function wait_for_file(file: string, ms: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -286,6 +369,11 @@ class ConsoleLink {
                     this.mirror();
                 }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
+                // R is back at the prompt: a held stop is over.
+                if (msg.event === 'running') deferred_stops.delete(this.ipc);
+                // The debugger started after R ran its startup profiles: a
+                // mirror that gave up waiting for it is sent again.
+                if (msg.event === 'ready') this.mirror();
                 if (msg.event === 'breakpoints') {
                     this.heard = true;
                     this.states = msg.breakpoints ?? [];
@@ -373,8 +461,10 @@ class ConsoleLink {
                 this.mirror();
             }
             if (!applied) {
-                // No summary will follow; don't hold sends for one.
-                this.mirrored_once();
+                // No summary will follow; don't hold sends for one. A
+                // replacement mirror started above (the debugger became
+                // ready meanwhile) releases them itself.
+                if (!this.in_flight) this.mirrored_once();
             } else if (this.heard) {
                 this.applied = true;
                 this.reconcile();
@@ -418,6 +508,9 @@ class ConsoleLink {
             if (done || !reply.includes('\n')) return;
             done = true;
             sock.end();
+            // `not-ready`: R is still starting. `unavailable` (the debugger
+            // can't run in this console) is final and falls through to
+            // `finish()`, releasing sends at once.
             if (reply.includes('"not-ready"') && attempt < 40) {
                 // Rebuilt on retry, so it carries any change made meanwhile.
                 this.again = false;
@@ -444,6 +537,7 @@ class ConsoleLink {
     dispose(): void {
         this.mirrored_once();
         this.closed = true;
+        deferred_stops.delete(this.ipc);
         this.control?.destroy();
         this.states = [];
         update_status();
@@ -459,12 +553,23 @@ async function auto_attach(ipc: string): Promise<void> {
         if (ending.has(current.id)) attach_after_end.add(ipc);
         return;
     }
-    await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
-        type: DEBUG_TYPE,
-        request: 'launch',
-        name: 'R console',
-        consoleSocket: ipc,
-    });
+    // A stop replayed on subscribe can arrive next to the same stop's push.
+    if (attaching.has(ipc)) return;
+    if (launches_choosing > 0 || launch_claims.has(ipc)) {
+        deferred_stops.add(ipc);
+        return;
+    }
+    attaching.add(ipc);
+    try {
+        await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
+            type: DEBUG_TYPE,
+            request: 'launch',
+            name: 'R console',
+            consoleSocket: ipc,
+        });
+    } finally {
+        attaching.delete(ipc);
+    }
 }
 
 /** The console a new session should attach to, opening one if needed. */
@@ -540,50 +645,88 @@ async function inspect_last_error(): Promise<void> {
 
 const configuration_provider: vscode.DebugConfigurationProvider = {
     async resolveDebugConfiguration(_folder, config) {
-        if (!debugger_enabled()) {
-            void vscode.window.showInformationMessage(
-                'Raven: the R debugger is turned off (raven.debugger.enabled).',
-            );
-            return undefined;
-        }
-        if (!config.type && !config.request) {
-            // F5 with no launch.json: source the open R script, if any.
-            const doc = vscode.window.activeTextEditor?.document;
-            config = doc && doc.uri.scheme === 'file' && /\.r$/i.test(doc.uri.fsPath)
-                ? { type: DEBUG_TYPE, request: 'launch', name: 'Source R file', program: doc.uri.fsPath }
-                : { type: DEBUG_TYPE, request: 'launch', name: 'R console' };
-        }
-        if (config.request === 'launch' && config.program) {
-            if (config.program === '${file}') {
-                config.program = vscode.window.activeTextEditor?.document.uri.fsPath;
-                if (!config.program) {
-                    void vscode.window.showErrorMessage('Raven: no R file is open to run.');
-                    return undefined;
-                }
+        // `""` means no console given, as in `resolve_configuration`.
+        const given: unknown = config.consoleSocket || undefined;
+        if (typeof given === 'string' && attaching.has(given)) return resolve_configuration(config);
+        // Until it knows its console, a launch holds back every stop; then
+        // only its console's.
+        let choosing = typeof given !== 'string';
+        let held: string | undefined;
+        const hold = (ipc: string) => {
+            if (held === ipc) return;
+            if (held !== undefined) unhold_console(held);
+            held = ipc;
+            hold_console(ipc);
+            if (choosing) {
+                choosing = false;
+                launches_choosing--;
+                reconsider_stops();
             }
-            const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === config.program);
-            if (open?.isDirty && !(await open.save())) return undefined;
+        };
+        if (typeof given === 'string') hold(given);
+        else launches_choosing++;
+        try {
+            const resolved = await resolve_configuration(config, hold);
+            const chosen: unknown = resolved?.consoleSocket;
+            if (typeof chosen === 'string') claim_console(chosen);
+            return resolved;
+        } finally {
+            // Also when resolution throws: an untimed hold must not outlive it.
+            if (held !== undefined) unhold_console(held);
+            if (choosing) launches_choosing--;
+            reconsider_stops();
         }
-        config.justMyCode ??= just_my_code();
-        if (!config.consoleSocket) {
-            const ipc = await choose_console();
-            if (!ipc) {
-                void vscode.window.showErrorMessage(
-                    "Raven: the R debugger needs Raven's R console, and it couldn't open one.",
-                );
-                return undefined;
-            }
-            config.consoleSocket = ipc;
-        }
-        if (!(await wait_for_file(dap_socket_for(config.consoleSocket), SOCKET_WAIT_MS))) {
-            void vscode.window.showErrorMessage(
-                "Raven: this R console wasn't started with the debugger. Close it and open a new R console.",
-            );
-            return undefined;
-        }
-        return config;
     },
 };
+
+async function resolve_configuration(
+    config: vscode.DebugConfiguration,
+    on_console: (ipc: string) => void = () => undefined,
+): Promise<vscode.DebugConfiguration | undefined> {
+    if (!debugger_enabled()) {
+        void vscode.window.showInformationMessage(
+            'Raven: the R debugger is turned off (raven.debugger.enabled).',
+        );
+        return undefined;
+    }
+    if (!config.type && !config.request) {
+        // F5 with no launch.json: source the open R script, if any.
+        const doc = vscode.window.activeTextEditor?.document;
+        config = doc && doc.uri.scheme === 'file' && /\.r$/i.test(doc.uri.fsPath)
+            ? { type: DEBUG_TYPE, request: 'launch', name: 'Source R file', program: doc.uri.fsPath }
+            : { type: DEBUG_TYPE, request: 'launch', name: 'R console' };
+    }
+    if (config.request === 'launch' && config.program) {
+        if (config.program === '${file}') {
+            config.program = vscode.window.activeTextEditor?.document.uri.fsPath;
+            if (!config.program) {
+                void vscode.window.showErrorMessage('Raven: no R file is open to run.');
+                return undefined;
+            }
+        }
+        const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === config.program);
+        if (open?.isDirty && !(await open.save())) return undefined;
+    }
+    config.justMyCode ??= just_my_code();
+    if (!config.consoleSocket) {
+        const ipc = await choose_console();
+        if (!ipc) {
+            void vscode.window.showErrorMessage(
+                "Raven: the R debugger needs Raven's R console, and it couldn't open one.",
+            );
+            return undefined;
+        }
+        config.consoleSocket = ipc;
+    }
+    on_console(config.consoleSocket);
+    if (!(await wait_for_file(dap_socket_for(config.consoleSocket), SOCKET_WAIT_MS))) {
+        void vscode.window.showErrorMessage(
+            "Raven: this R console wasn't started with the debugger. Close it and open a new R console.",
+        );
+        return undefined;
+    }
+    return config;
+}
 
 const descriptor_factory: vscode.DebugAdapterDescriptorFactory = {
     createDebugAdapterDescriptor(session) {
@@ -622,6 +765,24 @@ const tracker_factory: vscode.DebugAdapterTrackerFactory = {
     },
 };
 
+/**
+ * With Raven's R console turned off, `raven-r` is disabled (package.json
+ * `when`) but a launch.json configuration of that type still reaches its
+ * providers. Answer it with why, instead of VS Code's missing-adapter error.
+ */
+export function register_debugger_unavailable(context: vscode.ExtensionContext): void {
+    const why = "Raven: the R debugger runs in Raven's R console, which is turned off in this window (raven.rConsole.activation).";
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, {
+            resolveDebugConfiguration() {
+                void vscode.window.showErrorMessage(why);
+                // `undefined` aborts quietly; `null` would open launch.json.
+                return undefined;
+            },
+        }),
+    );
+}
+
 function mirror_all(): void {
     for (const link of links.values()) link.mirror();
 }
@@ -640,8 +801,12 @@ export function register_debugger(context: vscode.ExtensionContext): void {
         vscode.debug.onDidChangeBreakpoints(mirror_all),
         vscode.debug.onDidStartDebugSession((s) => {
             if (s.type === DEBUG_TYPE && s.configuration.consoleSocket) {
+                end_claim(s.configuration.consoleSocket);
+                // This session shows the console's stop.
+                deferred_stops.delete(s.configuration.consoleSocket);
                 sessions.set(s.configuration.consoleSocket, s);
                 update_status();
+                reconsider_stops();
             }
         }),
         vscode.debug.onDidTerminateDebugSession((s) => {
