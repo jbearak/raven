@@ -9,7 +9,10 @@
 //! * Requests that need R (scopes, variables, evaluate, setVariable,
 //!   function breakpoints) become [`Job`]s, drained by [`service`] on the R
 //!   thread at the console's service points: the line editor's idle callback
-//!   at a prompt, and the nested-read poll loop. Resume commands (`n`, `c`, …)
+//!   at a prompt, the nested-read poll loop, and every REPL prompt before
+//!   the console feeds it more input (a queued request or the next line of
+//!   one), so a breakpoint acknowledged while R ran binds before more code
+//!   runs. Resume commands (`n`, `c`, …)
 //!   are handed to the editor through the break flag, because they must
 //!   change the prompt.
 //! * No lock is held across an R call: [`Shared`] is locked only to copy
@@ -188,8 +191,14 @@ struct Shared {
     rewrite_next: bool,
     /// Line breakpoints changed: the R thread re-syncs the `source()` hook.
     hooks_dirty: bool,
-    /// Virtual sources (deparsed functions) of the current stop.
+    /// Virtual sources (deparsed functions) by `sourceReference`, for the
+    /// life of the debug session: a reference VS Code holds (an open tab)
+    /// must name the same text at every later stop. The same text gets the
+    /// same reference; cleared when a client initializes a new session.
     sources: HashMap<i64, String>,
+    /// The next `sourceReference` to hand out. Never reset, so a reference
+    /// from an earlier session is never reused for other text.
+    next_source_ref: i64,
     /// The session asked to step into code without source too
     /// (`justMyCode: false`).
     all_code: bool,
@@ -544,6 +553,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 s.configured = false;
                 s.runs_program = false;
                 s.program_done = false;
+                s.sources.clear();
             }
             out.respond(&msg, capabilities());
             out.event("initialized", json!({}));
@@ -1855,18 +1865,13 @@ fn on_captured() -> Option<String> {
         release_held(Release::Announced { called_from: false });
         return Some("n\n".into());
     }
-    let mut sources: Vec<(i64, String)> = Vec::new();
     let mut frames: Vec<Frame> = serde_json::from_str::<Vec<Value>>(&frames_json)
         .unwrap_or_default()
         .iter()
         .map(|f| {
             let loc = f["loc"].as_array().cloned().unwrap_or_default();
             let num = |i: usize| loc.get(i).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let source_ref = f["fsrc"].as_str().map(|text| {
-                let id = 1000 + sources.len() as i64;
-                sources.push((id, text.to_string()));
-                id
-            });
+            let source_ref = f["fsrc"].as_str().map(|text| source_ref_for(h, text));
             Frame {
                 source_ref,
                 r_index: f["id"].as_i64().unwrap_or(0),
@@ -1971,7 +1976,6 @@ fn on_captured() -> Option<String> {
     };
     let configured = {
         let mut s = lock(h);
-        s.sources = sources.into_iter().collect();
         s.stop = Some(stop.clone());
         s.rewrite_next = rewrite;
         s.resume = None;
@@ -1991,6 +1995,19 @@ fn on_captured() -> Option<String> {
     }
     push_control(json!({"event": "stopped", "reason": stop.reason}));
     None
+}
+
+/// The `sourceReference` for a virtual source's text: the one it already
+/// has this session, or a new one.
+fn source_ref_for(h: &Handle, text: &str) -> i64 {
+    let mut s = lock(h);
+    if let Some((&id, _)) = s.sources.iter().find(|(_, t)| t.as_str() == text) {
+        return id;
+    }
+    let id = 1000 + s.next_source_ref;
+    s.next_source_ref += 1;
+    s.sources.insert(id, text.to_string());
+    id
 }
 
 fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
