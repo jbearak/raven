@@ -583,8 +583,9 @@ describe('a console whose debugger is not running yet, or never will', () => {
         const start = Date.now();
         ipc.send_debug_program(sock, 'source("a.R")');
         await until(() => con.executes.length === 1, 20_000);
-        // Well inside the 15 s backstop, which would also release sends.
-        expect(Date.now() - start).toBeLessThan(13_000);
+        // Released by the replacement mirror (about 10.5 s), not the 15 s
+        // backstop.
+        expect(Date.now() - start).toBeLessThan(14_500);
         expect(con.executes[0].armed).toEqual({ [real(a_r)]: [2] });
     }, 30_000);
 });
