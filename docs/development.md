@@ -60,7 +60,7 @@ cargo build --release -p raven
 - Run (stdio): `RAVEN_PERF=1 cargo run -p raven -- --stdio`
 - Unit tests: `cargo test -p raven`
 - Integration tests: `cargo test -p raven --features test-support -- --test`
-- Bun tests (TypeScript): `bun test` (from repo root; `bunfig.toml` sets root to `./tests/bun`)
+- Bun tests (TypeScript): `bun test` (from repo root; `bunfig.toml` sets root to `./tests/bun`). The release-tag tests run `scripts/check-release-tag.sh`, which needs `python3` 3.11 or later on PATH.
 - Full local workspace suite (Rust, Bun, and VS Code): `RAVEN_RUN_WORKSPACE_SUITE=1 bun test tests/bun/workspace-suite.test.ts`
 - VS Code extension tests: `cd editors/vscode && bun run test`
 - Setup (build + install + package): `./scripts/setup.sh`
@@ -181,7 +181,7 @@ Use the bump script to update versions, commit, tag, and push:
 
 This updates `Cargo.toml` (workspace version) and `editors/vscode/package.json`, commits the change, creates a git tag, and pushes both. Run from a terminal, it first asks you to confirm the version and channel.
 
-Create release tags only with the bump script. The extension, archive, and Debian package take their version from the tag, and `raven --version` takes it from `Cargo.toml`. Both release workflows therefore run `scripts/check-release-tag.sh` before anything else: it fails unless the tag is `v` plus the `[workspace.package]` version in the tagged commit's `Cargo.toml`, so a tag pushed without the version bump builds and publishes nothing. To check a tag yourself:
+Create release tags only with the bump script. The extension, archive, and Debian package take their version from the tag, and `raven --version` takes it from `Cargo.toml`. Both release workflows therefore run `scripts/check-release-tag.sh` before anything else: it fails unless the tag is `v` plus the `[workspace.package]` version in the tagged commit's `Cargo.toml`, so a tag pushed without the version bump builds and publishes nothing. To check a tag yourself (the script needs `python3` 3.11 or later):
 
 ```bash
 git show "refs/tags/v0.24.0^{commit}:Cargo.toml" | ./scripts/check-release-tag.sh v0.24.0

@@ -40,13 +40,6 @@ jobs:
             exit 1
           fi
 
-      - name: Validate tag exists
-        run: |
-          if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
-            echo "ERROR: Tag '${{ inputs.tag }}' does not exist. Push the tag first."
-            exit 1
-          fi
-
       # Same check and classification release-build.yml ran before it built
       # anything. The checkout is the dispatch branch, whose Cargo.toml can be
       # ahead of the tag, so read the manifest from the tagged commit.
@@ -54,6 +47,10 @@ jobs:
         id: channel
         run: |
           set -euo pipefail
+          if ! git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
+            echo "ERROR: Tag '$TAG' does not exist. Push the tag first."
+            exit 1
+          fi
           channel=$(git show "refs/tags/${TAG}^{commit}:Cargo.toml" | ./scripts/check-release-tag.sh "$TAG")
           echo "Release channel for $TAG: $channel"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"

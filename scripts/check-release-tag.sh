@@ -36,7 +36,9 @@ fi
 # Rejects tags the Marketplace would refuse, before reading the manifest.
 CHANNEL=$("$SCRIPT_DIR/release-channel.sh" "$TAG")
 
-CARGO_VERSION=$(python3 -c '
+# Python compares as well as parses: a shell $(...) capture would strip trailing
+# newlines from the version before the comparison.
+python3 -c '
 import sys
 
 try:
@@ -44,20 +46,19 @@ try:
 except ImportError:
     sys.exit("ERROR: check-release-tag.sh needs python3 >= 3.11 (tomllib).")
 
+tag = sys.argv[1]
 try:
     version = tomllib.load(sys.stdin.buffer)["workspace"]["package"]["version"]
 except (tomllib.TOMLDecodeError, KeyError, TypeError) as error:
     sys.exit(f"ERROR: Could not read [workspace.package] version from the Cargo.toml on stdin: {error!r}")
 if not isinstance(version, str):
     sys.exit(f"ERROR: [workspace.package] version is not a string: {version!r}")
-print(version)
-')
-
-if [ "$TAG" != "v$CARGO_VERSION" ]; then
-    echo "ERROR: Tag $TAG does not match the workspace version $CARGO_VERSION in Cargo.toml." >&2
-    echo "The release would be labelled ${TAG#v} while raven --version reports $CARGO_VERSION." >&2
-    echo "Bump the version with ./scripts/bump-version.sh, which commits and tags together." >&2
-    exit 1
-fi
+if tag != "v" + version:
+    sys.exit(
+        f"ERROR: Tag {tag} does not match the workspace version {version} in Cargo.toml.\n"
+        f"The release would be labelled {tag[1:]} while raven --version reports {version}.\n"
+        "Bump the version with ./scripts/bump-version.sh, which commits and tags together."
+    )
+' "$TAG"
 
 echo "$CHANNEL"

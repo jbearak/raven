@@ -120,6 +120,7 @@ describe("check-release-tag.sh", () => {
     ["invalid TOML", "v0.24.0", "not toml [[[\n"],
     ["a version in another table", "v0.24.0", '[package]\nversion = "0.24.0"\n'],
     ["a version that is not a string", "v0.24.0", "[workspace.package]\nversion = 1\n"],
+    ["a version with a trailing newline", "v0.24.0", '[workspace.package]\nversion = "0.24.0\\n"\n'],
   ])("rejects %s", (_name, tag, input) => {
     const result = guard(tag, input);
     expect(result.status).not.toBe(0);
@@ -135,73 +136,90 @@ describe("check-release-tag.sh", () => {
 });
 
 describe("release workflows check the tag before building or publishing", () => {
-  /** Job ids and their inline `needs`, read from the workflow text. */
-  function jobNeeds(workflow: string): Map<string, string[]> {
-    const jobs = new Map<string, string[]>();
-    let current: string | undefined;
-    for (const line of workflow.slice(workflow.indexOf("\njobs:\n") + 1).split("\n")) {
-      const job = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line);
-      if (job) {
-        current = job[1];
-        jobs.set(current, []);
-        continue;
-      }
-      const needs = /^ {4}needs:\s*(\S.*)$/.exec(line);
-      if (needs && current) {
-        jobs.set(
-          current,
-          needs[1]
-            .replace(/[[\]]/g, "")
-            .split(",")
-            .map((name) => name.trim()),
-        );
-      }
-    }
-    return jobs;
+  type Job = { needs?: string | string[]; if?: string; steps: { id?: string; run?: string }[] };
+  function workflowJobs(file: string): Record<string, Job> {
+    const text = readFileSync(path.join(repoRoot, ".github", "workflows", file), "utf8");
+    return (Bun.YAML.parse(text) as { jobs: Record<string, Job> }).jobs;
   }
 
-  function jobText(workflow: string, job: string): string {
-    const start = workflow.indexOf(`\n  ${job}:\n`);
-    const next = /\n {2}[A-Za-z0-9_-]+:\n/.exec(workflow.slice(start + 1));
-    return workflow.slice(start, next ? start + 1 + next.index : undefined);
+  // A repository checked out at 0.23.9 with three tags: v0.23.8 on the earlier
+  // 0.23.8 commit (release-publish.yml dispatched from a branch that has moved
+  // on), an annotated v0.23.9 on the checkout, and v0.24.0 on that same commit
+  // (the reported case: a tag pushed without the version bump).
+  const scratch = mkdtempSync(path.join(tmpdir(), "raven-release-guard-"));
+  afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+  const repo = path.join(scratch, "repo");
+  mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  for (const script of ["check-release-tag.sh", "release-channel.sh"]) {
+    copyFileSync(path.join(repoRoot, "scripts", script), path.join(repo, "scripts", script));
+  }
+  function git(...args: string[]): void {
+    const identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"];
+    const signing = ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"];
+    const result = spawnSync("git", [...identity, ...signing, ...args], { cwd: repo, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+  }
+  git("init", "-q");
+  for (const [version, tag] of [
+    ["0.23.8", ["tag", "v0.23.8"]],
+    ["0.23.9", ["tag", "-a", "-m", "release", "v0.23.9"]],
+  ] as const) {
+    writeFileSync(path.join(repo, "Cargo.toml"), `[workspace.package]\nversion = "${version}"\n`);
+    git("add", "-A");
+    git("commit", "-q", "-m", version);
+    git(...tag);
+  }
+  git("tag", "v0.24.0");
+
+  /** Runs the job's `channel` step as GitHub does (`bash -e {0}` when no `shell:` is set). */
+  function runChannelStep(file: string, job: string, env: Record<string, string>) {
+    const run = workflowJobs(file)[job].steps.find((step) => step.id === "channel")?.run ?? "exit 97";
+    const script = path.join(scratch, "step.sh");
+    const output = path.join(scratch, "github-output");
+    writeFileSync(script, run);
+    writeFileSync(output, "");
+    const result = spawnSync("bash", ["-e", script], {
+      cwd: repo,
+      encoding: "utf8",
+      env: { ...process.env, ...env, GITHUB_OUTPUT: output },
+    });
+    return { passed: result.status === 0, output: readFileSync(output, "utf8") };
   }
 
   test.each([
-    [
-      "release-build.yml",
-      "release-channel",
-      // The tag push checks out the tagged commit, so its Cargo.toml is the tagged one.
-      'channel=$(./scripts/check-release-tag.sh "$GITHUB_REF_NAME" < Cargo.toml)',
-    ],
-    [
-      "release-publish.yml",
-      "validate",
-      // The manual fallback checks out the dispatch branch, so it reads the tagged commit.
-      'channel=$(git show "refs/tags/${TAG}^{commit}:Cargo.toml" | ./scripts/check-release-tag.sh "$TAG")',
-    ],
-  ])("%s: %s runs the guard and every other job needs it", (file, guardJob, command) => {
-    const workflow = readFileSync(path.join(repoRoot, ".github", "workflows", file), "utf8");
-    const jobs = jobNeeds(workflow);
-    expect(jobs.get(guardJob)).toEqual([]);
+    // The tag push checks out the tagged commit.
+    ["release-build.yml", "release-channel", { GITHUB_REF_NAME: "v0.23.9" }, "channel=pre-release\n"],
+    ["release-build.yml", "release-channel", { GITHUB_REF_NAME: "v0.24.0" }, undefined],
+    // The fallback's checkout is at 0.23.9, so v0.23.8 passes only if the
+    // manifest is read from the tagged commit.
+    ["release-publish.yml", "validate", { TAG: "v0.23.8" }, "channel=pre-release\n"],
+    ["release-publish.yml", "validate", { TAG: "v0.23.9" }, "channel=pre-release\n"],
+    ["release-publish.yml", "validate", { TAG: "v0.24.0" }, undefined],
+    ["release-publish.yml", "validate", { TAG: "v0.23.7" }, undefined], // no such tag
+  ])("%s %s step with %o", (file, job, env, channelOutput) => {
+    expect(runChannelStep(file, job, env)).toEqual(
+      channelOutput === undefined ? { passed: false, output: "" } : { passed: true, output: channelOutput },
+    );
+  });
 
-    const guardText = jobText(workflow, guardJob);
-    expect(guardText).toContain(command);
-    if (command.includes("|")) {
-      // GitHub runs an unlabelled `run:` as `bash -e`, without pipefail.
-      expect(guardText.indexOf("set -euo pipefail")).toBeGreaterThan(-1);
-      expect(guardText.indexOf("set -euo pipefail")).toBeLessThan(guardText.indexOf(command));
-    }
-
+  test.each([
+    ["release-build.yml", "release-channel"],
+    ["release-publish.yml", "validate"],
+  ])("%s: every other job runs only after %s succeeds", (file, guardJob) => {
+    const jobs = workflowJobs(file);
+    const needs = (job: string) => [jobs[job].needs ?? []].flat();
     const reachesGuard = (job: string, seen = new Set<string>()): boolean => {
       if (job === guardJob) return true;
       if (seen.has(job)) return false;
       seen.add(job);
-      return (jobs.get(job) ?? []).some((needed) => reachesGuard(needed, seen));
+      return needs(job).some((needed) => reachesGuard(needed, seen));
     };
-    const others = [...jobs.keys()].filter((job) => job !== guardJob);
+    const others = Object.keys(jobs).filter((job) => job !== guardJob);
     expect(others.length).toBeGreaterThan(0);
     for (const job of others) {
-      expect({ job, reachesGuard: reachesGuard(job) }).toEqual({ job, reachesGuard: true });
+      // `needs` only gates a job whose `if` has no status function.
+      const ungated = /always\(\)|failure\(\)|cancelled\(\)/.test(String(jobs[job].if ?? ""));
+      expect({ job, gated: reachesGuard(job) && !ungated }).toEqual({ job, gated: true });
     }
   });
 });

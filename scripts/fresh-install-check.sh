@@ -16,12 +16,13 @@ set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 ext="$repo/editors/vscode"
 
-# Where the server looks for R after PATH. This list must contain every path
+# Where the server looks for R after PATH (the home locations on Linux only,
+# as in the server). This list must contain every path
 # `get_common_r_paths` in crates/raven/src/r_subprocess.rs returns on this OS;
 # the test `fresh_install_check_lists_every_common_r_path` there runs
 # `--list-r-candidates` and compares the two.
 r_candidates=(/usr/bin/R /usr/local/bin/R /opt/homebrew/bin/R /Library/Frameworks/R.framework/Resources/bin/R)
-if [[ -n "${HOME+set}" ]]; then
+if [[ "$(uname -s)" == Linux && -n "${HOME+set}" ]]; then
   r_candidates+=("$HOME/miniconda3/bin/R" "$HOME/anaconda3/bin/R" "$HOME/.local/bin/R")
 fi
 if [[ "${1:-}" == "--list-r-candidates" ]]; then
