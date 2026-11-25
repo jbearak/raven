@@ -550,6 +550,37 @@ spawn) re-captures the routing basis and installs the same library
 degraded/unavailable build is remembered by its winning key so opening
 continues fail-closed with unresolved package sources instead of looping.
 
+A `didOpen` commit that is refused is handled by cause (`did_open_transactional`
+in `backend.rs`, issue #897). A stale in-memory basis means another writer
+committed while the attempt derived off-lock. Startup does this at least twice
+(the package-library install and the workspace-scan commit, each followed by a
+second write), and a file whose derivation is slow enough overlaps both. The
+open derives again from a fresh snapshot, and after three such refusals it logs
+a warning and switches to locked attempts, which hold the diagnostics publish
+lock and the state write lock from capture to commit so that no writer can
+overtake them. A locked attempt blocks every state reader and writer for one
+derivation. It can repeat: one that finds an unindexed prerequisite releases
+both locks to index it and derives again under them, up to the prerequisite
+ceiling, and a disk change under one spends the disk budget below. Locking is a
+deliberate exception to keeping analysis out of the state lock: the handler
+already occupies the only dispatch slot, so retrying without limit would stall
+the server under continuous background writes, and giving up would leave a tab
+the server never answers for (a later `didChange` finds no record to edit). A
+filesystem change under the attempt (alias topology, or a file the package
+scans read) cannot be excluded by a lock. It keeps a separate budget of one
+retry, after which the open is abandoned with a warning. An open whose
+arrival-time target record was replaced is superseded and ends quietly.
+
+`didClose` (`did_close_transactional`) uses the same budgets and the same
+locked attempts. Its target differs in one respect. A newer open or close, or
+an edit of the record, supersedes a pending close. A background replacement of
+the record does not: a metadata refresh after a workspace scan or a dependency
+change replaces the record without changing its document, and the editor has
+closed the document either way. The close follows the record
+(`WorldState::follow_open_close_target`) and derives again. Treating that
+replacement as superseding the close dropped it silently and left the closed
+tab open in the server, with its diagnostics still published.
+
 Startup does not build the library inline. `initialized` returns immediately
 after scheduling the workspace scan and `run_startup_package_library_build`,
 which goes through the same `package_init_coordinator` mutex as `didOpen`'s
@@ -575,14 +606,17 @@ open-provider precedence hides it, closed commits still veto, and close can
 fall back to it without a transient empty-scope window before disk resync.
 
 `didClose` is the corresponding first-class `OpenClose` transaction. Its
-never-reused intent is bound to the arrival-time open record, lifecycle epoch,
-alias ownership, configuration, graph, closed-index, raw-cache, and package
-inputs; retries may refresh ancillary context once but never rebase onto an
-edit, metadata replacement, duplicate open, or close/reopen lifecycle. Disk
-roots are read and parsed off-lock, represented by exact content-hashed
-snapshots, and revalidated while the diagnostics publish lock is held
-immediately before the central state CAS. The commit atomically removes the
-open record and lifecycle, hands aliases to surviving owners, installs a
+never-reused intent is bound to the open record it targets. Each attempt's
+commit basis adds the lifecycle epoch, alias ownership, configuration, graph,
+closed-index, raw-cache, and package inputs captured for that attempt. Retries
+refresh that context but never rebase the target onto an edit, duplicate open,
+or close/reopen lifecycle. A background replacement of the same document, such
+as a metadata refresh, is followed instead (see the `didClose` retry policy
+above). On lock-free attempts disk roots are read and parsed off-lock,
+represented by exact content-hashed snapshots, and revalidated while the
+diagnostics publish lock is held immediately before the central state CAS. A
+locked attempt does the same work holding both locks. The commit atomically
+removes the open record and lifecycle, hands aliases to surviving owners, installs a
 retained shadow or validated fresh-disk projection (or removes a
 missing/excluded root), updates graph/cache/package/Rprofile/testthat state,
 refreshes pins, claims watched generations, and reserves one capped fanout.
@@ -2687,14 +2721,15 @@ within one invocation still serialize through one exact lane. Dedicated
 physical-lifetime tests construct a lane explicitly and verify slot clearing
 before permit release.
 
-Two nearby fail-closed behaviors are deliberately not completion-harness
-mechanisms. `did_close_second_ancillary_invalidation_stops_after_one_retry`
-pins the two-attempt close CAS ceiling (the document remains open after a
-second ancillary invalidation), while
-`close_resync_pre_commit_rejects_changed_disk_snapshot` pins rejection of a
-stale disk parse without an in-invocation retry. Changes to eventual retry
-policy belong in a separate correctness design and must preserve reopen/disk
-snapshot vetoes.
+One nearby fail-closed behavior is deliberately not a completion-harness
+mechanism. `close_resync_pre_commit_rejects_changed_disk_snapshot` pins
+rejection of a stale disk parse without an in-invocation retry. Changes to
+that retry policy belong in a separate correctness design and must preserve
+reopen/disk snapshot vetoes. The close CAS itself no longer stops after two
+attempts, because that left a closed document open (issue #897).
+`did_close_survives_two_overtaken_attempts` and
+`did_close_closes_under_the_state_lock_once_every_lock_free_attempt_is_overtaken`
+pin its bounded retry and its locked attempt.
 
 ### Native lint parity audit
 

@@ -13073,6 +13073,36 @@ fn derive_open_install_analysis(
     }
 }
 
+/// Why one `didOpen` or `didClose` attempt did not commit. The two causes have
+/// separate retry budgets in [`did_open_transactional`] and
+/// [`did_close_transactional`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenTransitionRejected {
+    /// The filesystem moved under the attempt: the URI's alias topology
+    /// re-resolved differently, or a file the derivation read changed after
+    /// it was read.
+    Disk,
+    /// [`WorldState::try_commit_analysis`] refused the basis: in-memory state
+    /// the derivation read changed before the commit, or the open was
+    /// superseded.
+    StaleBasis,
+}
+
+/// The filesystem half of the `didOpen` commit check.
+///
+/// Alias topology is explicitly snapshot/eventually consistent. This bounded
+/// re-resolution is its linearization point for the install; later filesystem
+/// changes converge through watched-file reconciliation.
+fn open_install_disk_observations_are_current(
+    source_following_disk: &SourceFollowingDiskProjection,
+    uri: &Url,
+    workspace_folders: &[Url],
+    expected_aliases: &[Url],
+) -> bool {
+    WorldState::resolve_open_alias_candidates(uri, workspace_folders) == expected_aliases
+        && source_following_disk.is_current()
+}
+
 async fn commit_detached_open_install(
     state_arc: &Arc<RwLock<WorldState>>,
     prepared: PreparedOpenInstallAnalysis,
@@ -13080,8 +13110,7 @@ async fn commit_detached_open_install(
     uri: &Url,
     workspace_folders: &[Url],
     expected_aliases: &[Url],
-) -> std::result::Result<crate::state::AnalysisCommitEffects, crate::state::AnalysisCommitRejected>
-{
+) -> std::result::Result<crate::state::AnalysisCommitEffects, OpenTransitionRejected> {
     let publish_lock = {
         let state = state_arc.read().await;
         state.diagnostics_publish_lock.clone()
@@ -13099,18 +13128,19 @@ async fn commit_detached_open_install(
         }
     }
 
-    // Alias topology is explicitly snapshot/eventually consistent. This
-    // bounded re-resolution is its linearization point for the install; later
-    // filesystem changes converge through watched-file reconciliation.
-    if WorldState::resolve_open_alias_candidates(uri, workspace_folders) != expected_aliases {
-        return Err(crate::state::AnalysisCommitRejected::StaleBasis);
-    }
-    if !source_following_disk.is_current() {
-        return Err(crate::state::AnalysisCommitRejected::StaleBasis);
+    if !open_install_disk_observations_are_current(
+        &source_following_disk,
+        uri,
+        workspace_folders,
+        expected_aliases,
+    ) {
+        return Err(OpenTransitionRejected::Disk);
     }
 
     let mut state = state_arc.write().await;
-    state.try_commit_analysis(PreparedAnalysisCommit::OpenInstall(Box::new(prepared)))
+    state
+        .try_commit_analysis(PreparedAnalysisCommit::OpenInstall(Box::new(prepared)))
+        .map_err(|_| OpenTransitionRejected::StaleBasis)
 }
 
 struct DerivedOpenMetadataReenrichment {
@@ -17939,6 +17969,51 @@ struct ReconciliationDecisions {
     open_uris: Vec<Url>,
 }
 
+/// Attempts a `didOpen` or `didClose` makes without holding the state lock
+/// before it stops racing other writers. See [`did_open_transactional`].
+const OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS: usize = 3;
+
+/// Fresh attempts a `didOpen` or `didClose` makes after the filesystem moved
+/// under one. See [`did_open_transactional`].
+const OPEN_TRANSITION_DISK_RETRIES: usize = 1;
+
+/// Install the document a `didOpen` carries, as one atomic commit.
+///
+/// The editor text is parsed once. Each attempt snapshots the state the
+/// analysis reads, derives the metadata, graph and package projections on the
+/// blocking pool with no lock held, and commits through
+/// [`WorldState::try_commit_analysis`], which refuses the attempt if anything
+/// it read has since changed. Nothing is visible before the commit. What
+/// follows a refusal depends on its cause:
+///
+/// - **Superseded.** A close, a newer open, or a replacement of the record
+///   this open targeted on arrival now owns the URI. The open ends quietly.
+/// - **Stale in-memory basis.** Another writer committed during the attempt:
+///   a package-library install, a workspace-scan commit, a package-input
+///   seed, a config reload. Startup alone does this at least twice (issue
+///   #897). The open derives again from a fresh snapshot. After
+///   [`OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS`] refusals it logs a warning and switches
+///   to **locked attempts**, which hold the diagnostics publish lock and the
+///   state write lock from capture to commit so that no writer can overtake
+///   them.
+/// - **Disk.** The URI's alias topology or a file the package scans read
+///   changed between derivation and commit. No lock stops that, so it keeps
+///   its own budget of [`OPEN_TRANSITION_DISK_RETRIES`], after which the open is
+///   abandoned with a warning. Its text is then not installed until the
+///   editor closes and reopens the file.
+///
+/// The bound matters because the handler occupies the server's only dispatch
+/// slot (`concurrency_level(1)`): every later message waits for it. Retrying
+/// without limit would stall the server under continuous background writes,
+/// and giving up leaves a tab the server never answers for, since a later
+/// `didChange` finds no record to edit. A locked attempt costs one derivation
+/// with every state reader and writer blocked. That is a deliberate exception
+/// to keeping analysis out of the state lock, taken only after the lock-free
+/// attempts lost, and while the handler is already blocking every request.
+/// Locked attempts can repeat, within bounds: one that finds an unindexed
+/// prerequisite releases both locks to index it and derives again under them,
+/// up to the existing prerequisite ceiling, and a disk change under one spends
+/// the disk budget.
 async fn did_open_transactional(
     backend: &Backend,
     uri: &Url,
@@ -17956,7 +18031,8 @@ async fn did_open_transactional(
         crate::state::Document::new_with_language_id(text, Some(version), uri, Some(language_id));
 
     let mut convergence_rounds = 0usize;
-    let mut commit_retries = 0usize;
+    let mut basis_rejections = 0usize;
+    let mut disk_rejections = 0usize;
     let mut local_only = false;
     let mut convergence_seed_uris = Vec::new();
     // Prerequisites a convergence round tried and failed to index (a
@@ -18039,10 +18115,45 @@ async fn did_open_transactional(
         }
         local_only |= force_local_only;
         let aliases = WorldState::resolve_open_alias_candidates(uri, &workspace_folders);
-        let Some(captured) = ({
+        // A locked attempt holds the diagnostics publish lock and the state
+        // write lock, taken in commit order, from capture to commit.
+        let locked_guards = if basis_rejections >= OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS {
+            let publish_lock = backend.state.read().await.diagnostics_publish_lock.clone();
+            let publish_guard = publish_lock.lock_owned().await;
+            Some((publish_guard, backend.state.write().await))
+        } else {
+            None
+        };
+        let attempt_started = std::time::Instant::now();
+        let capture = |state: &WorldState| {
+            // An install whose target moved can never commit, so it is not
+            // worth a derivation, least of all one under the state lock.
+            state
+                .open_install_target_is_current(&intent)
+                .then(|| {
+                    capture_open_install_analysis(state, &intent, aliases.clone(), document.clone())
+                })
+                .flatten()
+        };
+        let captured = match &locked_guards {
+            Some((_, state)) => capture(state),
+            None => capture(&*backend.state.read().await),
+        };
+        let Some(captured) = captured else {
+            drop(locked_guards);
+            // A superseded open needs no report. Otherwise the capture
+            // refused a snapshot over its size ceiling, which no retry fixes.
             let state = backend.state.read().await;
-            capture_open_install_analysis(&state, &intent, aliases.clone(), document.clone())
-        }) else {
+            if state.open_install_intent_is_current(&intent)
+                && state.open_install_target_is_current(&intent)
+            {
+                log::warn!(
+                    "didOpen for {uri} was abandoned and its text was not installed: the open \
+                     documents, workspace index and file cache together exceed the {}-entry \
+                     analysis snapshot ceiling",
+                    WorldState::MULTI_SEED_VISITED_CEILING
+                );
+            }
             break;
         };
         let excluded = captured.exclusions.is_excluded_uri(uri);
@@ -18059,10 +18170,15 @@ async fn did_open_transactional(
         })
         .await
         else {
-            log::warn!("didOpen detached derivation task failed for {uri}");
+            log::warn!(
+                "didOpen detached derivation task failed for {uri}; its text was not installed. \
+                 Close and reopen the file to recover"
+            );
             break;
         };
         if !derived.prerequisites.is_empty() {
+            // Convergence indexes files through the state lock.
+            drop(locked_guards);
             if convergence_rounds >= 2 {
                 log::warn!(
                     "didOpen prerequisite convergence exceeded its bounded retry ceiling for \
@@ -18096,16 +18212,41 @@ async fn did_open_transactional(
             convergence_rounds = convergence_rounds.saturating_add(1);
             continue;
         }
-        match commit_detached_open_install(
-            &backend.state,
-            derived.prepared,
-            derived.source_following_disk,
-            uri,
-            &workspace_folders,
-            &aliases,
-        )
-        .await
-        {
+        let locked = locked_guards.is_some();
+        let committed = match locked_guards {
+            Some((_publish_guard, mut state)) => {
+                #[cfg(test)]
+                {
+                    state.did_open_locked_attempts_for_test += 1;
+                }
+                if open_install_disk_observations_are_current(
+                    &derived.source_following_disk,
+                    uri,
+                    &workspace_folders,
+                    &aliases,
+                ) {
+                    state
+                        .try_commit_analysis(PreparedAnalysisCommit::OpenInstall(Box::new(
+                            derived.prepared,
+                        )))
+                        .map_err(|_| OpenTransitionRejected::StaleBasis)
+                } else {
+                    Err(OpenTransitionRejected::Disk)
+                }
+            }
+            None => {
+                commit_detached_open_install(
+                    &backend.state,
+                    derived.prepared,
+                    derived.source_following_disk,
+                    uri,
+                    &workspace_folders,
+                    &aliases,
+                )
+                .await
+            }
+        };
+        match committed {
             Ok(mut effects) => {
                 let packages_to_prefetch = effects
                     .open
@@ -18217,19 +18358,62 @@ async fn did_open_transactional(
                 }
                 return true;
             }
-            Err(_) => {
-                let state = backend.state.read().await;
-                if !state.open_install_intent_is_current(&intent) {
-                    return true;
+            Err(rejected) => {
+                {
+                    let state = backend.state.read().await;
+                    if !state.open_install_intent_is_current(&intent) {
+                        return true;
+                    }
+                    if !state.open_install_target_is_current(&intent) {
+                        log::debug!(
+                            "didOpen for {uri} was superseded: the record it targeted was \
+                             replaced during the install"
+                        );
+                        break;
+                    }
                 }
-                if commit_retries < 1 {
-                    commit_retries = commit_retries.saturating_add(1);
-                    convergence_rounds = 0;
-                    local_only = false;
-                    unindexable_prerequisites.clear();
-                    continue;
+                match rejected {
+                    OpenTransitionRejected::Disk => {
+                        disk_rejections += 1;
+                        if disk_rejections > OPEN_TRANSITION_DISK_RETRIES {
+                            log::warn!(
+                                "didOpen for {uri} was abandoned and its text was not \
+                                 installed: its path aliases or the files its package scans \
+                                 read changed on disk during {disk_rejections} install attempts. \
+                                 Close and reopen the file to recover"
+                            );
+                            break;
+                        }
+                    }
+                    OpenTransitionRejected::StaleBasis if locked => {
+                        // No writer ran between capture and commit, so this
+                        // is a defect in the basis check, not a race.
+                        log::warn!(
+                            "didOpen for {uri} was abandoned and its text was not installed: \
+                             the install was rejected while holding the state write lock. \
+                             Close and reopen the file to recover"
+                        );
+                        break;
+                    }
+                    OpenTransitionRejected::StaleBasis => {
+                        basis_rejections += 1;
+                        if basis_rejections >= OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS {
+                            log::warn!(
+                                "didOpen for {uri}: {basis_rejections} install attempts were \
+                                 each overtaken by a concurrent state change; installing under \
+                                 the state write lock"
+                            );
+                        }
+                    }
                 }
-                break;
+                log::debug!(
+                    "didOpen for {uri}: install attempt rejected ({rejected:?}) {:?} after its \
+                     capture; deriving again",
+                    attempt_started.elapsed()
+                );
+                convergence_rounds = 0;
+                local_only = false;
+                unindexable_prerequisites.clear();
             }
         }
     }
@@ -18358,8 +18542,26 @@ async fn spawn_open_close_continuation(
     });
 }
 
+/// Remove the document a `didClose` names, as one atomic commit followed by
+/// the empty diagnostics publication.
+///
+/// A refused commit is handled as in [`did_open_transactional`], with the same
+/// budgets. A close that a newer open, close or edit of the record superseded
+/// ends quietly. A background replacement of the record (a metadata refresh,
+/// a diagnostics-lifecycle change) does not supersede it: the close follows
+/// the record through [`WorldState::follow_open_close_target`] and counts the
+/// refusal as a stale basis. A stale in-memory basis derives again, and after
+/// [`OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS`] refusals the close logs a warning and
+/// switches to locked attempts, which hold the diagnostics publish lock and
+/// the state write lock from capture to commit. A change on disk under the
+/// attempt gets [`OPEN_TRANSITION_DISK_RETRIES`] fresh attempts, after which the
+/// close is abandoned with a warning and the server keeps treating the file
+/// as open. Before issue #897 a second refusal of either kind, or one
+/// background replacement of the record, abandoned the close silently, which
+/// left a closed tab's diagnostics published and its buffer shadowing the
+/// file on disk.
 async fn did_close_transactional(backend: &Backend, uri: &Url) {
-    let (intent, test_captures) = {
+    let (mut intent, test_captures) = {
         let mut state = backend.state.write().await;
         state.open_tar_source_refreshes.cancel(uri);
         backend.open_tar_source_refresh_completions.cancel_uri(uri);
@@ -18374,36 +18576,60 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
         (state.begin_open_close_intent(uri), test_captures)
     };
 
-    for attempt in 0..2 {
-        let Some(captured) = ({
-            let state = backend.state.read().await;
-            capture_open_close_analysis(&state, &intent)
-        }) else {
+    let publish_lock = backend.state.read().await.diagnostics_publish_lock.clone();
+    let mut basis_rejections = 0usize;
+    let mut disk_rejections = 0usize;
+    loop {
+        // A locked attempt holds the diagnostics publish lock and the state
+        // write lock, taken in commit order, from capture to commit.
+        let locked_guards = if basis_rejections >= OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS {
+            let publish_guard = publish_lock.clone().lock_owned().await;
+            Some((publish_guard, backend.state.write().await))
+        } else {
+            None
+        };
+        let attempt_started = std::time::Instant::now();
+        let captured = match &locked_guards {
+            Some((_, state)) => {
+                state.follow_open_close_target(&mut intent);
+                capture_open_close_analysis(state, &intent)
+            }
+            None => {
+                let state = backend.state.read().await;
+                state.follow_open_close_target(&mut intent);
+                capture_open_close_analysis(&state, &intent)
+            }
+        };
+        let Some(captured) = captured else {
             break;
         };
         let Ok(derived) =
             tokio::task::spawn_blocking(move || derive_open_close_analysis(captured)).await
         else {
-            log::warn!("didClose detached derivation task failed for {uri}");
+            log::warn!(
+                "didClose detached derivation task failed for {uri}; the server still treats \
+                 the file as open"
+            );
             break;
         };
 
-        #[cfg(test)]
-        {
-            let pause = {
-                let state = backend.state.read().await;
-                state.did_close_pre_commit_test_pause.take_armed(uri)
-            };
-            if let Some(pause) = pause {
-                pause.pause().await;
+        let (publish_guard, mut locked_state) = match locked_guards {
+            Some((publish_guard, state)) => (publish_guard, Some(state)),
+            None => {
+                #[cfg(test)]
+                {
+                    let pause = {
+                        let state = backend.state.read().await;
+                        state.did_close_pre_commit_test_pause.take_armed(uri)
+                    };
+                    if let Some(pause) = pause {
+                        pause.pause().await;
+                    }
+                }
+                (publish_lock.clone().lock_owned().await, None)
             }
-        }
-
-        let publish_lock = {
-            let state = backend.state.read().await;
-            state.diagnostics_publish_lock.clone()
         };
-        let publish_guard = publish_lock.lock().await;
+        let locked = locked_state.is_some();
         let prepared = derived.prepared;
         let source_following_disk = derived.source_following_disk;
         let disk_observations = prepared.disk_observations().to_vec();
@@ -18461,36 +18687,76 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
         })
         .await
         .unwrap_or(false);
-        if !disk_is_current {
-            drop(publish_guard);
-            if attempt == 0
-                && backend
-                    .state
-                    .read()
-                    .await
-                    .open_close_intent_is_current(&intent)
+        let committed = if !disk_is_current {
+            Err(OpenTransitionRejected::Disk)
+        } else {
+            #[cfg(test)]
             {
-                continue;
+                if let Some(state) = locked_state.as_mut() {
+                    state.did_close_locked_attempts_for_test += 1;
+                }
             }
-            break;
-        }
-        let committed = {
-            let mut state = backend.state.write().await;
-            state.try_commit_analysis(PreparedAnalysisCommit::OpenClose(Box::new(prepared)))
+            let prepared = PreparedAnalysisCommit::OpenClose(Box::new(prepared));
+            match locked_state.take() {
+                Some(mut state) => state.try_commit_analysis(prepared),
+                None => backend.state.write().await.try_commit_analysis(prepared),
+            }
+            .map_err(|_| OpenTransitionRejected::StaleBasis)
         };
+        drop(locked_state);
         let mut effects = match committed {
             Ok(effects) => effects,
-            Err(crate::state::AnalysisCommitRejected::StaleBasis) => {
+            Err(rejected) => {
                 drop(publish_guard);
-                let target_still_current = backend
-                    .state
-                    .read()
-                    .await
-                    .open_close_intent_is_current(&intent);
-                if attempt == 0 && target_still_current {
-                    continue;
+                // A newer open or close, or an edit of the record, superseded
+                // this close. A background replacement of the record did not.
+                let superseded = {
+                    let state = backend.state.read().await;
+                    state.follow_open_close_target(&mut intent);
+                    !state.open_close_intent_is_current(&intent)
+                };
+                if superseded {
+                    break;
                 }
-                break;
+                match rejected {
+                    OpenTransitionRejected::Disk => {
+                        disk_rejections += 1;
+                        if disk_rejections > OPEN_TRANSITION_DISK_RETRIES {
+                            log::warn!(
+                                "didClose for {uri} was abandoned: files it read changed on \
+                                 disk during {disk_rejections} attempts. The server still \
+                                 treats the file as open; open and close it again to recover"
+                            );
+                            break;
+                        }
+                    }
+                    OpenTransitionRejected::StaleBasis if locked => {
+                        // No writer ran between capture and commit, so this
+                        // is a defect in the basis check, not a race.
+                        log::warn!(
+                            "didClose for {uri} was abandoned: it was rejected while holding \
+                             the state write lock. The server still treats the file as open; \
+                             open and close it again to recover"
+                        );
+                        break;
+                    }
+                    OpenTransitionRejected::StaleBasis => {
+                        basis_rejections += 1;
+                        if basis_rejections >= OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS {
+                            log::warn!(
+                                "didClose for {uri}: {basis_rejections} attempts were each \
+                                 overtaken by a concurrent state change; closing under the \
+                                 state write lock"
+                            );
+                        }
+                    }
+                }
+                log::debug!(
+                    "didClose for {uri}: attempt rejected ({rejected:?}) {:?} after its \
+                     capture; deriving again",
+                    attempt_started.elapsed()
+                );
+                continue;
             }
         };
 
@@ -61224,6 +61490,225 @@ infixContinuationStyle = "aligned"
         );
     }
 
+    async fn assert_did_open_is_invisible(backend: &Backend, uri: &Url, context: &str) {
+        let state = backend.state.read().await;
+        assert!(!state.documents.contains_key(uri), "{context}: record");
+        assert!(
+            state.diagnostics_gate.current_epoch(uri).is_none(),
+            "{context}: diagnostics epoch"
+        );
+        assert!(
+            state.did_open_commit_snapshot_for_test.is_none(),
+            "{context}: commit"
+        );
+    }
+
+    /// Open one buffer while another writer overtakes `overtaken` of its
+    /// install attempts in a row, cycling through the state changes startup
+    /// makes (issue #897), and require that the buffer is installed and
+    /// editable afterwards. `locked_attempts` is how many attempts must have
+    /// committed under the state write lock.
+    async fn assert_did_open_survives_overtaken_attempts(
+        name: &str,
+        overtaken: usize,
+        locked_attempts: usize,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let uri = Url::from_file_path(tmp.path().join(format!("{name}.R"))).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut pause = {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.did_open_pre_commit_test_pause.arm(uri.clone())
+        };
+        let handler = open_doc(backend, &uri, "r", 1, "candidate <- 1\n");
+        tokio::pin!(handler);
+        for attempt in 1..=overtaken {
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut handler => {
+                    panic!("{name}: didOpen returned before install attempt {attempt}")
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("{name}: install attempt {attempt} did not reach its commit")
+                }
+            }
+            assert_did_open_is_invisible(backend, &uri, &format!("{name}: attempt {attempt}"))
+                .await;
+            let mut state = backend.state.write().await;
+            match attempt % 3 {
+                1 => state.bump_package_config_generation(),
+                2 => state.advance_workspace_graph_authority_generation(),
+                _ => state.record_package_input_mutation(),
+            }
+            pause = state
+                .did_open_pre_commit_test_pause
+                .rearm_before_release(uri.clone(), pause);
+        }
+        if locked_attempts == 0 {
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut handler => {
+                    panic!("{name}: didOpen gave up after {overtaken} overtaken attempts")
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("{name}: the attempt after {overtaken} overtaken ones never ran")
+                }
+            }
+            assert_did_open_is_invisible(backend, &uri, &format!("{name}: final attempt")).await;
+            pause.release();
+            handler.await;
+        } else {
+            // A locked attempt never parks at the lock-free commit barrier.
+            tokio::select! {
+                _ = &mut handler => {}
+                _ = pause.wait_arrived() => {
+                    panic!("{name}: attempt after the bound ran without the state lock")
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("{name}: the locked attempt did not finish")
+                }
+            }
+        }
+
+        {
+            let state = backend.state.read().await;
+            let record = state
+                .documents
+                .get_record(&uri)
+                .unwrap_or_else(|| panic!("{name}: the buffer was not installed"));
+            assert_eq!(record.document().text(), "candidate <- 1\n");
+            assert_eq!(record.document().version, Some(1));
+            let snapshot = state
+                .did_open_commit_snapshot_for_test
+                .as_ref()
+                .expect("an eligible open records its commit");
+            assert_eq!(
+                state.diagnostics_gate.current_epoch(&uri),
+                Some(snapshot.epoch)
+            );
+            assert_eq!(
+                snapshot
+                    .tickets
+                    .iter()
+                    .filter(|(ticket_uri, _)| ticket_uri == &uri)
+                    .count(),
+                1,
+                "{name}: the open reserves its own diagnostics exactly once"
+            );
+            assert_eq!(state.did_open_locked_attempts_for_test, locked_attempts);
+        }
+        change_doc(backend, &uri, 2, "edited <- 2\n").await;
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&uri).unwrap();
+        assert_eq!(record.document().text(), "edited <- 2\n");
+        assert_eq!(record.document().version, Some(2));
+    }
+
+    #[tokio::test]
+    async fn did_open_survives_two_overtaken_install_attempts() {
+        const { assert!(OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS > 2) };
+        assert_did_open_survives_overtaken_attempts("two-overtaken", 2, 0).await;
+    }
+
+    #[tokio::test]
+    async fn did_open_installs_under_the_state_lock_once_every_lock_free_attempt_is_overtaken() {
+        assert_did_open_survives_overtaken_attempts(
+            "all-overtaken",
+            OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS,
+            1,
+        )
+        .await;
+    }
+
+    /// A locked attempt that finds an unindexed `source()` target must
+    /// release the state lock to index it, then take the lock again.
+    #[tokio::test]
+    async fn did_open_locked_attempt_releases_the_state_lock_to_index_prerequisites() {
+        let tmp = TempDir::new().unwrap();
+        let child_path = tmp.path().join("child.R");
+        fs::write(&child_path, "from_child <- 1\n").unwrap();
+        let uri = Url::from_file_path(tmp.path().join("parent.R")).unwrap();
+        let child = Url::from_file_path(&child_path).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut pause = {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = true;
+            state.did_open_pre_commit_test_pause.arm(uri.clone())
+        };
+        let handler = open_doc(backend, &uri, "r", 1, "source(\"child.R\")\nfrom_child\n");
+        tokio::pin!(handler);
+        for attempt in 1..=OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS {
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut handler => panic!("didOpen returned before install attempt {attempt}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("install attempt {attempt} did not reach its commit")
+                }
+            }
+            let state = backend.state.write().await;
+            assert!(
+                state.workspace_index.get_metadata(&child).is_some(),
+                "attempt {attempt} indexed its prerequisite before reaching the commit"
+            );
+            // Overtake the attempt and drop the prerequisite it indexed, so
+            // the next attempt has to index it again.
+            state.workspace_index.invalidate_all();
+            pause = state
+                .did_open_pre_commit_test_pause
+                .rearm_before_release(uri.clone(), pause);
+        }
+        tokio::select! {
+            _ = &mut handler => {}
+            _ = pause.wait_arrived() => panic!("attempt after the bound ran without the state lock"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("the locked attempt did not finish")
+            }
+        }
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.documents.get(&uri).map(|document| document.text()),
+            Some("source(\"child.R\")\nfrom_child\n".into())
+        );
+        assert_eq!(state.did_open_locked_attempts_for_test, 1);
+        assert!(state.workspace_index.get_metadata(&child).is_some());
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&uri)
+                .iter()
+                .any(|edge| edge.to == child),
+            "the locked install committed the edge to its indexed prerequisite"
+        );
+    }
+
     #[tokio::test]
     async fn did_open_retries_after_fresh_exclusion_config() {
         assert_did_open_retries_after_authority_mutation("exclusion-retry", |state| {
@@ -62391,8 +62876,11 @@ infixContinuationStyle = "aligned"
         assert_eq!(record.document().version, Some(2));
     }
 
+    /// A background metadata refresh replaces the record while the close
+    /// derives. The editor has still closed the document, so the close follows
+    /// the replacement instead of being dropped by it (issue #897).
     #[tokio::test]
-    async fn did_close_target_metadata_replacement_is_terminal() {
+    async fn did_close_follows_a_metadata_replacement_of_its_target() {
         let tmp = TempDir::new().unwrap();
         let (svc, uri) =
             open_in_quiescent_workspace(&tmp, "close-metadata-owner.R", "r", "owner <- 1\n").await;
@@ -62424,15 +62912,16 @@ infixContinuationStyle = "aligned"
         pause.release();
         close.await;
         let state = backend.state.read().await;
+        assert!(
+            !state.documents.contains_key(&uri),
+            "a metadata replacement must not keep a closed document open"
+        );
+        assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
         assert_eq!(
             state
-                .documents
-                .get_record(&uri)
-                .unwrap()
-                .metadata()
-                .working_directory
-                .as_deref(),
-            Some("/new-metadata-owner")
+                .open_close_intent_for_test(&uri)
+                .map(|intent| intent.0),
+            Some("closed")
         );
     }
 
@@ -62472,17 +62961,20 @@ infixContinuationStyle = "aligned"
         );
     }
 
-    /// Characterizes the bounded close contract: two consecutive ancillary
-    /// invalidations leave the open authority intact instead of attempting an
-    /// unbounded third CAS. Whether a later close should be queued is a
-    /// separate production-policy question, not a harness completion rule.
-    #[tokio::test]
-    async fn did_close_second_ancillary_invalidation_stops_after_one_retry() {
+    /// Close one open buffer while another writer overtakes `overtaken` of the
+    /// close's attempts in a row (issue #897), and require that the buffer is
+    /// closed afterwards. `locked_attempts` is how many attempts must have
+    /// committed under the state write lock.
+    async fn assert_did_close_survives_overtaken_attempts(
+        name: &str,
+        overtaken: usize,
+        locked_attempts: usize,
+    ) {
         let tmp = TempDir::new().unwrap();
         let (svc, uri) =
-            open_in_quiescent_workspace(&tmp, "close-retry-cap.R", "r", "owner <- 1\n").await;
+            open_in_quiescent_workspace(&tmp, &format!("{name}.R"), "r", "owner <- 1\n").await;
         let backend = svc.inner();
-        let first_pause = backend
+        let mut pause = backend
             .state
             .write()
             .await
@@ -62490,33 +62982,82 @@ infixContinuationStyle = "aligned"
             .arm(uri.clone());
         let close = close_doc(backend, &uri);
         tokio::pin!(close);
-        tokio::select! {
-            _ = first_pause.wait_arrived() => {}
-            _ = &mut close => panic!("close skipped its first barrier"),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                panic!("close did not reach its first barrier")
+        for attempt in 1..=overtaken {
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut close => panic!("{name}: didClose returned before attempt {attempt}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("{name}: close attempt {attempt} did not reach its commit")
+                }
+            }
+            let mut state = backend.state.write().await;
+            assert!(
+                state.documents.contains_key(&uri),
+                "{name}: attempt {attempt} must not close before its commit"
+            );
+            match attempt % 3 {
+                1 => state.workspace_index.invalidate_all(),
+                2 => state.bump_package_config_generation(),
+                _ => state.record_package_input_mutation(),
+            }
+            pause = state
+                .did_close_pre_commit_test_pause
+                .rearm_before_release(uri.clone(), pause);
+        }
+        if locked_attempts == 0 {
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut close => {
+                    panic!("{name}: didClose gave up after {overtaken} overtaken attempts")
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("{name}: the attempt after {overtaken} overtaken ones never ran")
+                }
+            }
+            pause.release();
+            close.await;
+        } else {
+            // A locked attempt never parks at the lock-free commit barrier.
+            tokio::select! {
+                _ = &mut close => {}
+                _ = pause.wait_arrived() => {
+                    panic!("{name}: attempt after the bound ran without the state lock")
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("{name}: the locked attempt did not finish")
+                }
             }
         }
-        let second_pause = {
-            let state = backend.state.write().await;
-            state.workspace_index.invalidate_all();
-            state.did_close_pre_commit_test_pause.arm(uri.clone())
-        };
-        first_pause.release();
-        tokio::select! {
-            _ = second_pause.wait_arrived() => {}
-            _ = &mut close => panic!("close did not retry after ancillary drift"),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                panic!("close did not reach its second barrier")
-            }
-        }
-        backend.state.write().await.workspace_index.invalidate_all();
-        second_pause.release();
-        close.await;
+
+        let state = backend.state.read().await;
         assert!(
-            backend.state.read().await.documents.contains_key(&uri),
-            "the bounded close must stop instead of deriving a third attempt"
+            !state.documents.contains_key(&uri),
+            "{name}: the buffer is still open"
         );
+        assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
+        assert_eq!(
+            state
+                .open_close_intent_for_test(&uri)
+                .map(|intent| intent.0),
+            Some("closed")
+        );
+        assert_eq!(state.did_close_locked_attempts_for_test, locked_attempts);
+    }
+
+    #[tokio::test]
+    async fn did_close_survives_two_overtaken_attempts() {
+        const { assert!(OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS > 2) };
+        assert_did_close_survives_overtaken_attempts("close-two-overtaken", 2, 0).await;
+    }
+
+    #[tokio::test]
+    async fn did_close_closes_under_the_state_lock_once_every_lock_free_attempt_is_overtaken() {
+        assert_did_close_survives_overtaken_attempts(
+            "close-all-overtaken",
+            OPEN_TRANSITION_OPTIMISTIC_ATTEMPTS,
+            1,
+        )
+        .await;
     }
 
     #[tokio::test]
