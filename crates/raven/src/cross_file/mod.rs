@@ -211,8 +211,15 @@ pub fn extract_metadata_with_tree(
         content.len()
     );
 
-    // Parse directives first
-    let mut meta = directive::parse_directives(content);
+    // Parse directives first, from R's comments: a `#` inside a multi-line
+    // string isn't one.
+    let mut meta = match tree {
+        Some(tree) => directive::parse_directives(&directive::mask_multiline_strings(
+            content,
+            tree.root_node(),
+        )),
+        None => directive::parse_directives(content),
+    };
 
     // Parse AST for source() calls and library() calls using provided tree
     if let Some(tree) = tree {

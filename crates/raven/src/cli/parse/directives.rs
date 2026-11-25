@@ -32,7 +32,9 @@ use super::statements::CommentSpan;
 
 /// Each directive comment's `directive` object, by the comment's start byte.
 /// `text` is the decoded text with each lone `\r` read as `\n` (the text the
-/// tree was parsed from), so its lines are the document's lines.
+/// tree was parsed from), so its lines are the document's lines, and with
+/// multi-line strings blanked (`mask_multiline_strings`), as the analysis and
+/// the lint track scan it. Comments read the same in both.
 pub(crate) fn directives_by_comment(
     text: &str,
     lines: &LineIndex<'_>,
