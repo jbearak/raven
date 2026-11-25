@@ -85,7 +85,7 @@ const attaching = new Set<string>();
  * reattach a stopped persistent console, whose subscription then replays the
  * stop, and the console replays it to the launch's session too.
  */
-const launch_claims = new Map<string, ReturnType<typeof setTimeout> | undefined>();
+const launch_claims = new Map<string, { holds: number; timer?: ReturnType<typeof setTimeout> }>();
 let LAUNCH_CLAIM_MS = 10_000;
 /** Launches still choosing their console, which may be any of them. */
 let launches_choosing = 0;
@@ -96,24 +96,48 @@ let launches_choosing = 0;
  */
 const deferred_stops = new Set<string>();
 
-/** Hold `ipc` for a launch still resolving (no expiry). */
+function claim_of(ipc: string): { holds: number; timer?: ReturnType<typeof setTimeout> } {
+    let c = launch_claims.get(ipc);
+    if (!c) launch_claims.set(ipc, (c = { holds: 0 }));
+    return c;
+}
+
+/** Forget `ipc`'s entry once no launch holds it and no claim is timed. */
+function prune_claim(ipc: string): void {
+    const c = launch_claims.get(ipc);
+    if (c && c.holds === 0 && c.timer === undefined) launch_claims.delete(ipc);
+}
+
+/** One more launch resolving with `ipc` (no expiry; see `unhold_console`). */
 function hold_console(ipc: string): void {
-    clearTimeout(launch_claims.get(ipc));
-    launch_claims.set(ipc, undefined);
+    claim_of(ipc).holds++;
+}
+
+function unhold_console(ipc: string): void {
+    const c = launch_claims.get(ipc);
+    if (c) c.holds = Math.max(0, c.holds - 1);
+    prune_claim(ipc);
 }
 
 /** Claim `ipc` for a resolved launch until its session starts. */
 function claim_console(ipc: string): void {
-    clearTimeout(launch_claims.get(ipc));
-    launch_claims.set(ipc, setTimeout(() => {
-        launch_claims.delete(ipc);
+    const c = claim_of(ipc);
+    clearTimeout(c.timer);
+    c.timer = setTimeout(() => {
+        c.timer = undefined;
+        prune_claim(ipc);
         reconsider_stops();
-    }, LAUNCH_CLAIM_MS));
+    }, LAUNCH_CLAIM_MS);
 }
 
-function release_console(ipc: string): void {
-    clearTimeout(launch_claims.get(ipc));
-    launch_claims.delete(ipc);
+/** A session started for `ipc`: its timed claim is done (holds remain). */
+function end_claim(ipc: string): void {
+    const c = launch_claims.get(ipc);
+    if (c) {
+        clearTimeout(c.timer);
+        c.timer = undefined;
+    }
+    prune_claim(ipc);
 }
 
 /** Test hook: shorter claim and socket waits. */
@@ -626,6 +650,8 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
         let choosing = typeof given !== 'string';
         let held: string | undefined;
         const hold = (ipc: string) => {
+            if (held === ipc) return;
+            if (held !== undefined) unhold_console(held);
             held = ipc;
             hold_console(ipc);
             if (choosing) {
@@ -640,9 +666,10 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
             const resolved = await resolve_configuration(config, hold);
             const chosen: unknown = resolved?.consoleSocket;
             if (typeof chosen === 'string') claim_console(chosen);
-            if (held !== undefined && held !== chosen) release_console(held);
             return resolved;
         } finally {
+            // Also when resolution throws: an untimed hold must not outlive it.
+            if (held !== undefined) unhold_console(held);
             if (choosing) launches_choosing--;
             reconsider_stops();
         }
@@ -771,7 +798,7 @@ export function register_debugger(context: vscode.ExtensionContext): void {
         vscode.debug.onDidChangeBreakpoints(mirror_all),
         vscode.debug.onDidStartDebugSession((s) => {
             if (s.type === DEBUG_TYPE && s.configuration.consoleSocket) {
-                release_console(s.configuration.consoleSocket);
+                end_claim(s.configuration.consoleSocket);
                 // This session shows the console's stop.
                 deferred_stops.delete(s.configuration.consoleSocket);
                 sessions.set(s.configuration.consoleSocket, s);

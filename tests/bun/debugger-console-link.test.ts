@@ -694,6 +694,69 @@ describe('an explicit launch', () => {
         for (const l of start_listeners) l({ type: 'raven-r', id: 'f5a', configuration: { consoleSocket: a.sock } });
     });
 
+    test("a launch that throws while it holds the console doesn't keep its stop held", async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        const program = path.join(root, 'save-throws.R');
+        let fail: (e: Error) => void = () => undefined;
+        text_documents.push({ uri: { fsPath: program }, isDirty: true, save: () => new Promise((_r, j) => { fail = j; }) });
+        try {
+            const resolving = config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'Source R file', program, consoleSocket: sock },
+            ) as Promise<unknown>;
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await settle(200);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            fail(new Error('disk full'));
+            await expect(resolving).rejects.toThrow('disk full');
+            await until(() => started.some((c) => c.consoleSocket === sock), 2_000);
+        } finally {
+            text_documents.length = 0;
+        }
+    });
+
+    test("one launch failing doesn't release a console another launch still holds", async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        const slow = path.join(root, 'slow-a.R');
+        const refused = path.join(root, 'refused-b.R');
+        let saved_a: (ok: boolean) => void = () => undefined;
+        text_documents.push(
+            { uri: { fsPath: slow }, isDirty: true, save: () => new Promise((r) => { saved_a = r; }) },
+            { uri: { fsPath: refused }, isDirty: true, save: async () => false },
+        );
+        try {
+            const a = config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'A', program: slow, consoleSocket: sock },
+            );
+            con.push({ event: 'stopped', reason: 'breakpoint' });
+            await settle(200);
+            // B targets the same console and fails (its save is refused).
+            expect(await config_providers[0].resolveDebugConfiguration(
+                undefined,
+                { type: 'raven-r', request: 'launch', name: 'B', program: refused, consoleSocket: sock },
+            )).toBeUndefined();
+            await settle(300);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+            saved_a(true);
+            expect(await a).toMatchObject({ consoleSocket: sock });
+            for (const l of start_listeners) l({ type: 'raven-r', id: 'a', configuration: { consoleSocket: sock } });
+            await settle(300);
+            expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+        } finally {
+            text_documents.length = 0;
+        }
+    });
+
     test('a held stop that R has moved past is dropped', async () => {
         const { con, sock } = await console_at();
         set_breakpoints([]);
