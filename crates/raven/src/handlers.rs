@@ -10883,23 +10883,18 @@ fn enclosing_box_declaration_argument<'a>(
     node: Node<'a>,
     text: &str,
 ) -> Option<(Node<'a>, Node<'a>)> {
-    let mut current = node;
-    loop {
-        let parent = current.parent()?;
-        if parent.kind() == "argument"
-            && let Some(arguments) = parent
-                .parent()
-                .filter(|ancestor| ancestor.kind() == "arguments")
-            && let Some(call) = arguments
-                .parent()
-                .filter(|ancestor| ancestor.kind() == "call")
+    // One root descent for the whole climb (see `parser_pool::ancestors`);
+    // `window[1]` and `window[2]` are the parent and grandparent of `window[0]`.
+    let chain: Vec<Node<'a>> = crate::parser_pool::ancestors(node).collect();
+    chain.windows(3).find_map(|window| {
+        let (argument, arguments, call) = (window[0], window[1], window[2]);
+        (argument.kind() == "argument"
+            && arguments.kind() == "arguments"
+            && call.kind() == "call"
             && (crate::box_use::detect::is_box_use_call(call, text)
-                || crate::box_use::exports::is_box_export_call(call, text))
-        {
-            return Some((parent, call));
-        }
-        current = parent;
-    }
+                || crate::box_use::exports::is_box_export_call(call, text)))
+        .then_some((argument, call))
+    })
 }
 
 /// Whether `node` is static declaration syntax inside `box::use()` or a
@@ -11048,15 +11043,13 @@ fn default_references_sibling_formal(parameter: Node, node: Node, text: &str) ->
 ///   closure is eventually called, mask or no mask, so the walk stops at a
 ///   closure boundary.
 fn default_of_defused_formal(parameter: Node, node: Node, text: &str) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
+    for parent in crate::parser_pool::ancestors(node) {
         if parent.id() == parameter.id() {
             break;
         }
         if parent.kind() == "function_definition" {
             return false;
         }
-        current = parent;
     }
 
     let Some(formal_name) = parameter_node_name(parameter, text) else {
@@ -11079,8 +11072,7 @@ fn default_of_defused_formal(parameter: Node, node: Node, text: &str) -> bool {
 }
 
 fn containing_default_parameter(node: Node) -> Option<Node> {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
+    for parent in crate::parser_pool::ancestors(node) {
         // The nested closure is created while the outer default is forced, but
         // identifiers in its formals/body are evaluated only when that closure
         // is called. They therefore use ordinary lexical late binding and must
@@ -11100,7 +11092,6 @@ fn containing_default_parameter(node: Node) -> Option<Node> {
                 return Some(parent);
             }
         }
-        current = parent;
     }
     None
 }
@@ -11228,14 +11219,7 @@ fn function_scope_contains(
 }
 
 fn containing_function_definition(node: Node) -> Option<Node> {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if parent.kind() == "function_definition" {
-            return Some(parent);
-        }
-        current = parent;
-    }
-    None
+    crate::parser_pool::ancestors(node).find(|parent| parent.kind() == "function_definition")
 }
 
 /// Whether the containing function proves that `name` is bound before the
@@ -21795,20 +21779,19 @@ fn single_named_child(node: Node) -> Option<Node> {
 /// (`data[[{{ idx }}]]`) does not count; a subscript nested inside a call
 /// argument (`filter(df, x[{{ i }}])`) still does — the walk keeps climbing.
 fn is_inside_call_argument(node: Node) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
+    // `chain[i + 2]` is the grandparent of `chain[i]`.
+    let chain: Vec<Node> = crate::parser_pool::ancestors(node).collect();
+    for (index, parent) in chain.iter().enumerate() {
         if parent.kind() == "function_definition" {
             return false;
         }
         if parent.kind() == "argument"
-            && parent
-                .parent()
-                .and_then(|args| args.parent())
+            && chain
+                .get(index + 2)
                 .is_some_and(|grandparent| grandparent.kind() == "call")
         {
             return true;
         }
-        current = parent;
     }
     false
 }
@@ -22311,16 +22294,20 @@ fn enclosing_call_arg_context<'t>(
     {
         return None;
     }
-    let mut cur = usage_node;
-    let arg = loop {
-        let parent = cur.parent()?;
-        if parent.kind() == "arguments" && cur.kind() == "argument" {
-            break cur;
-        }
-        cur = parent;
-    };
-    let args = arg.parent()?; // "arguments"
-    let call = args.parent().filter(|n| n.kind() == "call")?;
+    // `usage_node`, then its ancestors nearest first: each adjacent pair is a
+    // (node, parent) step of the climb.
+    let chain: Vec<Node<'t>> = std::iter::once(usage_node)
+        .chain(crate::parser_pool::ancestors(usage_node))
+        .collect();
+    let arg_index = chain
+        .windows(2)
+        .position(|step| step[1].kind() == "arguments" && step[0].kind() == "argument")?;
+    let arg = chain[arg_index];
+    // `chain[arg_index + 1]` is the "arguments" node; its parent is the call.
+    let call = chain
+        .get(arg_index + 2)
+        .copied()
+        .filter(|n| n.kind() == "call")?;
     let func = call.child_by_field_name("function")?;
     let callee = match func.kind() {
         "identifier" => node_text(func, text).to_string(),
@@ -23103,7 +23090,7 @@ fn call_is_pipe_fed(call_node: Node, text: &str) -> bool {
 /// its RHS `.` is equally a pronoun.
 fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    for parent in crate::parser_pool::ancestors(node) {
         if parent.kind() == "binary_operator" {
             // Check if the operator is a magrittr pipe and `current` is on the RHS.
             let is_rhs = parent
@@ -23146,7 +23133,7 @@ fn is_call_function_head(node: Node) -> bool {
 /// pipes are unaffected.
 fn is_inside_exposition_rhs(node: Node, text: &str) -> bool {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    for parent in crate::parser_pool::ancestors(node) {
         if parent.kind() == "binary_operator" {
             let is_rhs = parent
                 .child_by_field_name("rhs")
@@ -23205,8 +23192,7 @@ fn is_functional_sequence_head_dot(node: Node, text: &str) -> bool {
 /// placeholder elsewhere (a common `%>%`→`|>` migration bug) is NOT inside
 /// such a call and stays flagged.
 fn is_inside_dplyr_dot_context(node: Node, text: &str) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
+    for parent in crate::parser_pool::ancestors(node) {
         if parent.kind() == "call"
             && let Some(func) = parent.child_by_field_name("function")
         {
@@ -23218,7 +23204,6 @@ fn is_inside_dplyr_dot_context(node: Node, text: &str) -> bool {
                 return true;
             }
         }
-        current = parent;
     }
     false
 }
@@ -23228,7 +23213,7 @@ fn is_inside_dplyr_dot_context(node: Node, text: &str) -> bool {
 /// value — it is always defined and should not be flagged as undefined.
 fn is_inside_native_pipe_rhs(node: Node, _text: &str) -> bool {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    for parent in crate::parser_pool::ancestors(node) {
         if parent.kind() == "binary_operator" {
             let is_rhs = parent
                 .child_by_field_name("rhs")

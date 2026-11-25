@@ -6,6 +6,7 @@
 // NOTE: Only modules required by benchmarks/tests are included here.
 // The full module set lives in main.rs (the binary crate root).
 
+pub mod analysis_stack;
 pub mod cli;
 pub mod cross_file;
 pub mod parser_pool;

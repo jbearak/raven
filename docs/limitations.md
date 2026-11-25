@@ -15,9 +15,10 @@ Most gaps share one cause: Raven reads code without running it, so it can't see 
 - **`data()` objects don't reach files that declare their parent.** When a parent calls `data(api, package = "survey")`, a child that inherits scope through `# raven: sourced-by` (or an inferred backward link) sees `api` but not the objects it loads, such as `apiclus1`. Children reached through `source()` see them all. See [Cross-file analysis](cross-file.md#base-packages) for workarounds.
 - **Symlinked paths to closed files.** If you reach the same closed file through two different symlinked paths, Raven may treat them as two files. Open files are matched to their on-disk file. See [Cross-file analysis](cross-file.md#open-buffers-disk-state-and-closing-files).
 - **Member navigation only for static names.** Go to definition, hover, and find references follow `foo$bar`, `foo@bar`, and `foo[["bar"]]`, but not subscripts R resolves only at runtime, such as `x[[i]]`, `x[[1]]`, or `x["bar"]`. See [Go to definition](go-to-definition.md#-and--member-resolution) and [Find references](find-references.md#scope-and-pooling).
+- **One expression can nest about 20,000 levels deep.** A chain of `+`, `|>`, or `%>%` nests one level per term, so this is a 20,000-term model formula or pipeline. Past that, `raven check` and the language server stop with a stack overflow instead of reporting diagnostics.
 
 <details markdown="1">
-<summary>Exact rules for Stan, symlinks, and member navigation</summary>
+<summary>Exact rules for Stan, symlinks, member navigation, and nesting depth</summary>
 
 **Stan.** Complete `.stan` programs get native syntax and undeclared-variable diagnostics. Raven does not type-check expressions, validate shapes or overloads, diagnose whether a called function or sampling distribution exists, preprocess `#include`, or assemble project-specific source fragments. A file with no real top-level Stan block is treated as a fragment and gets no undeclared-variable findings. Any `#include` turns off that check for the whole file, because the included file may supply declarations.
 
@@ -26,6 +27,8 @@ Most gaps share one cause: Raven reads code without running it, so it can't see 
 **Symlinks and path spelling.** Raven keeps each file under the path spelling it was reached by rather than resolving every path to one canonical form, because full canonicalization follows symlinks and could disagree with the paths in the workspace index. So closed files reached through different symlinked spellings can stay separate. An open file whose path differs from the on-disk file only by case or by a symlink stands in for that file while it is open, including for package-internal scope and for the workspace `.Rprofile`. Diagnostics still appear on the path the editor opened. When resolving `source()` paths, Raven may correct a case-only mismatch so it matches the on-disk spelling.
 
 **Member navigation.** A member access is navigable only when it is statically a name: an identifier after `$` or `@` (`foo$bar`), or a single, positional, literal string inside `[[` (`foo[["bar"]]`, which extracts the same element as `$`). Raven does not follow computed indices (`x[[i]]`, `x[[paste0("a", "b")]]`), numeric indices (`x[[1]]`), named or multi-argument subscripts (`x[[name = "a"]]`, `x[["a", exact = FALSE]]`), strings with escapes, or single brackets (`x["bar"]`, which returns a sub-container, not the element).
+
+**Nesting depth.** The limit comes from the stack Raven reserves for analysis, 128 MiB per thread, and was measured at about 22,700 levels on an Apple silicon Mac. Where address space is rationed (`ulimit -v`, or Linux strict overcommit) Raven reserves less and the limit is lower. R's own defaults stop sooner: it refuses to evaluate a `+` chain of 5,000 terms and cannot parse more than 49 nested parentheses or calls. Checking time grows with the square of the depth. A 2,000-term chain takes about two seconds and a 5,000-term chain about seven.
 
 </details>
 

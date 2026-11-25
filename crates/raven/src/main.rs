@@ -81,10 +81,15 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async_main())
+    // Everything below can walk an R syntax tree, so it runs on threads with
+    // the analysis stack: see `raven::analysis_stack` (issue #882).
+    raven::analysis_stack::run_main(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(raven::analysis_stack::stack_size())
+            .build()?
+            .block_on(async_main())
+    })?
 }
 
 async fn async_main() -> anyhow::Result<()> {
