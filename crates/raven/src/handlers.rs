@@ -10036,9 +10036,10 @@ fn infix_sites_from_snapshot(
                         (Some(own), _) if contribution.r_internal_symbols.contains(op) => {
                             InfixSite::Provider(own.clone())
                         }
-                        (_, Some(importers)) if !importers.is_empty() => {
-                            InfixSite::Packages(vec![importers.iter().cloned().collect()])
-                        }
+                        (_, Some(importers)) if !importers.is_empty() => InfixSite::Packages {
+                            tiers: vec![importers.iter().cloned().collect()],
+                            inherited: Vec::new(),
+                        },
                         _ => attached_at(stream, snapshot, analysis),
                     }
                 }
@@ -10105,7 +10106,9 @@ fn attached_at(
     rest.sort();
     rest.dedup();
     tiers.push(rest);
-    InfixSite::Packages(tiers)
+    let mut inherited: Vec<String> = scope.inherited_packages.iter().cloned().collect();
+    inherited.sort();
+    InfixSite::Packages { tiers, inherited }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20504,8 +20507,14 @@ enum InfixSite {
     /// The packages that may provide the operator here, in tiers in R's
     /// lookup order (see [`attached_at`]): the first tier with a package
     /// that exports the operator decides. Within a tier the order is
-    /// unknown, so its exporters' declarations must agree.
-    Packages(Vec<Vec<String>>),
+    /// unknown, so its exporters' declarations must agree. `inherited` are
+    /// the packages callers attached before this file ran: a package one of
+    /// them `Depends:` on doesn't move when a tier's package attaches it
+    /// again.
+    Packages {
+        tiers: Vec<Vec<String>>,
+        inherited: Vec<String>,
+    },
 }
 
 impl<'a> NseAnalysis<'a> {
@@ -23434,13 +23443,22 @@ fn declared_infix_operator(
         .and_then(|sites| sites.get(&operator_start))
         .cloned()
         .or_else(|| file_final_infix_site(op, analysis));
-    let tiers = match site {
+    let (tiers, inherited) = match site {
         Some(InfixSite::Shadowed) => return none,
         Some(InfixSite::Provider(package)) => return lookup(&package).unwrap_or(none),
-        Some(InfixSite::Packages(tiers)) => tiers,
-        None => vec![analysis.in_play_packages.clone()],
+        Some(InfixSite::Packages { tiers, inherited }) => (tiers, inherited),
+        None => (vec![analysis.in_play_packages.clone()], Vec::new()),
     };
-    for tier in &tiers {
+    for (index, tier) in tiers.iter().enumerate() {
+        // Packages attached before this tier's (the ordered tiers after it,
+        // short of the last, unordered one, and what callers attached): a
+        // `Depends:` on one of them doesn't move it in front.
+        let attached_before = |owner: &String| {
+            inherited.contains(owner)
+                || tiers
+                    .get(index + 1..tiers.len().saturating_sub(1))
+                    .is_some_and(|earlier| earlier.iter().any(|tier| tier.contains(owner)))
+        };
         // The package in this tier whose `op` R finds: its own export, or
         // one a package it depends on puts on the search path with it.
         let mut exporters: Vec<String> = Vec::new();
@@ -23452,6 +23470,7 @@ fn declared_infix_operator(
             } else {
                 lib.find_package_owner_for_symbol(op, std::slice::from_ref(pkg))
                     .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
+                    .filter(|owner| !attached_before(owner))
             };
             if let Some(exporter) = exporter
                 && !exporters.contains(&exporter)
@@ -33090,6 +33109,14 @@ d[n > 1, older] := 1
         assert_eq!(where_undefined_names(last).await, Vec::<String>::new());
         let depends = "library(capa)\nlibrary(wrapplain)\nd <- 1\nd %where% missing_dep\n";
         assert_eq!(where_undefined_names(depends).await, vec!["missing_dep"]);
+        // `plain` is already attached, so `wrapplain` doesn't move it in
+        // front of `capa`.
+        let depends_attached =
+            "library(plain)\nlibrary(capa)\nlibrary(wrapplain)\nd <- 1\nd %where% captured_dep\n";
+        assert_eq!(
+            where_undefined_names(depends_attached).await,
+            Vec::<String>::new()
+        );
         let agreeing = "library(capa)\nlibrary(capb)\nd <- 1\nd %where% captured\n";
         assert_eq!(where_undefined_names(agreeing).await, Vec::<String>::new());
         let later = "library(capa)\nd <- 1\nd %where% captured\nlibrary(plain)\n";
