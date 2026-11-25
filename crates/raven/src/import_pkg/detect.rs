@@ -437,14 +437,12 @@ fn canonical_package_name(spec: &str) -> Option<String> {
 /// True only for identifier tokens belonging to a call that the detector
 /// consumed completely. Dynamic/inert calls deliberately return false.
 pub(crate) fn is_static_declaration_token(token: Node, content: &str) -> bool {
-    let mut current = token;
-    while let Some(parent) = current.parent() {
-        if let Some(kind) = import_call_kind(parent, content) {
-            return parse_call(parent, content, kind, false).is_some();
-        }
-        current = parent;
-    }
-    false
+    crate::parser_pool::ancestors(token)
+        .find_map(|parent| {
+            import_call_kind(parent, content)
+                .map(|kind| parse_call(parent, content, kind, false).is_some())
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]

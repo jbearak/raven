@@ -1202,6 +1202,18 @@ Raven keeps `tower-lsp` at `.concurrency_level(1)` to preserve ordered text sync
 
 Interactive handlers that can spend noticeable time in cross-file scope resolution should use a request-scoped `DiagCancelToken` from the registry and poll it through long loops and scope helpers. Qualified-member go-to-definition threads this token through `goto_definition_with_cancel` → `resolve_qualified_member_with_cancel` → `get_cross_file_scope_with_cache`, including per-candidate validation. New interactive multi-position resolvers should follow the same pattern: keep a request-local `ParentPrefixCache`, pass the token into every scope lookup, and check the token between candidate batches while still preserving a single `WorldState` snapshot.
 
+### Deeply nested syntax: stack size and ancestor climbs (#882)
+
+R parses an operator chain as a left-nested tree, so a 2000-term `+` chain, pipeline, or model formula is 2000 levels deep. Raven's analysis passes are recursive, and deep input used to cost them in two ways.
+
+**Stack.** The widest pass, the scope artifact walk, uses about 6.3 KiB of stack per level in a release build and 23 KiB in a debug build. On default stacks that aborted the process at about 330 levels on a tokio or rayon thread and 1300 on the main thread. `analysis_stack.rs` now gives every thread that walks a tree a 128 MiB stack: the thread that runs the CLI and the tokio runtime, tokio's worker and blocking threads, the global rayon pool, and the library-routing derivation thread. A new thread that analyses R code must use `analysis_stack::stack_size()`. The size is an address-space reservation; pages are committed only when touched. It shrinks when `RLIMIT_AS` or Linux strict overcommit rations address space, so Raven still starts there. When the OS main thread's own stack (`ulimit -s`) is already at least that large, the CLI runs on it directly instead of on a new thread.
+
+The limit moved; it is not gone. A release build overflows at about 22,700 levels (measured on arm64 macOS), a debug build near 5700, and it still dies with `has overflowed its stack` and SIGABRT. Making every walker iterative would remove the limit, but there are well over a hundred of them and the scope walk's event order is behaviour, so that was not attempted. Tests and benches run on default stacks: exercise deep input through the binary (`tests/deep_nesting.rs`) or on a thread spawned with `stack_size()`.
+
+**Time.** A tree-sitter node has no parent pointer. `Node::parent` descends from the root, so a loop of `while let Some(parent) = current.parent()` costs one root descent per level climbed, quadratic in depth. The diagnostic collectors run several such climbs per identifier, which made a 2000-term chain take about 90 seconds. `parser_pool::ancestors(node)` returns the same nodes from a single descent. Use it for any climb of more than one level; a single `node.parent()` call is fine. The per-identifier collectors and the metadata walks in `handlers.rs`, `cross_file/binding.rs`, and `import_pkg/detect.rs` use it. Loops that run once per request or per error node were left alone.
+
+What remains is one descent per identifier, so checking is still quadratic in depth: about 2 seconds for a 2000-term chain and 7 for 5000. `budget_diagnostics_2000_term_chain` in `tests/performance_budgets.rs` guards the climb cost.
+
 ### Semantic tokens
 
 Raven advertises full-document semantic tokens for R documents and currently emits the standard LSP `function` token type for function-definition names and call heads. The token legend order is part of the LSP contract: keep `SemanticTokenType::FUNCTION` at index 0 unless all encoded token-type indexes are updated together.

@@ -6023,8 +6023,11 @@ fn spawn_library_routing_derivation(
     }
     #[cfg(not(any(test, feature = "test-support")))]
     let _ = dispatch_on_tokio_for_test;
+    // The derivation parses and analyses external R files, so it needs the
+    // analysis stack like every other thread that walks a syntax tree.
     let spawn = std::thread::Builder::new()
         .name(format!("raven-routing-derive-{id}"))
+        .stack_size(crate::analysis_stack::stack_size())
         .spawn(move || complete_library_routing_derivation(completion, captured));
     if let Err(error) = spawn {
         // `Builder::spawn` drops the closure, whose completion guard clears

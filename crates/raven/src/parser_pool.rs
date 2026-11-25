@@ -36,9 +36,163 @@ pub(crate) fn non_extra_children<'a>(
     node.children(cursor).filter(|c| !c.is_extra()).collect()
 }
 
+/// The ancestors of `node`, nearest first: its parent, then its grandparent,
+/// and so on up to the root. Yields exactly the nodes that repeated
+/// [`tree_sitter::Node::parent`] calls return.
+///
+/// Use this for any loop that climbs more than one level. Tree-sitter nodes
+/// store no parent pointer, so each `Node::parent` call descends from the root
+/// to find it. A climb written as `while let Some(parent) = current.parent()`
+/// therefore costs one root descent per level, which is quadratic in the
+/// node's depth. This function pays for a single descent however far the caller
+/// climbs, the same price as one `Node::parent` call. On a 2000-term `+` chain
+/// that turns minutes of per-identifier climbing into milliseconds (issue #882).
+pub(crate) fn ancestors<'tree>(
+    node: tree_sitter::Node<'tree>,
+) -> impl Iterator<Item = tree_sitter::Node<'tree>> {
+    // SAFETY: `node` borrows its tree for `'tree`, so the tree pointer inside
+    // the raw node is live for that lifetime. `ts_tree_root_node` only reads the
+    // tree, and the root it returns belongs to that same tree.
+    let root = unsafe {
+        tree_sitter::Node::from_raw(tree_sitter::ffi::ts_tree_root_node(node.into_raw().tree))
+    };
+    // Same walk as tree-sitter's `ts_node_parent`, keeping every node it passes
+    // instead of only the last one. Ordinary code nests well under 32 levels,
+    // so this is one allocation.
+    let mut chain = Vec::with_capacity(32);
+    if root.id() != node.id() {
+        let mut current = root;
+        loop {
+            chain.push(current);
+            match current.child_with_descendant(node) {
+                Some(next) if next.id() != node.id() => current = next,
+                _ => break,
+            }
+        }
+    }
+    chain.into_iter().rev()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every node of `tree`, in preorder, without recursion.
+    fn all_nodes(tree: &tree_sitter::Tree) -> Vec<tree_sitter::Node<'_>> {
+        let mut nodes = Vec::new();
+        let mut cursor = tree.walk();
+        loop {
+            nodes.push(cursor.node());
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return nodes;
+                }
+            }
+        }
+    }
+
+    fn assert_ancestors_match_parent_calls(code: &str) {
+        let tree = with_parser(|parser| parser.parse(code, None)).expect("parse should succeed");
+        for node in all_nodes(&tree) {
+            let mut expected = Vec::new();
+            let mut current = node;
+            while let Some(parent) = current.parent() {
+                expected.push(parent.id());
+                current = parent;
+            }
+            let actual: Vec<usize> = ancestors(node).map(|ancestor| ancestor.id()).collect();
+            assert_eq!(
+                actual,
+                expected,
+                "ancestors of {} node at bytes {:?} in {code:?}",
+                node.kind(),
+                node.byte_range()
+            );
+        }
+    }
+
+    #[test]
+    fn ancestors_match_repeated_parent_calls() {
+        for code in [
+            "",
+            "x",
+            "x <- 1",
+            "f <- function(a, b = a + 1) {\n  if (a) b else g(a)[[1]]$name\n}\n",
+            "library(dplyr)\nmtcars |> filter(mpg > 20) |> summarise(n = n())\n",
+            "y ~ a + b + c + (d | e)",
+            "# only a comment\n",
+            "x <- c(1, # trailing comment\n  2)\n",
+            r#"s <- r"(raw string)"; t <- 'two' ; `back tick` <- NULL"#,
+        ] {
+            assert_ancestors_match_parent_calls(code);
+        }
+    }
+
+    /// Zero-width MISSING nodes and ERROR subtrees take the special paths in
+    /// tree-sitter's descent, so they are where the single descent could
+    /// disagree with repeated `Node::parent` calls.
+    #[test]
+    fn ancestors_match_repeated_parent_calls_on_malformed_code() {
+        for code in [
+            "f(",
+            "f(a, ",
+            "x <- ",
+            "if (",
+            "function(x",
+            "a +",
+            "((((",
+            "))))",
+            "x[[1",
+            "f(a = , b)",
+            "x <- function(a) { if (a) { b } else",
+            "1 +* 2\ny <- )\nz <- 3",
+            "foo(bar(baz(",
+            "x <- 'unterminated\ny <- 2",
+            "for (i in ) {}",
+            "a %>% \n",
+        ] {
+            assert_ancestors_match_parent_calls(code);
+        }
+    }
+
+    /// The same equivalence over every R file in the repo's fixture, demo, and
+    /// docs-example corpora, so real code (not only hand-picked snippets) backs
+    /// the claim that `ancestors` is a drop-in for a `Node::parent` climb.
+    #[test]
+    fn ancestors_match_repeated_parent_calls_across_the_corpus() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut pending = vec![
+            repo.join("crates/raven/tests/fixtures"),
+            repo.join("demo"),
+            repo.join("docs/examples"),
+        ];
+        let mut files = 0;
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("corpus directory is readable") {
+                let path = entry.expect("corpus entry is readable").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("r"))
+                    && let Ok(code) = std::fs::read_to_string(&path)
+                {
+                    assert_ancestors_match_parent_calls(&code);
+                    files += 1;
+                }
+            }
+        }
+        assert!(files > 50, "corpus walk found only {files} R files");
+    }
+
+    #[test]
+    fn ancestors_of_root_is_empty() {
+        let tree = with_parser(|parser| parser.parse("x <- 1", None)).expect("parse");
+        assert_eq!(ancestors(tree.root_node()).count(), 0);
+    }
 
     #[test]
     fn test_parser_initialized_with_r_language() {

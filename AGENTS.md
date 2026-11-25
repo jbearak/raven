@@ -87,6 +87,8 @@ Items here have no natural code home — they span multiple systems, depend on e
 - **File-type tracking** for non-R languages: track file type on the document itself, not solely from URI extensions — untitled buffers rely on `languageId`, and extension contributions should include mixed-case extensions when backend matching is case-insensitive.
 - **Vendored R + R Markdown grammars** are registered in `editors/vscode/package.json` as `contributes.grammars` so the knit pipeline can reach them on remote extension hosts, where UI-only sibling grammar extensions are invisible. `editors/vscode/syntaxes/SOURCE.md` holds the rationale and the touchpoints that must stay in lockstep; `tests/bun/grammar-contribution-paths.test.ts` gates the manifest paths on CI.
 
+- **Deeply nested syntax** (issue #882): a long `+` / `|>` chain or model formula is one tree level per term, and analysis is recursive. Two rules keep it from aborting or stalling. A thread that walks an R syntax tree must be created with `analysis_stack::stack_size()` (default stacks overflow at about 330 levels); tests and benches run on default stacks, so deep input is tested through the binary. A climb of more than one level uses `parser_pool::ancestors(node)`, never a `while let Some(parent) = current.parent()` loop: each `Node::parent` call descends from the root, so the loop is quadratic in depth. See "Deeply nested syntax" in `docs/development.md`.
+
 ### Environment / tooling
 
 - **Searching the repo**: `target/` is huge (200+ GB of `debug/deps`), so plain `grep -r` is very slow because it doesn't honor `.gitignore`. Use `rg` (respects `.gitignore`, skips `target/`) or `grep -r --exclude-dir=target`.
