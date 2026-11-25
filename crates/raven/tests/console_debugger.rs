@@ -2985,6 +2985,217 @@ fn a_second_console_on_live_sockets_is_refused_and_stale_sockets_are_replaced() 
     assert_eq!(d.req("threads", json!({}))["success"], true);
 }
 
+/// A console stopped at line 2 of a two-line file (the only stop that
+/// program makes), with a subscriber connected before any session.
+fn stopped_once(c: &Console) -> Subscriber {
+    let deadline = Instant::now() + TIMEOUT;
+    while c.ipc_status("breakpoints") != "ok" {
+        assert!(Instant::now() < deadline, "debugger never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let a = c.write_file("a.R", "x <- 1\ny <- 2\n");
+    let arm = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {&a: [{"line": 2}]}});
+    assert_eq!(ipc_request(c, &arm), "ok");
+    let mut sub = Subscriber::connect(c);
+    c.send(&format!("source({a:?})"), None);
+    assert!(sub.event("stopped", TIMEOUT).is_some(), "{}", c.text());
+    sub
+}
+
+/// A session attached to the stop and showing it.
+fn showing_the_stop(c: &Console) -> Dap {
+    let d = Dap::open(&c.dir, true);
+    d.event("stopped", 0);
+    d
+}
+
+const QUIET: Duration = Duration::from_millis(1500);
+
+/// A second window subscribes while the first shows a stop, so it is not
+/// told of it. If the first then loses its debug connection without ending
+/// the session, the stop is announced again, or the second would never
+/// attach.
+#[test]
+fn a_stop_is_announced_again_when_the_session_showing_it_drops() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let _first = stopped_once(&c);
+    let d = showing_the_stop(&c);
+    let mut other = Subscriber::connect(&c);
+    assert!(
+        other.event("stopped", QUIET).is_none(),
+        "replayed a stop a live session shows"
+    );
+    // The window showing the stop is gone without a word. (Both halves:
+    // the test client's reader thread holds a clone of the socket.)
+    d.w.shutdown(std::net::Shutdown::Both).unwrap();
+    let ev = other.event("stopped", Duration::from_secs(5));
+    assert_eq!(
+        ev.as_ref().map(|v| v["reason"].clone()),
+        Some(json!("breakpoint")),
+        "{}",
+        c.text()
+    );
+    // Once: the stop is not announced over and over.
+    assert!(other.event("stopped", QUIET).is_none());
+    // The session that attaches now is shown the same stop.
+    let mut d = showing_the_stop(&c);
+    assert_eq!(d.stack()[0].1, 2);
+    // A connection the newer session replaced closing changes nothing...
+    let mut newer = showing_the_stop(&c);
+    d.w.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(
+        other.event("stopped", QUIET).is_none(),
+        "announced a stop the replacement session shows"
+    );
+    assert_eq!(newer.stack()[0].1, 2);
+}
+
+/// A session that stops reading its connection (a hung extension host) is
+/// dropped when a write to it times out, before its reader sees anything.
+/// The stop it showed is announced again then too.
+#[test]
+fn a_stop_is_announced_again_when_a_write_to_its_session_fails() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let _first = stopped_once(&c);
+    // A client that never reads what the console sends it.
+    let mut hung = UnixStream::connect(c.dir.join("d")).expect("dap connect");
+    hung.set_write_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut reader = hung.try_clone().unwrap();
+    let mut seq = 0;
+    let mut request = |command: &str| {
+        seq += 1;
+        let body = serde_json::to_vec(&json!({"seq": seq, "type": "request", "command": command,
+            "arguments": {"threadId": 1}}))
+        .unwrap();
+        let framed = [
+            format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
+            body,
+        ]
+        .concat();
+        hung.write_all(&framed).is_ok()
+    };
+    for command in ["initialize", "attach", "configurationDone"] {
+        assert!(request(command));
+    }
+    // It reads as far as the stop it is shown, and never again.
+    let mut seen = Vec::new();
+    reader.set_read_timeout(Some(TIMEOUT)).unwrap();
+    while !String::from_utf8_lossy(&seen).contains("\"event\":\"stopped\"") {
+        let mut buf = [0u8; 4096];
+        let n = reader
+            .read(&mut buf)
+            .expect("the session was never shown the stop");
+        assert!(n > 0, "the console closed the session");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    let mut other = Subscriber::connect(&c);
+    assert!(
+        other.event("stopped", QUIET).is_none(),
+        "replayed a stop a live session shows"
+    );
+    // Responses pile up until the socket's buffer is full; the console's
+    // write then times out (5 s). Requests stop once the console stops
+    // taking them.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut taking = true;
+    let ev = loop {
+        for _ in 0..200 {
+            taking = taking && request("stackTrace");
+        }
+        if let Some(ev) = other.event("stopped", Duration::from_millis(200)) {
+            break ev;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stop was never announced again:\n{}",
+            c.text()
+        );
+    };
+    assert_eq!(ev["reason"], "breakpoint");
+    let mut d = showing_the_stop(&c);
+    assert_eq!(d.stack()[0].1, 2);
+}
+
+/// Every session's connection closes in the end. A stop is not announced
+/// again when the session ended first: it is being resumed or quit, and a
+/// window told of it would attach to a stop that is going away. Here, a
+/// user detach (R continues).
+#[test]
+fn a_stop_is_not_announced_again_after_a_detach() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let _first = stopped_once(&c);
+    let mut d = showing_the_stop(&c);
+    let mut other = Subscriber::connect(&c);
+    d.req("disconnect", json!({"terminateDebuggee": false}));
+    d.w.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(other.event("stopped", QUIET).is_none());
+}
+
+/// Nor after Stop, which quits the browser.
+#[test]
+fn a_stop_is_not_announced_again_after_terminate() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let _first = stopped_once(&c);
+    let mut d = showing_the_stop(&c);
+    let mut other = Subscriber::connect(&c);
+    d.req("terminate", json!({}));
+    d.w.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(other.event("stopped", QUIET).is_none());
+}
+
+/// Nor after Continue, even when the connection is lost before R has taken
+/// the command.
+#[test]
+fn a_stop_is_not_announced_again_when_a_continue_is_pending() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let _first = stopped_once(&c);
+    let mut d = showing_the_stop(&c);
+    let mut other = Subscriber::connect(&c);
+    d.send("continue", json!({"threadId": 1}));
+    d.w.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(other.event("stopped", QUIET).is_none());
+    c.send("cat(toupper('ran on'), '\\n')", None);
+    c.expect("RAN ON");
+}
+
+/// The console ended the session (R reached the prompt) and R stops again
+/// while the editor is still tearing that session down: the new stop is
+/// announced once, as any stop is, and not again when the old session's
+/// connection closes.
+#[test]
+fn a_stop_is_not_announced_again_when_an_ended_session_closes() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut first = stopped_once(&c);
+    let mut d = showing_the_stop(&c);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    let a = c.dir.join("a.R");
+    c.send(&format!("source({a:?})"), None);
+    assert!(first.event("stopped", TIMEOUT).is_some(), "{}", c.text());
+    d.w.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(first.event("stopped", QUIET).is_none());
+}
+
 /// A resume ends the stop for subscribers at once, not when R next reaches
 /// the top-level prompt: a window holding the stop back for a launch that is
 /// still resolving must not attach to it after the user typed `c`, however

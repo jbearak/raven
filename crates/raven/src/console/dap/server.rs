@@ -94,8 +94,11 @@ pub fn read_frame(r: &mut impl BufRead) -> Option<Value> {
 }
 
 /// Listen on `path` (created owner-only, like the IPC socket) and call
-/// `on_message` for every message from the client, and `on_close` when a
-/// client goes away.
+/// `on_message` for every message from the client, and `on_close` when the
+/// current client goes away: once per client, whether its reader found the
+/// connection closed or a write to it failed first. A client that a newer
+/// connection replaced gets no `on_close`; the state is the newer one's by
+/// then.
 pub fn start(
     path: &Path,
     on_message: impl Fn(Value) + Send + Sync + 'static,
@@ -107,7 +110,10 @@ pub fn start(
     let current: Arc<Mutex<Option<(u64, Stream)>>> = Arc::new(Mutex::new(None));
     let connection = Arc::new(AtomicU64::new(0));
 
+    let on_message = Arc::new(on_message);
+    let on_close = Arc::new(on_close);
     let writer_current = current.clone();
+    let writer_on_close = on_close.clone();
     std::thread::Builder::new()
         .name("raven-dap-writer".into())
         .spawn(move || {
@@ -127,13 +133,15 @@ pub fn start(
                 }
                 seq += 1;
                 if write_frame(stream, &msg).is_err() {
+                    // Gone as far as the debugger is concerned, exactly as
+                    // when its reader finds the connection closed (which,
+                    // no longer current, then reports nothing).
                     *g = None;
+                    writer_on_close();
                 }
             }
         })?;
 
-    let on_message = Arc::new(on_message);
-    let on_close = Arc::new(on_close);
     let accept_current = current.clone();
     let accept_connection = connection.clone();
     std::thread::Builder::new()
@@ -202,5 +210,130 @@ mod tests {
         assert_eq!(read_frame(&mut r).unwrap()["b"], "é");
         assert_eq!(read_frame(&mut r).unwrap()["c"][1], 2);
         assert!(read_frame(&mut r).is_none());
+    }
+
+    #[cfg(unix)]
+    mod transport {
+        use super::super::*;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+
+        /// A server in a scratch directory; how many times it called
+        /// `on_close`, and how many messages it dispatched.
+        struct Server {
+            dir: std::path::PathBuf,
+            out: Outbox,
+            closes: Arc<AtomicUsize>,
+            messages: Arc<AtomicUsize>,
+        }
+
+        impl Server {
+            fn start(tag: &str) -> Server {
+                // Short: macOS caps Unix socket paths at 104 bytes.
+                let dir =
+                    std::path::PathBuf::from(format!("/tmp/rvdap-{}-{tag}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let closes = Arc::new(AtomicUsize::new(0));
+                let messages = Arc::new(AtomicUsize::new(0));
+                let (c, m) = (closes.clone(), messages.clone());
+                let out = start(
+                    &dir.join("d"),
+                    move |_| {
+                        m.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move || {
+                        c.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .unwrap();
+                Server {
+                    dir,
+                    out,
+                    closes,
+                    messages,
+                }
+            }
+
+            /// A client the server has seen a message from (so it is the
+            /// current one).
+            fn client(&self) -> UnixStream {
+                let before = self.messages.load(Ordering::SeqCst);
+                let mut s = UnixStream::connect(self.dir.join("d")).unwrap();
+                write_frame(&mut s, &json!({"type": "request", "command": "hello"})).unwrap();
+                wait(|| self.messages.load(Ordering::SeqCst) > before);
+                s
+            }
+
+            fn closes(&self) -> usize {
+                self.closes.load(Ordering::SeqCst)
+            }
+        }
+
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn wait(done: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn settle() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        #[test]
+        fn a_client_that_closes_is_reported_once() {
+            let server = Server::start("eof");
+            let client = server.client();
+            client.shutdown(Shutdown::Both).unwrap();
+            wait(|| server.closes() == 1);
+            settle();
+            assert_eq!(server.closes(), 1);
+        }
+
+        /// A client that stops reading (but stays connected, so its reader
+        /// here is still blocked) fails a write once the socket's buffer is
+        /// full and the write times out: the writer reports the client
+        /// gone, and the reader's later end of file doesn't again.
+        #[test]
+        fn a_failed_write_reports_the_client_gone_once() {
+            let server = Server::start("write");
+            let client = server.client();
+            // More than any socket buffer holds.
+            for _ in 0..64 {
+                server
+                    .out
+                    .event("output", json!({"output": "x".repeat(64 * 1024)}));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while server.closes() == 0 {
+                assert!(Instant::now() < deadline, "the write never failed");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            client.shutdown(Shutdown::Both).unwrap();
+            settle();
+            assert_eq!(server.closes(), 1);
+        }
+
+        #[test]
+        fn a_replaced_client_closing_is_not_reported() {
+            let server = Server::start("stale");
+            let old = server.client();
+            let new = server.client();
+            old.shutdown(Shutdown::Both).unwrap();
+            settle();
+            assert_eq!(server.closes(), 0, "the replacement is still connected");
+            new.shutdown(Shutdown::Both).unwrap();
+            wait(|| server.closes() == 1);
+        }
     }
 }

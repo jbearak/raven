@@ -35,7 +35,8 @@
 //! A `subscribe` made while R is stopped in the debugger, with no debug
 //! session showing the stop, is followed by that stop's `stopped` event, so
 //! an editor that connects (or reconnects to a persistent console) after the
-//! stop still attaches.
+//! stop still attaches. A stop is pushed again, to every subscriber, if the
+//! session showing it loses its connection without ending or resuming it.
 //!
 //! `{"event":"running"}` says the last `stopped` is over: R was given a
 //! command that leaves the stop (Continue or a step, from the debug session

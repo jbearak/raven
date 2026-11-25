@@ -518,10 +518,36 @@ fn outbox() -> Option<&'static server::Outbox> {
     handle().and_then(|h| h.out.as_ref())
 }
 
+/// The current client's connection is gone (see [`server::start`]).
+///
+/// If it was showing a stop that nothing has ended, the stop is unattended
+/// again, and control connections are sent `stopped` for it: one that
+/// subscribed while the session lived was not told of the stop (see
+/// [`unattended_stop_reason`]), and would otherwise never attach. This runs
+/// at the end of every session, so the stop is announced only when it was
+/// abandoned:
+///
+/// * not after the session was ended (`ended`: its own `disconnect` or
+///   `terminate`, or the console's `terminated`), when the stop is being
+///   resumed or quit, or belongs to the next session;
+/// * not with a resume queued for the R thread (`resume`). Whoever consumes
+///   the resume ends the stop in that same critical section
+///   ([`leave_stop`]), so there is no moment when a stop about to be left
+///   looks abandoned.
+///
+/// The flags are cleared and the event queued in one critical section. A
+/// `subscribe` decides whether to replay the stop by reading the flags
+/// while it holds the subscribers lock, which the thread delivering the
+/// event needs: a subscriber either reads the stop as unattended, or is in
+/// the list by the time the event is delivered.
 fn on_close(shared: &Arc<Mutex<Shared>>) {
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let abandoned = s.connected && !s.ended && s.resume.is_none();
     s.connected = false;
     s.configured = false;
+    if abandoned && let Some(stop) = &s.stop {
+        push_control(json!({"event": "stopped", "reason": stop.reason}));
+    }
 }
 
 /// The key breakpoints and stops are matched on: the real path. On Windows
