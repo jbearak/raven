@@ -1022,6 +1022,9 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
         if let Some(hidden) = dap::on_repl_prompt(level, more) {
             return Some(hidden);
         }
+        // Breakpoints changed while R ran are applied before anything more
+        // runs: a `source()` in the next line or request must see them.
+        service_debugger();
         if kind == PromptKind::TopLevel {
             start_next_segment(prompt, true);
         }
@@ -1322,6 +1325,9 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
 /// Pop a socket request (if any) and return its first line for R.
 fn start_request(prompt: &str, kind: PromptKind, cap: usize) -> Option<String> {
     let mut req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
+    // A breakpoint acknowledged after the last idle tick binds before the
+    // request runs (see `service_debugger`).
+    service_debugger();
     // A CRLF file's lines arrive with their `\r`, which R rejects as an
     // invalid token.
     if req.code.contains("\r\n") {
@@ -1365,6 +1371,18 @@ fn start_request(prompt: &str, kind: PromptKind, cap: usize) -> Option<String> {
     let (chunk, _) = next_pending(cap)?;
     echo_line(prompt, kind, &chunk);
     Some(chunk)
+}
+
+/// Run the debugger's pending R-thread work now, rather than at the editor's
+/// next idle tick. A breakpoint the console has acknowledged while R was
+/// busy is only recorded (`hooks_dirty`, a queued function-breakpoint job);
+/// installing the `source()` wrapper or `debug()`-ing the function happens
+/// here, on the R thread. A queued request starts without an idle tick, so
+/// it would otherwise run past that breakpoint.
+fn service_debugger() {
+    if dap::has_work() {
+        dap::service();
+    }
 }
 
 fn update_width() {
