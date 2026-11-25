@@ -880,9 +880,20 @@ function sortTerms(ctx: Ctx): SortTerm[] {
         const kind = keyKind(col, { labelsOn });
         let text: string | undefined;
         switch (kind) {
-            case 'number':
             case 'int64':
             case 'uint64':
+                if (ctx.flavor === 'base') {
+                    // Base R's order() reads an integer64 as its raw bits
+                    // until bit64 is attached, and then refuses a second
+                    // key; its rank is a double that orders the same,
+                    // NA kept as NA (so last).
+                    ctx.needs.add('bit64');
+                    terms.push({ expr: `bit64::rank.integer64(${x})`, desc, character: false, bare: false });
+                    continue;
+                }
+                terms.push({ expr: x, desc, character: false, bare: true });
+                continue;
+            case 'number':
             case 'timestamp':
             case 'dictCode':
                 terms.push({ expr: x, desc, character: false, bare: true });
