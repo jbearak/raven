@@ -8,7 +8,7 @@ use crate::linting::{
     IndentKind, InfixContinuationStyle, LineIndentExpectation, accepted_indents_for_lines,
     leading_space_count,
 };
-use crate::parser_pool::with_parser;
+use crate::parser_pool::{ancestors, with_parser};
 use crate::utf16::utf16_column_to_byte_offset;
 
 const SENTINEL: &str = "raven_sentinel_";
@@ -453,17 +453,19 @@ fn is_multiline_string_like(node: Node<'_>) -> bool {
 /// indentation.
 fn line_starts_inside_multiline_node(tree: &Tree, row: usize) -> bool {
     let point = Point::new(row, 0);
-    let mut node = tree.root_node().descendant_for_point_range(point, point);
-    while let Some(current) = node {
-        if is_multiline_string_like(current)
+    node_and_ancestors_at(tree, point).any(|current| {
+        is_multiline_string_like(current)
             && current.start_position().row < row
             && point_in_node(current, row, 0)
-        {
-            return true;
-        }
-        node = current.parent();
-    }
-    false
+    })
+}
+
+/// The smallest node spanning `point`, then its ancestors up to the root.
+fn node_and_ancestors_at(tree: &Tree, point: Point) -> impl Iterator<Item = Node<'_>> {
+    tree.root_node()
+        .descendant_for_point_range(point, point)
+        .into_iter()
+        .flat_map(|node| std::iter::once(node).chain(ancestors(node)))
 }
 
 fn multiline_string_like_contains(
@@ -473,12 +475,10 @@ fn multiline_string_like_contains(
     column: usize,
 ) -> bool {
     let point = Point::new(row, column);
-    let mut node = tree.root_node().descendant_for_point_range(point, point);
-    while let Some(current) = node {
-        if is_multiline_string_like(current) && point_in_node(current, row, column) {
-            return true;
-        }
-        node = current.parent();
+    if node_and_ancestors_at(tree, point)
+        .any(|current| is_multiline_string_like(current) && point_in_node(current, row, column))
+    {
+        return true;
     }
 
     // At an empty EOF line, tree-sitter may resolve the exact boundary point
@@ -491,15 +491,8 @@ fn multiline_string_like_contains(
         && !previous.is_empty()
     {
         let preceding = Point::new(row - 1, previous.len() - 1);
-        let mut node = tree
-            .root_node()
-            .descendant_for_point_range(preceding, preceding);
-        while let Some(current) = node {
-            if is_multiline_string_like(current) && current.end_position() == point {
-                return true;
-            }
-            node = current.parent();
-        }
+        return node_and_ancestors_at(tree, preceding)
+            .any(|current| is_multiline_string_like(current) && current.end_position() == point);
     }
     false
 }

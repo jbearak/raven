@@ -854,7 +854,8 @@ fn on_analysis_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) 
 /// to climb to the root from each of them with repeated `Node::parent` calls,
 /// which is cubic in the number of steps: this took 30 seconds and held up
 /// every later request. It now skips the operators whose change begins below
-/// the requested rows and takes about 2 ms.
+/// the requested rows and takes about 2 ms. Without the skip it takes about
+/// 260 ms even with single-descent climbs, so the budget sits between the two.
 #[test]
 fn budget_enter_in_2100_step_pipeline() {
     use raven::indentation::{IndentationConfig, on_type_indentation};
@@ -875,7 +876,7 @@ fn budget_enter_in_2100_step_pipeline() {
 /// The lint pass over the same pipeline. It collects the indentation change of
 /// every operator, so it runs the two ancestor climbs 2100 times each. With
 /// repeated `Node::parent` calls that took 30 seconds; with one root descent
-/// per climb (`parser_pool::ancestors`) it takes well under a second.
+/// per climb (`parser_pool::ancestors`) it takes about 0.3 seconds.
 #[test]
 fn budget_lint_2100_step_pipeline() {
     use raven::linting::{LintConfig, run_lints};
