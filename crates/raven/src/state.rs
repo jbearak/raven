@@ -10728,40 +10728,14 @@ impl WorldState {
                     &self.cross_file_graph,
                     &self.cross_file_meta,
                 );
-            // Children that inherit through this parent's `source()` calls:
-            // re-derive those whose proposal from it changed, whether because
-            // the directory it runs them in changed or because it started or
-            // stopped sourcing them. A parent that proposes nothing (no `cd`
-            // in effect, no `chdir = TRUE`) queues nothing.
-            let effective_wd = |metadata: Option<&crate::cross_file::CrossFileMetadata>| {
-                metadata.and_then(|metadata| {
-                    metadata
-                        .working_directory
-                        .clone()
-                        .or_else(|| metadata.inherited_working_directory.clone())
-                })
-            };
-            let proposals = |children: Vec<(Url, bool)>, wd: Option<String>| {
-                children
-                    .into_iter()
-                    .filter_map(|(child, chdir)| {
-                        // `chdir = TRUE` runs the child in its own directory.
-                        let proposal = if chdir {
-                            Some(None)
-                        } else {
-                            wd.clone().map(Some)
-                        };
-                        proposal.map(|proposal| (child, proposal))
-                    })
-                    .collect::<std::collections::BTreeSet<_>>()
-            };
-            let before = proposals(
+            // Children that inherit through this parent's `source()` calls.
+            let before = forward_child_proposals(
                 forward_children_before,
-                effective_wd(projection.old_metadata.as_deref()),
+                projection.old_metadata.as_deref(),
             );
-            let after = proposals(
+            let after = forward_child_proposals(
                 forward_children(&self.cross_file_graph, &projection.uri),
-                effective_wd(Some(projection.new_metadata.as_ref())),
+                Some(projection.new_metadata.as_ref()),
             );
             let mut refresh = backward_affected.clone();
             // The commit's own derivation ran before its new
@@ -10986,6 +10960,7 @@ impl WorldState {
             removal_affected
         };
         let mut post_fanout = Vec::new();
+        let mut wd_refresh = Vec::new();
         let mut graph_changed = false;
         // Pending/Complete upserts hydrate prerequisites before their caller's
         // graph exists. Only observed disk mutations can retire their ownership.
@@ -11004,6 +10979,14 @@ impl WorldState {
                         .get_artifacts(&prepared.uri)
                         .map(|artifacts| artifacts.interface_hash);
                     let new_interface = Some(prepared.entry.artifacts.interface_hash);
+                    // A closed parent has no open commit to re-derive the
+                    // open children its `source()` calls pass a directory
+                    // to, so queue those whose proposal changes here.
+                    let proposals_before = forward_child_proposals(
+                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        self.workspace_index.get_metadata(&prepared.uri).as_deref(),
+                    );
+                    let new_metadata = prepared.entry.metadata.clone();
                     let reserve_fanout = reserve_closed_fanout
                         && matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
                     let report_unmarked_fanout = !reserve_closed_fanout
@@ -11062,6 +11045,15 @@ impl WorldState {
                         prepared.snapshot,
                         prepared.content,
                     );
+                    let proposals_after = forward_child_proposals(
+                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        Some(new_metadata.as_ref()),
+                    );
+                    wd_refresh.extend(
+                        proposals_before
+                            .symmetric_difference(&proposals_after)
+                            .map(|(child, _)| child.clone()),
+                    );
                     self.cross_file_meta.invalidate_many(&prepared.wd_children);
                     if reserve_fanout || report_unmarked_fanout {
                         let wd_open = prepared.wd_children.iter().filter_map(|child| {
@@ -11082,6 +11074,15 @@ impl WorldState {
                     graph_changed |= edges_changed;
                 }
                 PreparedClosedMutation::Remove { basis: _, uri } => {
+                    // A deleted parent stops proposing to its open children.
+                    wd_refresh.extend(
+                        forward_child_proposals(
+                            forward_children(&self.cross_file_graph, &uri),
+                            self.workspace_index.get_metadata(&uri).as_deref(),
+                        )
+                        .into_iter()
+                        .map(|(child, _)| child),
+                    );
                     self.workspace_index.invalidate(&uri);
                     self.cross_file_graph.remove_file(&uri);
                     self.cross_file_file_cache.invalidate(&uri);
@@ -11106,6 +11107,7 @@ impl WorldState {
                 }
             }
         }
+        self.queue_open_wd_refresh_through_closed(wd_refresh);
         if !targets.is_empty() {
             self.advance_workspace_scan_generation();
         }
@@ -12577,6 +12579,45 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
         .collect()
 }
 
+/// What a parent proposes to each of its `forward_children`, given its
+/// metadata: the directory it runs them in, or `None` for a `chdir = TRUE`
+/// call, which runs the child in its own directory. A parent that proposes
+/// nothing (no `cd` in effect, no `chdir = TRUE`) gives an empty set.
+///
+/// A commit re-derives the open children whose proposal changed between the
+/// parent's old and new sets, whether because the directory it runs them in
+/// changed or because it started or stopped sourcing them.
+///
+/// For a closed parent the old set comes from its index entry, which may hold
+/// a directory a forward parent passed on in the last workspace derivation,
+/// while the new set comes from disk metadata, whose inherited directory
+/// comes only from its backward directives. Such a parent can then queue a
+/// refresh that changes nothing, or miss one; that is the documented limit of
+/// a closed intermediate file keeping its old directory until it is
+/// re-indexed.
+fn forward_child_proposals(
+    children: Vec<(Url, bool)>,
+    metadata: Option<&crate::cross_file::CrossFileMetadata>,
+) -> std::collections::BTreeSet<(Url, Option<String>)> {
+    let wd = metadata.and_then(|metadata| {
+        metadata
+            .working_directory
+            .clone()
+            .or_else(|| metadata.inherited_working_directory.clone())
+    });
+    children
+        .into_iter()
+        .filter_map(|(child, chdir)| {
+            let proposal = if chdir {
+                Some(None)
+            } else {
+                wd.clone().map(Some)
+            };
+            proposal.map(|proposal| (child, proposal))
+        })
+        .collect()
+}
+
 /// The files `uri` names in `# raven: sourced-by` directives, per the graph.
 fn backward_directive_parents(
     graph: &crate::cross_file::DependencyGraph,
@@ -12817,6 +12858,12 @@ fn settle_inherited_wd_rounds<K: Ord>(
 /// The directories `parent` proposes to the files it sources, resolving
 /// each call under `parent_metadata`'s directory: `(child, directory)` for
 /// every call that resolves and proposes one (see [`forward_wd_proposals`]).
+///
+/// A call proposes a directory only under `chdir = TRUE` or a `cd` in effect
+/// ([`PathContext::forward_child_inherited_wd`](crate::cross_file::path_resolve::PathContext::forward_child_inherited_wd)),
+/// so any other call is skipped before its path is resolved: resolution
+/// touches the filesystem, and the open-buffer derivation calls this for
+/// every ancestor under the `WorldState` write lock on each edit.
 fn parent_wd_proposals(
     parent_uri: &Url,
     parent_metadata: &crate::cross_file::CrossFileMetadata,
@@ -12829,15 +12876,19 @@ fn parent_wd_proposals(
     ) else {
         return Vec::new();
     };
+    let cd_in_effect = path_context.cd_in_effect();
     parent_metadata
         .sources
         .iter()
+        .filter(|source| source.chdir || cd_in_effect)
         .filter_map(|source| {
             let resolved = source
                 .resolved_uri
                 .as_ref()
                 .and_then(|uri| uri.to_file_path().ok())
                 .or_else(|| {
+                    #[cfg(test)]
+                    PARENT_WD_PROPOSAL_RESOLUTIONS.with(|count| count.set(count.get() + 1));
                     crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                         &source.path,
                         &path_context,
@@ -12848,6 +12899,139 @@ fn parent_wd_proposals(
             Some((child_uri, inherited.to_string_lossy().to_string()))
         })
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many `source()` paths [`parent_wd_proposals`] resolved on this
+    /// thread.
+    static PARENT_WD_PROPOSAL_RESOLUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The workspace derivation's source-batch expansions, per file and the
+/// directory it runs in.
+///
+/// A `list.files()` or `tar_source()` batch lists a directory relative to
+/// where its caller runs, so a settle round that changes a parent's
+/// directory changes the files its batch reaches. A file's incoming members
+/// were expanded under whatever directory it had before, so the rounds
+/// propose through the members [`Self::for_round`] expands under the round's
+/// directory instead: a file only the old batch listed gets no proposal, and
+/// one only the new batch lists does. The final stage installs the same
+/// expansion ([`Self::install_settled`]), so proposals and graph edges come
+/// from one filesystem observation of each directory.
+///
+/// A parent with no `cd` in effect and no `change_directory = TRUE` batch
+/// proposes nothing through its members, so it keeps its incoming ones and
+/// lists nothing here. Expansion touches the filesystem, so this belongs to
+/// the off-lock workspace derivation only; the open-buffer derivation
+/// ([`enrich_open_metadata_with_inherited_wd`]) runs under the `WorldState`
+/// write lock and keeps each ancestor's stored members.
+struct RoundSourceBatches<'a> {
+    workspace_root: Option<&'a Url>,
+    exclusions: &'a crate::config_file::CompiledWorkspaceExclusions,
+    /// What each file's incoming members were expanded under, by whether the
+    /// file is an open overlay.
+    previous_closed: &'a HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    previous_open: &'a HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    /// Open overlays' incoming members are never reused.
+    refresh_open: bool,
+    /// Keyed by whether the file is open, its URI, and its directory.
+    expanded: std::cell::RefCell<HashMap<RoundBatchKey, Arc<crate::cross_file::CrossFileMetadata>>>,
+}
+
+type RoundBatchKey = (bool, Url, Option<String>);
+
+impl RoundSourceBatches<'_> {
+    /// `metadata` (a round's value for `uri`) with its batch members expanded
+    /// under its directory for the round.
+    fn for_round(
+        &self,
+        open: bool,
+        uri: &Url,
+        metadata: &Arc<crate::cross_file::CrossFileMetadata>,
+    ) -> Arc<crate::cross_file::CrossFileMetadata> {
+        if metadata.tar_source_requests.is_empty() && metadata.list_files_source_requests.is_empty()
+        {
+            return metadata.clone();
+        }
+        let proposes = crate::cross_file::path_resolve::PathContext::from_metadata(
+            uri,
+            metadata,
+            self.workspace_root,
+        )
+        .is_some_and(|context| context.cd_in_effect())
+            || metadata
+                .tar_source_requests
+                .iter()
+                .any(|request| request.change_directory);
+        if !proposes {
+            return metadata.clone();
+        }
+        // Within one derivation a file's metadata varies only in the
+        // directory it inherits.
+        let key = (
+            open,
+            uri.clone(),
+            metadata.inherited_working_directory.clone(),
+        );
+        self.expanded
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                let mut expanded = (**metadata).clone();
+                let previous = if open {
+                    self.previous_open.get(uri).filter(|_| !self.refresh_open)
+                } else {
+                    self.previous_closed.get(uri)
+                };
+                let reused = previous.is_some_and(|previous| {
+                    crate::cross_file::tar_source::reuse_tar_source_expansion(
+                        &mut expanded,
+                        previous,
+                        uri,
+                        self.workspace_root,
+                        self.exclusions,
+                    )
+                });
+                if !reused {
+                    crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+                        &mut expanded,
+                        uri,
+                        self.workspace_root,
+                        self.exclusions,
+                    );
+                }
+                Arc::new(expanded)
+            })
+            .clone()
+    }
+
+    /// Install into `metadata` (a file's settled value) the expansion a round
+    /// made under its settled directory, if one did. Returns whether it did.
+    fn install_settled(
+        &self,
+        open: bool,
+        uri: &Url,
+        metadata: &mut crate::cross_file::CrossFileMetadata,
+    ) -> bool {
+        let key = (
+            open,
+            uri.clone(),
+            metadata.inherited_working_directory.clone(),
+        );
+        let Some(expanded) = self.expanded.borrow().get(&key).cloned() else {
+            return false;
+        };
+        crate::cross_file::tar_source::reuse_tar_source_expansion(
+            metadata,
+            &expanded,
+            uri,
+            self.workspace_root,
+            self.exclusions,
+        )
+    }
 }
 
 /// Forward working-directory proposals for files with no directory of their
@@ -12907,6 +13091,7 @@ fn derive_closed_descendant_metadata(
     workspace_root: Option<&Url>,
     max_depth: usize,
     unstable: &HashSet<Url>,
+    batches: &RoundSourceBatches<'_>,
 ) -> bool {
     let mut closed_uris: Vec<_> = base_closed_metadata.keys().cloned().collect();
     closed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -12935,11 +13120,11 @@ fn derive_closed_descendant_metadata(
     let parents: Vec<_> = entries
         .iter()
         .filter(|(uri, _)| !open_metadata.contains_key(*uri))
-        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .map(|(uri, entry)| (uri.clone(), batches.for_round(false, uri, &entry.metadata)))
         .chain(
             open_metadata
                 .iter()
-                .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
+                .map(|(uri, metadata)| (uri.clone(), batches.for_round(true, uri, metadata))),
         )
         .collect();
     for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root, unstable) {
@@ -12977,6 +13162,7 @@ fn derive_open_candidate_metadata(
     workspace_root: Option<&Url>,
     max_depth: usize,
     unstable: &HashSet<Url>,
+    batches: &RoundSourceBatches<'_>,
 ) -> (
     HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     bool,
@@ -13008,14 +13194,14 @@ fn derive_open_candidate_metadata(
     let parents: Vec<_> = closed_metadata
         .iter()
         .filter(|(uri, _)| !current_open_metadata.contains_key(*uri))
-        .map(|(uri, metadata)| (uri.clone(), metadata.clone()))
+        .map(|(uri, metadata)| (uri.clone(), batches.for_round(false, uri, metadata)))
         // Open parents as of the previous round, like closed ones in
         // `derive_closed_descendant_metadata`: `next` has not received this
         // round's forward directories yet.
         .chain(
             current_open_metadata
                 .iter()
-                .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
+                .map(|(uri, metadata)| (uri.clone(), batches.for_round(true, uri, metadata))),
         )
         .collect();
     for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root, unstable) {
@@ -13170,6 +13356,14 @@ pub(crate) fn derive_workspace_dependency_graph(
                 }))
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
+    let batches = RoundSourceBatches {
+        workspace_root,
+        exclusions: &context.exclusions,
+        previous_closed: &previous_closed_metadata,
+        previous_open: &previous_open_metadata,
+        refresh_open: refresh_open_source_batches,
+        expanded: Default::default(),
+    };
     let initial = wd_state(entries, &open_metadata);
     settle_inherited_wd_rounds(
         context.max_depth,
@@ -13193,6 +13387,7 @@ pub(crate) fn derive_workspace_dependency_graph(
                 workspace_root,
                 context.max_depth,
                 unstable,
+                &batches,
             );
             let (next_open_metadata, open_changed) = derive_open_candidate_metadata(
                 &base_open_metadata,
@@ -13201,6 +13396,7 @@ pub(crate) fn derive_workspace_dependency_graph(
                 workspace_root,
                 context.max_depth,
                 unstable,
+                &batches,
             );
             open_metadata = next_open_metadata;
             (closed_changed || open_changed).then(|| wd_state(entries, &open_metadata))
@@ -13209,21 +13405,24 @@ pub(crate) fn derive_workspace_dependency_graph(
     );
 
     // Source-batch expansion is the final metadata derivation stage: inherited
-    // WD and system.file resolution are already stable. A scan entry or open
-    // overlay normally arrives with an expansion from the same candidate.
-    // Reuse it when the effective path context is unchanged so one candidate
-    // observes each directory only once.
+    // WD and system.file resolution are already stable. A file's batch takes
+    // the expansion a settle round made under its settled directory, if one
+    // did (`RoundSourceBatches`); otherwise a scan entry or open overlay
+    // normally arrives with an expansion from the same candidate. Reuse it
+    // when the effective path context is unchanged so one candidate observes
+    // each directory only once.
     for (uri, entry) in entries.iter_mut() {
         let metadata = Arc::make_mut(&mut entry.metadata);
-        let reused = previous_closed_metadata.get(uri).is_some_and(|previous| {
-            crate::cross_file::tar_source::reuse_tar_source_expansion(
-                metadata,
-                previous,
-                uri,
-                workspace_root,
-                &context.exclusions,
-            )
-        });
+        let reused = batches.install_settled(false, uri, metadata)
+            || previous_closed_metadata.get(uri).is_some_and(|previous| {
+                crate::cross_file::tar_source::reuse_tar_source_expansion(
+                    metadata,
+                    previous,
+                    uri,
+                    workspace_root,
+                    &context.exclusions,
+                )
+            });
         if !reused {
             let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 metadata,
@@ -13262,16 +13461,17 @@ pub(crate) fn derive_workspace_dependency_graph(
     }
     for (uri, metadata) in &mut open_metadata {
         let metadata = Arc::make_mut(metadata);
-        let reused = !refresh_open_source_batches
-            && previous_open_metadata.get(uri).is_some_and(|previous| {
-                crate::cross_file::tar_source::reuse_tar_source_expansion(
-                    metadata,
-                    previous,
-                    uri,
-                    workspace_root,
-                    &context.exclusions,
-                )
-            });
+        let reused = batches.install_settled(true, uri, metadata)
+            || !refresh_open_source_batches
+                && previous_open_metadata.get(uri).is_some_and(|previous| {
+                    crate::cross_file::tar_source::reuse_tar_source_expansion(
+                        metadata,
+                        previous,
+                        uri,
+                        workspace_root,
+                        &context.exclusions,
+                    )
+                });
         if !reused {
             let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 metadata,
@@ -16387,6 +16587,115 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 );
             }
         }
+    }
+
+    /// A `list.files()` batch lists its directory relative to where its
+    /// caller runs. `child.R` inherits `wd` from `main.R`, so its batch
+    /// reaches `wd/members/new.R`, not the `scripts/members/old.R` the scan
+    /// listed next to it, and only the file the batch reaches inherits `wd`.
+    #[test]
+    fn a_list_files_batch_proposes_only_to_members_under_the_inherited_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["wd/members", "scripts/members"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(
+            root.join("main.R"),
+            "# raven: cd wd\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("scripts/child.R"),
+            "for (f in list.files(\"members\", pattern = \"[.]R$\", full.names = TRUE)) source(f)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("scripts/members/old.R"),
+            "source(\"local.R\")\nprint(loc)\n",
+        )
+        .unwrap();
+        fs::write(root.join("scripts/members/local.R"), "loc <- 1\n").unwrap();
+        fs::write(root.join("wd/members/new.R"), "n <- 1\n").unwrap();
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+        let context = WorkspaceGraphDerivationContext {
+            reuse_unchanged_artifacts: true,
+            workspace_root: Some(root_uri),
+            max_depth: 20,
+            exclusions: Default::default(),
+            system_file_workspace_name: None,
+            system_file_workspace_root: None,
+            system_file_library_paths: Vec::new(),
+        };
+        let (graph, _) =
+            derive_workspace_dependency_graph(&mut entries, None, &[], &context, false);
+        let uri = |file: &str| Url::from_file_path(root.join(file)).unwrap();
+        let wd = root.join("wd").to_string_lossy().into_owned();
+        assert_eq!(
+            entries[&uri("scripts/child.R")]
+                .metadata
+                .inherited_working_directory,
+            Some(wd.clone())
+        );
+        let members: Vec<_> = graph
+            .get_dependencies(&uri("scripts/child.R"))
+            .iter()
+            .map(|edge| edge.to.clone())
+            .collect();
+        assert_eq!(members, vec![uri("wd/members/new.R")]);
+        assert_eq!(
+            entries[&uri("wd/members/new.R")]
+                .metadata
+                .inherited_working_directory,
+            Some(wd),
+            "the batch's actual member runs in wd"
+        );
+        assert_eq!(
+            entries[&uri("scripts/members/old.R")]
+                .metadata
+                .inherited_working_directory,
+            None,
+            "nothing sources old.R once the batch lists wd/members"
+        );
+    }
+
+    /// A parent with no `cd` in effect proposes a directory only through its
+    /// `chdir = TRUE` calls, so it resolves only those: the open-buffer
+    /// derivation runs this for every ancestor under the write lock.
+    #[test]
+    fn a_parent_without_cd_resolves_only_its_chdir_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        for file in ["a.R", "b.R", "c.R", "lib/d.R"] {
+            fs::write(root.join(file), "x <- 1\n").unwrap();
+        }
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let parent_uri = Url::from_file_path(root.join("main.R")).unwrap();
+        let resolutions = |content: &str| {
+            let metadata = crate::cross_file::extract_metadata(content);
+            PARENT_WD_PROPOSAL_RESOLUTIONS.with(|count| count.set(0));
+            let proposals = parent_wd_proposals(&parent_uri, &metadata, Some(&root_uri));
+            (
+                proposals,
+                PARENT_WD_PROPOSAL_RESOLUTIONS.with(std::cell::Cell::get),
+            )
+        };
+        let plain = "source(\"a.R\")\nsource(\"b.R\")\nsource(\"c.R\")\n";
+        let (proposals, resolved) =
+            resolutions(&format!("{plain}source(\"lib/d.R\", chdir = TRUE)\n"));
+        assert_eq!(
+            proposals,
+            vec![(
+                Url::from_file_path(root.join("lib/d.R")).unwrap(),
+                root.join("lib").to_string_lossy().into_owned()
+            )]
+        );
+        assert_eq!(resolved, 1, "only the chdir call is resolved");
+        let (proposals, resolved) = resolutions(&format!("# raven: cd lib\n{plain}"));
+        assert_eq!(proposals.len(), 3, "every call proposes lib/ under the cd");
+        assert_eq!(resolved, 3, "under a cd every call is resolved");
     }
 
     /// A `# raven: self-contained` file is isolated from its callers: a
