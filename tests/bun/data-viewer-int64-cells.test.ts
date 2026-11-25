@@ -18,6 +18,7 @@ import { computeProfile } from '../../editors/vscode/src/data-viewer/profile-eng
 import { computePermutation } from '../../editors/vscode/src/data-viewer/sort';
 import { render_tsv } from '../../editors/vscode/src/data-viewer/tsv';
 import { encodeInt64, type Cell } from '../../editors/vscode/src/data-viewer/wire-format';
+import { WorkerEngine } from '../../editors/vscode/src/data-viewer/worker-engine';
 import { profileStatLines } from '../../editors/vscode/src/data-viewer/webview/summary-model';
 import { describeSelection, formatStat, summarizeSelection } from '../../editors/vscode/src/data-viewer/webview/workflow-model';
 import { writeArrowFixture } from './_helpers/arrow-fixture-writer';
@@ -191,4 +192,38 @@ describe('a column summary shows the exact smallest and largest integer64', () =
         expect(out.rows.map(row => row[0])).toEqual([-3, -2, -1]);
         await r.close();
     });
+});
+
+// The extension reads through worker threads (`WorkerEngine`): the cells
+// and count keys cross a thread boundary on the way to the host.
+describe('through the reader thread and the scan worker', () => {
+    const THREADS = join(import.meta.dir, '../../editors/vscode/src/data-viewer/threads');
+
+    test('cells, a sorted window, the summary extremes and value counts arrive exact', async () => {
+        const engine = await WorkerEngine.start({
+            filePath: PATH, nrow: N,
+            readerScript: join(THREADS, 'reader-thread.ts'), scanScript: join(THREADS, 'scan-worker.ts'),
+        });
+        try {
+            const signal = new AbortController().signal;
+            const natural = await engine.getRows({ start: 0, end: 8, columns: [0], viewportGeneration: 1 }, 0);
+            expect(natural.rows.map(row => row[0])).toEqual(HEAD_CELLS);
+
+            const { min, max } = await engine.profile(2, signal);
+            expect([min, max]).toEqual([big('9007199254740993'), big('9007199254740995')]);
+
+            const counts = await engine.valueCounts(2, 'desc', 5, signal);
+            expect(counts.entries).toEqual([
+                { value: '9007199254740993', count: N / 2, error: 0 },
+                { value: '9007199254740995', count: N / 2, error: 0 },
+            ]);
+
+            const t = await engine.compute({ sort: { keys: [{ columnIndex: 0, direction: 'desc' }], labelsOnWhenSorted: true } });
+            expect(await engine.coordinator.install(t)).toBe(true);
+            const sorted = await engine.getRows({ start: 0, end: 2, columns: [0], viewportGeneration: 2 }, t.gen);
+            expect(sorted.rows.map(row => row[0])).toEqual([big('9223372036854775807'), big('4611686018427390975')]);
+        } finally {
+            await engine.dispose();
+        }
+    }, 60_000);
 });

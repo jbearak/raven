@@ -55,8 +55,9 @@ describe('a bound typed in the filter popover on an integer64 column', () => {
             initial={{ id: 'f', columnIndex: 0, predicate: { kind: 'numCompare', op: '<', value: 3 }, enabled: true, includeMissing: false }}
             onApply={e => { applied.push(e); }} onCancel={() => {}} />);
         const input = numberInput();
-        // The number input keeps the typed spelling (jsdom sanitizes its
-        // value as the HTML standard says; so does Chromium).
+        // The number input keeps the typed spelling: jsdom sanitizes its
+        // value by the HTML standard's rule for number inputs. A real
+        // Chromium input isn't exercised here.
         input.value = '9007199254740992.5';
         expect(input.value).toBe('9007199254740992.5');
         act(() => { reactProps(input).onChange({ target: input }); });
