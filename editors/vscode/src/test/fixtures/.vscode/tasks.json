@@ -1,0 +1,15 @@
+{
+    // Used by src/test/debugger-prelaunch.test.ts: a preLaunchTask that
+    // outlasts the 10 s a raven-r launch keeps its console for, and leaves
+    // a file behind so the test knows it ran to its end.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "raven-test: slow preLaunchTask",
+            "type": "shell",
+            "command": "sleep 14 && touch \"${workspaceFolder}/.raven-test-slow-task-done\"",
+            "presentation": { "reveal": "never", "focus": false },
+            "problemMatcher": []
+        }
+    ]
+}
