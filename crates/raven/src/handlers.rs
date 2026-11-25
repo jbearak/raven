@@ -9494,6 +9494,13 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
                 let key = (*usage_line, *usage_col);
                 let kept = scopes.entry(key).or_default();
+                if key == (0, 0) {
+                    // The undefined-variable collector reads the full scope
+                    // at the start of the file, so keep it: the position is
+                    // then resolved once.
+                    kept.full
+                        .get_or_insert_with(|| Box::new(snapshot.get_scope(uri, 0, 0, cancel)));
+                }
                 let packages = match &kept.full {
                     Some(scope) => ScopePackages::of(scope),
                     None => kept
@@ -67832,6 +67839,43 @@ source(\"provider.R\")
                 "'shape' is used before it's available (sourced on line 4)",
                 "shape is not defined"
             ]
+        );
+    }
+
+    /// The undefined-variable collector reads the full scope at the start of
+    /// the file. When the first collector resolves a use there, it keeps that
+    /// full scope, so the position is resolved once per pass.
+    #[test]
+    fn a_use_at_the_start_of_the_file_keeps_the_full_scope() {
+        let code = "shape(x) <- 2\nsource(\"provider.R\")\n";
+        let (mut state, uri) =
+            state_with(&[("a.R", code), ("provider.R", "shape <- function(x) x\n")]);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        let snapshot = super::DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        let mut diagnostics = Vec::new();
+        let mut scopes = std::collections::HashMap::new();
+        super::collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &uri,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut scopes,
+            &DiagCancelToken::never(),
+            None,
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            ["'shape' is used before it's available (sourced on line 2)"]
+        );
+        // The scope at the `source()` call and the one at the start of the file.
+        assert_eq!(
+            PassScopeCounts::of(&scopes),
+            PassScopeCounts { full: 2, at_use: 0 }
         );
     }
 
