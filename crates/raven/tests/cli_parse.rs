@@ -84,6 +84,50 @@ fn workspace_mode_prints_one_document_per_line_sorted_by_path() {
     assert_eq!(docs[2]["line_count"], 2);
 }
 
+/// A module the workspace admits only to resolve names (here an
+/// `import::from()` target outside the root, found through an inherited
+/// `# raven: cd`) isn't one of the workspace's files, so it isn't printed.
+#[test]
+fn workspace_mode_prints_only_the_workspace_files() {
+    let (tmp, ws) = workspace();
+    write(
+        &ws,
+        "main.R",
+        b"# raven: cd ../shared\nsource(\"../ws/child.R\")\n",
+    );
+    write(&ws, "child.R", b"import::from(\"x.R\", .all = TRUE)\n");
+    write(tmp.path(), "shared/x.R", b"secret <- function() 42\n");
+    let output = parse_in(&ws, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(paths(&documents(&output)), ["child.R", "main.R"]);
+}
+
+/// A directory that can't be listed hides files that should have been
+/// printed: the rest are still printed, and the run is an operator error.
+#[cfg(unix)]
+#[test]
+fn unlistable_directory_is_an_operator_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_tmp, ws) = workspace();
+    write(&ws, "top.R", b"x <- 1\n");
+    write(&ws, "locked/a.R", b"y <- 1\n");
+    let locked = ws.join("locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        // Running as root: permissions don't stop the listing.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let outputs = [parse_in(&ws, &["locked"]), parse_in(&ws, &[])];
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (output, printed) in outputs.iter().zip([&[][..], &["top.R"][..]]) {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(paths(&documents(output)), printed);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("raven parse: cannot read dir"), "{stderr}");
+    }
+}
+
 #[test]
 fn unreadable_files_get_error_documents_in_order_and_exit_3() {
     let (_tmp, ws) = workspace();

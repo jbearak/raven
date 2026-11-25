@@ -36,8 +36,7 @@ use crate::cli::check::{
 };
 use crate::cli::graph::{display_fs_path, display_path};
 use crate::cli::shared::{
-    EXIT_OK, EXIT_OPERATOR_ERROR, absolute_path, collect_r_file_paths_with_exclusions, is_r_file,
-    output_failed, stdout_writer,
+    EXIT_OK, EXIT_OPERATOR_ERROR, absolute_path, is_r_file, output_failed, stdout_writer,
 };
 
 pub use document::SCHEMA_VERSION;
@@ -118,7 +117,8 @@ Exit codes:
       printed in its place and every other document was still printed
   1   A usage error (unknown flag / bad option value)
   2   Operator error while running (config load failure, workspace not a
-      directory)
+      directory, a directory that can't be listed, output that couldn't be
+      written)
 ",
         env!("CARGO_PKG_VERSION")
     );
@@ -160,7 +160,7 @@ pub async fn run(args: ParseArgs) -> i32 {
     // scanned file's: a requested file resolves names through what its callers
     // attach.
     maybe_load_sysdata_fallback(&mut prepared.state).await;
-    let requests = requests(&args.files, &root, &prepared);
+    let (requests, unlisted) = requests(&args.files, &root, &prepared);
     let mut warm: Vec<PathBuf> = prepared.scan.discovered.clone();
     warm.extend(requests.iter().filter_map(|request| match &request.target {
         Target::RFile(path) => Some(path.clone()),
@@ -185,7 +185,10 @@ pub async fn run(args: ParseArgs) -> i32 {
         let line = serde_json::to_string(&document).expect("parse document serializes");
         (line, document.is_error())
     });
-    print_documents(stdout_writer(), documents)
+    let code = print_documents(stdout_writer(), documents);
+    // A directory that couldn't be listed hid files that should have been
+    // printed: an operator error, as in `raven lint`.
+    if unlisted { EXIT_OPERATOR_ERROR } else { code }
 }
 
 /// Writes each document's JSON line, with whether it is an error document,
@@ -233,37 +236,49 @@ fn printed_path(path: &Path, root: &Path) -> String {
     }
 }
 
-/// The requested files, in output order. With no FILES: every `.R`/`.r` file
-/// the workspace scan discovered, sorted by printed path. Otherwise each
-/// FILE in order; a directory stands for its R files (discovery walk, with
-/// exclusions), sorted by printed path.
-fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> Vec<Request> {
-    let r_files = |paths: Vec<PathBuf>| {
-        let mut found: Vec<Request> = paths
-            .into_iter()
-            .filter(|path| is_r_file(path))
-            .map(|path| Request {
-                path: printed_path(&path, root),
-                target: Target::RFile(path),
-            })
-            .collect();
-        found.sort_by(|a, b| a.path.cmp(&b.path));
-        found
+/// The requested files, in output order, and whether a directory walk
+/// couldn't list a directory (each failure is printed to stderr). With no
+/// FILES: the workspace root's R files, as for `raven parse .`. The scan's
+/// own file list isn't used: it also holds files admitted only to resolve
+/// names (an `import::from()` module outside the root), which aren't
+/// requested. Otherwise each FILE in order; a directory stands for its R files
+/// (discovery walk, with exclusions), sorted by printed path.
+fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> (Vec<Request>, bool) {
+    let workspace = [root.to_path_buf()];
+    let files = if files.is_empty() {
+        &workspace[..]
+    } else {
+        files
     };
-    if files.is_empty() {
-        return r_files(prepared.scan.discovered.clone());
-    }
     let mut out = Vec::new();
+    let mut unlisted = false;
     for file in files {
         let path = requested_path(file, root);
         if path.is_dir() {
             let mut walked = Vec::new();
-            collect_r_file_paths_with_exclusions(
+            let exclusions = prepared
+                .state
+                .workspace_exclusions
+                .for_discovery_directory(&path);
+            let errors = crate::state::collect_files_matching_for_discovery_with_errors(
                 &path,
                 &mut walked,
-                &prepared.state.workspace_exclusions,
+                is_r_file,
+                &exclusions,
             );
-            out.extend(r_files(walked));
+            for (dir, error) in errors {
+                eprintln!("raven parse: cannot read dir {}: {error}", dir.display());
+                unlisted = true;
+            }
+            let mut found: Vec<Request> = walked
+                .into_iter()
+                .map(|path| Request {
+                    path: printed_path(&path, root),
+                    target: Target::RFile(path),
+                })
+                .collect();
+            found.sort_by(|a, b| a.path.cmp(&b.path));
+            out.extend(found);
         } else {
             out.push(Request {
                 path: printed_path(&path, root),
@@ -275,7 +290,7 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> Vec
             });
         }
     }
-    out
+    (out, unlisted)
 }
 
 /// Where a FILE argument points. Relative FILES resolve against the workspace

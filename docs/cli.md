@@ -428,7 +428,7 @@ $ raven parse clean.R
 
 ### Parse options
 
-- `FILES`: the files to print, in the order given. Relative paths resolve against the workspace root, as `raven check`'s do. A directory stands for the R files under it, sorted by path, with `.gitignore` and `[workspace].exclude` applied. With no `FILES`, Raven prints every `.R` and `.r` file in the workspace, sorted by `path` in byte order.
+- `FILES`: the files to print, in the order given. Relative paths resolve against the workspace root, as `raven check`'s do. A directory stands for the R files under it, sorted by path, with `.gitignore` and `[workspace].exclude` applied. With no `FILES`, Raven prints every `.R` and `.r` file in the workspace, sorted by `path` in byte order, as `raven parse .` does. A file outside the workspace that Raven reads only to resolve names, such as an `import::from()` module, isn't printed unless you name it.
 - `--workspace DIR`, `--config PATH`, `--no-config`: as for [`raven graph`](#graph-options).
 - `--format json`: the default and, for now, the only format. Any other value is a usage error.
 
@@ -441,7 +441,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 - `0`: every requested file has a parsed document. A file with syntax errors still gets a full document.
 - `3`: at least one file couldn't be read or decoded. Its error document is printed in its place, and every other document is still printed.
 - `1`: a usage error, such as an unknown flag or a `--format` other than `json`.
-- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
+- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory, and then nothing is printed on stdout. Output that can't be written, such as to a full disk or to a stdout that isn't open for writing, is an operator error too, reported on stderr, after whatever documents were written. So is a directory that can't be listed, such as one without read permission: the files Raven could find are still printed, and the directory is named on stderr. A closed pipe, as in `raven parse | head -1`, only ends the output, and the exit code stays the same.
 
 <!-- example: parse-unreadable -->
 ```console
