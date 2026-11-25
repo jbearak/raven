@@ -10728,40 +10728,14 @@ impl WorldState {
                     &self.cross_file_graph,
                     &self.cross_file_meta,
                 );
-            // Children that inherit through this parent's `source()` calls:
-            // re-derive those whose proposal from it changed, whether because
-            // the directory it runs them in changed or because it started or
-            // stopped sourcing them. A parent that proposes nothing (no `cd`
-            // in effect, no `chdir = TRUE`) queues nothing.
-            let effective_wd = |metadata: Option<&crate::cross_file::CrossFileMetadata>| {
-                metadata.and_then(|metadata| {
-                    metadata
-                        .working_directory
-                        .clone()
-                        .or_else(|| metadata.inherited_working_directory.clone())
-                })
-            };
-            let proposals = |children: Vec<(Url, bool)>, wd: Option<String>| {
-                children
-                    .into_iter()
-                    .filter_map(|(child, chdir)| {
-                        // `chdir = TRUE` runs the child in its own directory.
-                        let proposal = if chdir {
-                            Some(None)
-                        } else {
-                            wd.clone().map(Some)
-                        };
-                        proposal.map(|proposal| (child, proposal))
-                    })
-                    .collect::<std::collections::BTreeSet<_>>()
-            };
-            let before = proposals(
+            // Children that inherit through this parent's `source()` calls.
+            let before = forward_child_proposals(
                 forward_children_before,
-                effective_wd(projection.old_metadata.as_deref()),
+                projection.old_metadata.as_deref(),
             );
-            let after = proposals(
+            let after = forward_child_proposals(
                 forward_children(&self.cross_file_graph, &projection.uri),
-                effective_wd(Some(projection.new_metadata.as_ref())),
+                Some(projection.new_metadata.as_ref()),
             );
             let mut refresh = backward_affected.clone();
             // The commit's own derivation ran before its new
@@ -10986,6 +10960,7 @@ impl WorldState {
             removal_affected
         };
         let mut post_fanout = Vec::new();
+        let mut wd_refresh = Vec::new();
         let mut graph_changed = false;
         // Pending/Complete upserts hydrate prerequisites before their caller's
         // graph exists. Only observed disk mutations can retire their ownership.
@@ -11004,6 +10979,14 @@ impl WorldState {
                         .get_artifacts(&prepared.uri)
                         .map(|artifacts| artifacts.interface_hash);
                     let new_interface = Some(prepared.entry.artifacts.interface_hash);
+                    // A closed parent has no open commit to re-derive the
+                    // open children its `source()` calls pass a directory
+                    // to, so queue those whose proposal changes here.
+                    let proposals_before = forward_child_proposals(
+                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        self.workspace_index.get_metadata(&prepared.uri).as_deref(),
+                    );
+                    let new_metadata = prepared.entry.metadata.clone();
                     let reserve_fanout = reserve_closed_fanout
                         && matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
                     let report_unmarked_fanout = !reserve_closed_fanout
@@ -11062,6 +11045,15 @@ impl WorldState {
                         prepared.snapshot,
                         prepared.content,
                     );
+                    let proposals_after = forward_child_proposals(
+                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        Some(new_metadata.as_ref()),
+                    );
+                    wd_refresh.extend(
+                        proposals_before
+                            .symmetric_difference(&proposals_after)
+                            .map(|(child, _)| child.clone()),
+                    );
                     self.cross_file_meta.invalidate_many(&prepared.wd_children);
                     if reserve_fanout || report_unmarked_fanout {
                         let wd_open = prepared.wd_children.iter().filter_map(|child| {
@@ -11106,6 +11098,7 @@ impl WorldState {
                 }
             }
         }
+        self.queue_open_wd_refresh_through_closed(wd_refresh);
         if !targets.is_empty() {
             self.advance_workspace_scan_generation();
         }
@@ -12574,6 +12567,37 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
         .into_iter()
         .filter(|edge| is_wd_lending_edge(edge))
         .map(|edge| (edge.to.clone(), edge.chdir))
+        .collect()
+}
+
+/// What a parent proposes to each of its `forward_children`, given its
+/// metadata: the directory it runs them in, or `None` for a `chdir = TRUE`
+/// call, which runs the child in its own directory. A parent that proposes
+/// nothing (no `cd` in effect, no `chdir = TRUE`) gives an empty set.
+///
+/// A commit re-derives the open children whose proposal changed between the
+/// parent's old and new sets, whether because the directory it runs them in
+/// changed or because it started or stopped sourcing them.
+fn forward_child_proposals(
+    children: Vec<(Url, bool)>,
+    metadata: Option<&crate::cross_file::CrossFileMetadata>,
+) -> std::collections::BTreeSet<(Url, Option<String>)> {
+    let wd = metadata.and_then(|metadata| {
+        metadata
+            .working_directory
+            .clone()
+            .or_else(|| metadata.inherited_working_directory.clone())
+    });
+    children
+        .into_iter()
+        .filter_map(|(child, chdir)| {
+            let proposal = if chdir {
+                Some(None)
+            } else {
+                wd.clone().map(Some)
+            };
+            proposal.map(|proposal| (child, proposal))
+        })
         .collect()
 }
 
