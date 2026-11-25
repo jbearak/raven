@@ -508,6 +508,38 @@ df$bc <- as.Date(c(-719893, -719528, -719162, NA), origin = "1970-01-01")`,
         { name: 'bc > year -1', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '>', value: '-000001-01-01' } }], rows: [2, 3] },
     ]);
 
+// A year past 9999 as the native pickers write it: unsigned, five or six
+// digits (issue #893). The rows are the first days of the years -1, 0 and
+// 999, then 9999-12-31, 10000-01-01, 10000-01-02, 100000-01-01 and NA:
+// `d` as dates, `t` at midnight UTC, `k` at midnight in Asia/Kolkata.
+edgeSuite('Copy as R code round trip: years as the date pickers write them (real R)',
+    `df <- data.frame(id = 1:8)
+days <- c(-719893, -719528, -354650, 2932896, 2932897, 2932898, 35804722, NA)
+df$d <- as.Date(days, origin = "1970-01-01")
+df$t <- as.POSIXct(days * 86400, origin = "1970-01-01", tz = "UTC")
+df$k <- as.POSIXct(days * 86400 - 19800, origin = "1970-01-01", tz = "Asia/Kolkata")`,
+    ['df', 'dtobj'],
+    [
+        { name: 'd = 10000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '10000-01-01' } }], rows: [5] },
+        { name: 'd = 100000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '100000-01-01' } }], rows: [7] },
+        { name: 'd between 10000 and 100000', filters: [{ ci: 1, p: { kind: 'dateBetween', lo: '10000-01-01', hi: '100000-01-01', inclusive: true } }], rows: [5, 6, 7] },
+        { name: 'd not between 10000 and 100000, or missing', filters: [{ ci: 1, p: { kind: 'dateNotBetween', lo: '10000-01-01', hi: '100000-01-01', inclusive: true }, includeMissing: true }], rows: [1, 2, 3, 4, 8] },
+        { name: 't = 10000-01-01 00:00', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '10000-01-01T00:00' } }], rows: [5] },
+        { name: 't = 100000-01-01 00:00', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '100000-01-01T00:00' } }], rows: [7] },
+        { name: 't > 10000-01-01 00:00', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '>', value: '10000-01-01T00:00' } }], rows: [6, 7] },
+        { name: 'k = 10000-01-01 00:00 in its zone', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '=', value: '10000-01-01T00:00' } }], rows: [5] },
+        { name: 'k = 100000-01-01 00:00 in its zone', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '=', value: '100000-01-01T00:00' } }], rows: [7] },
+        { name: 'k = 10000-01-01 with an offset', filters: [{ ci: 3, p: { kind: 'dateCompare', op: '=', value: '10000-01-01T01:00+06:30' } }], rows: [5] },
+        { name: 'k between 10000 and 100000 in its zone', filters: [{ ci: 3, p: { kind: 'dateBetween', lo: '10000-01-01T00:00', hi: '100000-01-01T00:00', inclusive: false } }], rows: [6] },
+        // Years the pickers write in four digits, and a signed one, as before.
+        { name: 'd = year -1', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '-000001-01-01' } }], rows: [1] },
+        { name: 'd = 0000-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '0000-01-01' } }], rows: [2] },
+        { name: 'd = 0999-01-01', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '=', value: '0999-01-01' } }], rows: [3] },
+        { name: 'd <= 9999-12-31', filters: [{ ci: 1, p: { kind: 'dateCompare', op: '<=', value: '9999-12-31' } }], rows: [1, 2, 3, 4] },
+        { name: 't = 0999-01-01 00:00', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '0999-01-01T00:00' } }], rows: [3] },
+        { name: 't = 9999-12-31 00:00', filters: [{ ci: 2, p: { kind: 'dateCompare', op: '=', value: '9999-12-31T00:00' } }], rows: [4] },
+    ]);
+
 // integer64: set values are decimal strings the double can't hold
 // (Value Counts counts on the bigint), so the code compares them as
 // integer64; comparisons and ranges compare the exact integers too, in
