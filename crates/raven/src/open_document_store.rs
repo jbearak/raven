@@ -60,6 +60,26 @@ impl OpenRecordToken {
         &self.uri
     }
 
+    /// Whether both tokens name a present record with the same LSP version
+    /// and revision, whatever its analysis generation or diagnostics
+    /// lifecycle. Background work replaces a record without changing either;
+    /// an edit changes the revision.
+    ///
+    /// This is not proof of the same document on its own: a close and reopen
+    /// at the same version starts again at revision zero. The caller must
+    /// first establish that no reopen happened, as
+    /// `WorldState::follow_open_close_target` does through the pending close
+    /// intent.
+    pub(crate) fn holds_same_document_as(&self, other: &Self) -> bool {
+        self.uri == other.uri
+            && matches!(
+                (&self.identity, &other.identity),
+                (Some((_, mine)), Some((_, theirs)))
+                    if mine.lsp_version == theirs.lsp_version
+                        && mine.revision == theirs.revision
+            )
+    }
+
     #[cfg(test)]
     pub(crate) fn absent_for_test(uri: Url) -> Self {
         Self {
