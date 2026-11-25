@@ -121,8 +121,24 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     # The one element a row label names; a label that names two (a real name
     # equal to a generated `a [[1]]`) gives NA, and Set Value refuses it.
+    # Only the elements the label could name are labelled: those with it as
+    # their name, and the position a generated label ends in (`[[3]]`, `[3]`,
+    # `a [2]`, `[2,1]`). Labelling every element of a long vector would
+    # allocate a string per element.
     find_child <- function(x, label) {
-        w <- which(child_labels(x, seq_len(xlen(x))) == label)
+        n <- xlen(x)
+        num <- function(p) {
+            m <- regmatches(label, regexec(p, label))[[1L]]
+            if (length(m)) suppressWarnings(as.numeric(m[-1L])) else NULL
+        }
+        rc <- num("^\\[([0-9]+),([0-9]+)\\]$")
+        d <- sattr(x, "dim")
+        cand <- c(num("\\[\\[([0-9]+)\\]\\]$"), num("\\[([0-9]+)\\]$"),
+                  if (length(rc) == 2L && length(d) == 2L && rc[[1L]] <= d[[1L]]) (rc[[2L]] - 1) * d[[1L]] + rc[[1L]])
+        nms <- sattr(x, "names")
+        if (!is.null(nms)) cand <- c(cand, which(nms == label))
+        cand <- unique(cand[!is.na(cand) & cand >= 1 & cand <= n & cand == floor(cand)])
+        w <- if (length(cand)) cand[child_labels(x, cand) == label] else cand
         if (length(w) == 1L) w else if (length(w)) NA_integer_ else NULL
     }
     bt <- function(n) if (identical(make.names(n), n)) n else paste0("`", gsub("`", "\\`", n), "`")
@@ -932,6 +948,17 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         if (isTRUE(as.logical(top))) {
             clear_step_flags()
+            # Back at top level, the last stop's frames have returned: let
+            # go of them, and of the values its Variables view registered,
+            # so what they hold can be collected. Only after a stop: Debug
+            # Console results from the prompt keep their references.
+            # (The last error's saved frames live on in `state$last_dump`.)
+            if (!is.null(state$browse_env)) {
+                state$frames <- list()
+                state$funs <- list()
+                state$browse_env <- NULL
+                env$reset_refs()
+            }
             if (!is.null(state$nl_saved)) {
                 if (isTRUE(getOption("browserNLdisabled"))) options(browserNLdisabled = state$nl_saved[[1L]])
                 state$nl_saved <- NULL
@@ -1291,15 +1318,22 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # handler, up to the innermost frame with source (as an exception stop
     # opens there). NULL for an error at top level, which leaves nothing to
     # inspect but the global environment.
+    # The handler's frame bounds the error's: the debugger's own frames can
+    # sit below the user's too (the source() wrapper, a rebinding pass), so
+    # those are skipped, not taken for the handler.
     error_dump <- function(cnd, msg) {
         top <- 0L
-        for (i in seq_len(sys.nframe())) {
-            if (identical(environment(sys.function(i)), here)) break
-            top <- i
+        for (i in rev(seq_len(sys.nframe()))) {
+            if (identical(sys.function(i), on_condition)) {
+                top <- i - 1L
+                break
+            }
         }
         k <- 0L
         for (i in rev(seq_len(top))) {
-            if (!is.null(attr(sys.function(i), "srcref"))) {
+            f <- sys.function(i)
+            if (identical(environment(f), here)) next
+            if (!is.null(attr(f, "srcref"))) {
                 k <- i
                 break
             }

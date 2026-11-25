@@ -2610,3 +2610,243 @@ fn ascii_sends_still_bind_breakpoints_outside_a_utf8_locale() {
     d.event("stopped", m);
     assert_eq!(d.stack()[0], ("f".to_string(), 3));
 }
+
+/// The value an evaluate in the Debug Console prints, at the top frame.
+fn repl_value(d: &mut Dap, expr: &str) -> String {
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let ev = d.req(
+        "evaluate",
+        json!({"expression": expr, "frameId": frame, "context": "repl"}),
+    );
+    ev["body"]["result"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn set_value_on_a_long_unnamed_vector_labels_only_that_element() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "lv <- function() {\n  x <- numeric(3e6)\n  browser()\n  cat('fir', 'st', x[1], '\\n')\n}",
+        None,
+    );
+    let m = d.mark();
+    c.send("lv()", None);
+    d.event("stopped", m);
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let sc = d.req("scopes", json!({"frameId": frame}));
+    let locals = d.req(
+        "variables",
+        json!({"variablesReference": sc["body"]["scopes"][0]["variablesReference"]}),
+    );
+    let x = locals["body"]["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "x")
+        .unwrap()
+        .clone();
+    let page = d.req(
+        "variables",
+        json!({"variablesReference": x["variablesReference"], "start": 0, "count": 100}),
+    );
+    assert_eq!(page["body"]["variables"][0]["name"], "[1]");
+    // Peak memory while setting one element: a label per element would be
+    // millions of strings (well over 100 MB); x itself is 24 MB.
+    let base: f64 = repl_value(&mut d, "cat(gc(reset = TRUE)[2, 2])") // Vcells used, MB
+        .trim()
+        .parse()
+        .unwrap();
+    let set = d.req(
+        "setVariable",
+        json!({"variablesReference": x["variablesReference"], "name": "[1]", "value": "42"}),
+    );
+    assert_eq!(set["success"], true, "{set}");
+    let peak: f64 = repl_value(&mut d, "g <- gc(); cat(g[2, ncol(g)])")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        peak - base < 40.0,
+        "setting one element peaked {} MB above {base} MB",
+        peak - base
+    );
+    // A label past the end names nothing.
+    let past = d.req(
+        "setVariable",
+        json!({"variablesReference": x["variablesReference"], "name": "[3000001]", "value": "1"}),
+    );
+    assert_eq!(past["success"], false, "{past}");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("fir st 42");
+}
+
+#[test]
+fn inspect_last_error_sees_frames_under_a_hooked_source() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let s = c.write_file(
+        "s.R",
+        "g <- function() {\n  1\n}\nh <- function(x) {\n  y <- x * 2\n  stop(\"boom \", y)\n}\nh(21)\n",
+    );
+    let mut d = Dap::connect(&c);
+    d.req("setExceptionBreakpoints", json!({"filters": []}));
+    // Armed in a function the script never calls: source() goes through
+    // the debugger's wrapper, and nothing stops.
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": s}, "breakpoints": [{"line": 2}]}),
+    );
+    d.req("configurationDone", json!({}));
+    let sub = UnixStream::connect(c.dir.join("i")).unwrap();
+    writeln!(&sub, "{}", json!({"v": 1, "id": 2, "op": "subscribe"})).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    c.type_line(&format!("source('{s}')"));
+    c.expect("boom 42");
+    c.expect("Inspect it: run Raven: Inspect Last Error");
+    let m = d.mark();
+    assert_eq!(c.ipc_status("inspect"), "ok");
+    let stop = d.event("stopped", m);
+    assert_eq!(stop["body"]["reason"], "exception");
+    assert_eq!(d.stack()[0], ("h".to_string(), 6));
+    assert_eq!(d.locals().get("y").map(String::as_str), Some("42"));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    drop(sub);
+}
+
+#[test]
+fn a_breakpoint_set_while_busy_binds_before_a_queued_source() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let a = c.write_file(
+        "analysis.R",
+        "u <- 1\nv <- u + 1\ncat('r', 'an', v, '\\n')\n",
+    );
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    // R stays busy until the test opens the gate.
+    let gate = c.dir.join("gate");
+    c.type_line(&format!(
+        "cat('bu', 'sy\\n'); while (!file.exists('{}')) Sys.sleep(0.05)",
+        gate.display()
+    ));
+    c.expect("bu sy");
+    // The session's first breakpoint, while R is busy...
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": a}, "breakpoints": [{"line": 2}]}),
+    );
+    // ... then Source File, queued behind the running code.
+    let m = d.mark();
+    c.send(&format!("source('{a}')"), None);
+    std::fs::write(&gate, "").unwrap();
+    let stop = d.event("stopped", m);
+    assert_eq!(stop["body"]["reason"], "breakpoint");
+    assert_eq!(d.stack()[0].1, 2);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("r an 2");
+}
+
+#[test]
+fn a_virtual_source_keeps_its_text_for_the_session() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "vs <- function() {\n  lapply(1, function(i) browser())\n  vapply(1, function(i) { browser(); 1 }, 1)\n}",
+        None,
+    );
+    let virtual_frame = |d: &mut Dap, name: &str| {
+        let st = d.req("stackTrace", json!({"threadId": 1}));
+        st["body"]["stackFrames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == name)
+            .and_then(|f| f["source"]["sourceReference"].as_i64())
+            .unwrap_or_else(|| panic!("no virtual source for {name}: {st}"))
+    };
+    let content = |d: &mut Dap, r: i64| {
+        d.req("source", json!({"sourceReference": r}))["body"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let m = d.mark();
+    c.send("vs()", None);
+    d.event("stopped", m);
+    let first = virtual_frame(&mut d, "lapply");
+    assert!(content(&mut d, first).starts_with("lapply <- function"));
+    // The next stop, in the same session, has another function without
+    // source on its stack.
+    let stop = d.step("continue");
+    assert_eq!(stop["body"]["reason"], "breakpoint", "{stop}");
+    let second = virtual_frame(&mut d, "vapply");
+    assert_ne!(first, second);
+    assert!(content(&mut d, second).starts_with("vapply <- function"));
+    // The first tab's reference still names lapply.
+    let again = content(&mut d, first);
+    assert!(
+        again.starts_with("lapply <- function"),
+        "reference {first} now names: {}",
+        again.lines().next().unwrap_or("")
+    );
+    // A client that attaches to a stop R already made (as VS Code does)
+    // still opens that stop's sources.
+    let mut d = Dap::open(&c.dir, true);
+    d.event("stopped", 0);
+    let attached = virtual_frame(&mut d, "vapply");
+    assert_eq!(attached, second);
+    assert!(content(&mut d, attached).starts_with("vapply <- function"));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}
+
+#[test]
+fn a_finished_stop_lets_go_of_its_frames() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "fin <- function(e) cat('frame', 'freed\\n')\nhold <- function() {\n  big <- numeric(10)\n  reg.finalizer(environment(), fin)\n  browser()\n  invisible(NULL)\n}",
+        None,
+    );
+    let m = d.mark();
+    c.send("hold()", None);
+    d.event("stopped", m);
+    // What the Variables view does: scopes, then the locals.
+    assert!(d.locals().contains_key("big"));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    std::thread::sleep(Duration::from_millis(300));
+    c.type_line("invisible(gc()); cat('coll', 'ected\\n')");
+    c.expect("coll ected");
+    assert!(
+        c.text().contains("frame freed"),
+        "the stopped frame outlived its stop:\n{}",
+        c.text()
+    );
+}
