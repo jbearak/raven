@@ -18,7 +18,7 @@ use tower_lsp::lsp_types::Url;
 use crate::cli::check::{
     PreparedWorkspace, WorkspaceSetup, prepare_workspace, resolve_workspace_root,
 };
-use crate::cli::shared::{EXIT_OK, EXIT_OPERATOR_ERROR};
+use crate::cli::shared::{EXIT_OK, EXIT_OPERATOR_ERROR, stdout_writer, write_output};
 use crate::cross_file::dependency::DependencyEdge;
 use crate::cross_file::dependency::DependencyEdgeKind;
 use crate::cross_file::dependency::export::TracedGraph;
@@ -108,9 +108,11 @@ Options:
                        contract (schema_version {SCHEMA_VERSION}); text may change.
 
 Exit codes:
-  0   The graph was printed (even with dropped call sites or complete: false)
+  0   The graph was printed (even with dropped call sites or complete: false),
+      or stdout was a pipe that closed early (`raven graph | head`)
   1   A usage error (unknown flag / bad option value)
-  2   Operator error while running (config load failure)
+  2   Operator error while running (config load failure, workspace not a
+      directory, output that couldn't be written)
 ",
         env!("CARGO_PKG_VERSION")
     );
@@ -125,17 +127,25 @@ pub async fn run(args: GraphArgs) -> i32 {
         }
     };
     match build_graph_report(&args, &cwd).await {
-        Ok(report) => {
-            match args.format {
-                GraphFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).expect("graph report serializes")
-                ),
-                GraphFormat::Text => print!("{}", render_text(&report)),
-            }
-            EXIT_OK
-        }
+        Ok(report) => write_output(
+            "raven graph",
+            stdout_writer(),
+            &render(&report, args.format),
+            EXIT_OK,
+        ),
         Err(code) => code,
+    }
+}
+
+/// The report as printed in `format`, ending in a newline.
+fn render(report: &GraphReport, format: GraphFormat) -> String {
+    match format {
+        GraphFormat::Json => {
+            let mut json = serde_json::to_string_pretty(report).expect("graph report serializes");
+            json.push('\n');
+            json
+        }
+        GraphFormat::Text => render_text(report),
     }
 }
 
@@ -394,6 +404,7 @@ fn reason_name(reason: DropReason) -> &'static str {
         DropReason::Unresolvable => "unresolvable",
         DropReason::SystemFileUnresolved => "system_file_unresolved",
         DropReason::Superseded => "superseded",
+        DropReason::Url => "url",
     }
 }
 
@@ -449,12 +460,77 @@ fn case_name(exists: bool, case_mismatch: Option<CaseMismatchRegime>) -> Option<
 /// An exact-case portability check for code that runs from the project root:
 /// `raw_path` has no leading `/`, and the resolved endpoint is exactly
 /// `ROOT/raw_path`, normalized, with the same case, and exists.
+///
+/// On Windows the root carries the verbatim prefix and `resolved` usually
+/// doesn't (see [`display_fs_path`]), so the two are also compared as
+/// [`windows_portable`] does.
 fn portable_from_root(raw_path: &str, resolved: &Path, exists: bool, root: &Path) -> bool {
     if !exists || raw_path.starts_with('/') || Path::new(raw_path).is_absolute() {
         return false;
     }
-    crate::cross_file::path_resolve::normalize_path_public(&root.join(raw_path))
-        .is_some_and(|expected| expected.as_os_str() == resolved.as_os_str())
+    let native = crate::cross_file::path_resolve::normalize_path_public(&root.join(raw_path))
+        .is_some_and(|expected| expected.as_os_str() == resolved.as_os_str());
+    native
+        || (cfg!(windows)
+            && windows_portable(
+                raw_path,
+                &resolved.to_string_lossy(),
+                &root.to_string_lossy(),
+            ))
+}
+
+/// Whether `path` is the root or under it. On Windows a path from a file URI
+/// lacks the canonical root's verbatim prefix, which `Path::starts_with`
+/// treats as a different prefix, so the two are also compared as
+/// [`windows_is_under`] does.
+fn is_under_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        || (cfg!(windows) && windows_is_under(&path.to_string_lossy(), &root.to_string_lossy()))
+}
+
+/// A Windows path's text as the parts to compare: the verbatim prefix dropped
+/// (see [`without_verbatim_prefix`]), split at `\` and `/`, with empty and
+/// `.` parts dropped and `..` dropping the part before it (never the drive or
+/// share). A drive letter is uppercased, as std reads it; every other part
+/// keeps its case. Works on the text so it is testable on every platform.
+fn windows_parts(path: &str) -> Vec<String> {
+    let plain = without_verbatim_prefix(path).unwrap_or_else(|| path.to_string());
+    let mut parts = Vec::new();
+    // A UNC path's server and share are its root, like a drive.
+    let mut fixed = 0;
+    if plain.starts_with(r"\\") || plain.starts_with("//") {
+        parts.push(r"\\".to_string());
+        fixed = 3;
+    }
+    for part in plain.split(['\\', '/']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.len() > fixed.max(1) {
+                    parts.pop();
+                }
+            }
+            _ if parts.is_empty() && part.len() == 2 && part.ends_with(':') => {
+                parts.push(part.to_ascii_uppercase());
+            }
+            _ => parts.push(part.to_string()),
+        }
+    }
+    parts
+}
+
+/// [`is_under_root`] for Windows path text, with or without the verbatim
+/// prefix on either side.
+fn windows_is_under(path: &str, root: &str) -> bool {
+    windows_parts(path).starts_with(&windows_parts(root))
+}
+
+/// [`portable_from_root`]'s comparison for Windows path text: `root\raw_path`,
+/// normalized, names exactly `resolved`, with or without the verbatim prefix
+/// on either side.
+fn windows_portable(raw_path: &str, resolved: &str, root: &str) -> bool {
+    !raw_path.starts_with(['\\', '/'])
+        && windows_parts(&format!(r"{root}\{raw_path}")) == windows_parts(resolved)
 }
 
 fn edge_row(
@@ -546,7 +622,7 @@ fn edge_row(
                 endpoint,
                 exists,
                 case: case_name(exists, *case_mismatch),
-                outside_root: !path.starts_with(root),
+                outside_root: !is_under_root(path, root),
                 working_directory: if backward {
                     None
                 } else {
@@ -565,7 +641,7 @@ fn edge_row(
                 endpoint,
                 exists,
                 case: case_name(exists, None),
-                outside_root: path.as_deref().is_none_or(|p| !p.starts_with(root)),
+                outside_root: path.as_deref().is_none_or(|p| !is_under_root(p, root)),
                 working_directory: None,
             })
         }
@@ -841,8 +917,8 @@ fn file_row(
     row
 }
 
-/// `complete` and the warnings. `complete` means every file the scan
-/// discovered has a stored plan.
+/// `complete` and the warnings. `complete` means the scan listed every
+/// directory it walked and every file it discovered has a stored plan.
 fn completeness(
     prepared: &PreparedWorkspace,
     traced: &TracedGraph<'_>,
@@ -895,7 +971,21 @@ fn completeness(
             list(&evicted)
         ));
     }
-    let complete = failed.is_empty() && evicted.is_empty();
+    let mut unlisted: Vec<String> = scan
+        .unlisted
+        .iter()
+        .map(|(dir, error)| format!("{} ({error})", display_fs_path(dir, root)))
+        .collect();
+    unlisted.sort();
+    unlisted.dedup();
+    if !unlisted.is_empty() {
+        warnings.push(format!(
+            "{} director(ies) couldn't be listed, so files under them may be missing: {}",
+            unlisted.len(),
+            list(&unlisted)
+        ));
+    }
+    let complete = failed.is_empty() && evicted.is_empty() && unlisted.is_empty();
 
     let mut no_full_text: Vec<String> = artifacts
         .keys()
@@ -1294,6 +1384,102 @@ mod tests {
         assert_eq!(report.edges.len(), 1);
     }
 
+    /// A directory the scan can't list hides its files from the graph, so the
+    /// graph is incomplete and says which directory.
+    #[cfg(unix)]
+    #[test]
+    fn unlistable_directory_is_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "a.R", "x <- 1\n");
+        write(tmp.path(), "locked/b.R", "y <- 1\n");
+        let locked = tmp.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions don't stop the listing.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let report = report(tmp.path(), true);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!report.complete);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("1 director(ies) couldn't be listed")
+                    && w.contains("locked (")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    /// A symlink whose target sits behind a directory that can't be searched,
+    /// and a directory that lists its names but can't be searched (mode 0444),
+    /// hide files from the graph too, so the graph is incomplete and names
+    /// them.
+    #[cfg(unix)]
+    #[test]
+    fn unsearchable_entries_are_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(tmp.path(), "a.R", "x <- 1\n");
+        write(tmp.path(), "searchless/sub/b.R", "y <- 1\n");
+        write(outside.path(), "vault/inner/c.R", "z <- 1\n");
+        std::os::unix::fs::symlink(outside.path().join("vault/inner"), tmp.path().join("link"))
+            .unwrap();
+        let vault = outside.path().join("vault");
+        let searchless = tmp.path().join("searchless");
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&searchless, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let blocked = std::fs::metadata(tmp.path().join("link")).is_err();
+        let report = blocked.then(|| report(tmp.path(), true));
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&searchless, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(report) = report else {
+            // Running as root: permissions don't stop the walk.
+            return;
+        };
+        assert!(!report.complete);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("2 director(ies) couldn't be listed")
+                    && w.contains("link (")
+                    && w.contains("searchless (")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    /// `source("https://...")` reads a URL, not a local file: no edge to a
+    /// missing `https:/...` file, but a dropped row that says why.
+    #[test]
+    fn url_source_call_is_dropped_not_an_edge() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "main.R",
+            "source(\"https://example.invalid/setup.R\")\nsource(\"a.R\")\n",
+        );
+        write(tmp.path(), "a.R", "x <- 1\n");
+        let report = report(tmp.path(), true);
+        let targets: Vec<_> = report.edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["a.R"]);
+        assert_eq!(report.dropped.len(), 1);
+        let dropped = &report.dropped[0];
+        assert_eq!(dropped.reason, "url");
+        assert_eq!(
+            dropped.raw_path.as_deref(),
+            Some("https://example.invalid/setup.R")
+        );
+        assert_eq!(dropped.target, None);
+        assert!(report.complete, "{:?}", report.warnings);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
     #[test]
     fn oversized_file_stays_complete() {
         let tmp = TempDir::new().unwrap();
@@ -1353,6 +1539,55 @@ mod tests {
         let report = report(tmp.path(), true);
         let paths: Vec<_> = report.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["a.R"]);
+    }
+
+    /// The containment and portability comparisons, on Windows path text,
+    /// run on every platform: a verbatim root (`\\?\C:\work`, as canonicalize
+    /// gives it) and a path from a file URI (`C:\work\...`) are the same tree.
+    #[test]
+    fn verbatim_root_contains_uri_paths_as_windows_text() {
+        let root = r"\\?\C:\work";
+        assert!(windows_is_under(r"C:\work\R\helper.R", root));
+        assert!(windows_is_under(r"c:\work\helper.R", root));
+        assert!(windows_is_under(r"C:\work", root));
+        assert!(windows_is_under(r"\\?\C:\work\helper.R", r"C:\work"));
+        assert!(!windows_is_under(r"C:\workshop\helper.R", root));
+        assert!(!windows_is_under(r"C:\shared\x.R", root));
+        assert!(!windows_is_under(r"D:\work\helper.R", root));
+        assert!(!windows_is_under(r"C:\Work\helper.R", root));
+        let unc_root = r"\\?\UNC\Server\share\work";
+        assert!(windows_is_under(r"\\server\share\work\a.R", unc_root));
+        assert!(!windows_is_under(r"\\server\other\work\a.R", unc_root));
+
+        assert!(windows_portable("R/helper.R", r"C:\work\R\helper.R", root));
+        assert!(windows_portable(r"R\helper.R", r"C:\work\R\helper.R", root));
+        assert!(windows_portable("./helper.R", r"C:\work\helper.R", root));
+        assert!(windows_portable(
+            "../work/helper.R",
+            r"C:\work\helper.R",
+            root
+        ));
+        assert!(!windows_portable("r/helper.R", r"C:\work\R\helper.R", root));
+        assert!(!windows_portable("helper.R", r"C:\work\R\helper.R", root));
+        assert!(!windows_portable(r"\helper.R", r"C:\work\helper.R", root));
+        assert!(!windows_portable("../shared/x.R", r"C:\work\x.R", root));
+    }
+
+    /// An ordinary in-workspace edge is inside the root and portable from it,
+    /// on every platform. On Windows the canonical root has the verbatim
+    /// prefix and the resolved path doesn't; the Windows CI job runs this
+    /// (it runs the `verbatim_root` tests).
+    #[test]
+    fn verbatim_root_in_workspace_edge_is_inside_and_portable() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "main.R", "source(\"R/helper.R\")\n");
+        write(tmp.path(), "R/helper.R", "h <- 1\n");
+        let report = report(tmp.path(), true);
+        let row = edge(&report, "main.R", "R/helper.R", 0);
+        let resolution = row.resolution.as_ref().unwrap();
+        assert!(resolution.exists);
+        assert!(!resolution.outside_root);
+        assert_eq!(row.portable_from_root, Some(true));
     }
 
     /// An oversized file has no stored text, so `syntax_errors` rereads it.

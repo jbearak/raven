@@ -45,9 +45,17 @@ pub(crate) fn directives_by_comment(
     // `# raven:` / `@lsp-` directives, as the analysis reads them.
     let scan = directive::scan_directives(text);
     let mut suppression_lines = std::collections::HashSet::new();
+    // `# raven:` / `@lsp-` block markers, by line, `true` for a start: the
+    // lint track pairs them with `# nolint start` / `end` as one family.
+    let mut raven_blocks = Vec::new();
     for scanned in &scan.directives {
-        if matches!(scanned.payload, DirectivePayload::Suppression(_)) {
+        if let DirectivePayload::Suppression(marker) = &scanned.payload {
             suppression_lines.insert(scanned.line as usize);
+            match marker.kind {
+                SuppressionKind::BlockStart => raven_blocks.push((scanned.line as usize, true)),
+                SuppressionKind::BlockEnd => raven_blocks.push((scanned.line as usize, false)),
+                _ => {}
+            }
         }
         let start = lines.line_start(scanned.line as usize) + scanned.hash;
         // A `#` the scan reads as a comment that the grammar puts inside a
@@ -57,8 +65,7 @@ pub(crate) fn directives_by_comment(
         }
     }
 
-    // lintr's `# nolint`: paired among themselves, as the lint track pairs
-    // them in a file without `# raven:` blocks.
+    // lintr's `# nolint`, paired as the lint track pairs block markers.
     let mut nolint = Vec::new();
     for comment in comments {
         if out.contains_key(&comment.start) {
@@ -76,7 +83,7 @@ pub(crate) fn directives_by_comment(
             nolint.push((comment.start, line, marker));
         }
     }
-    out.extend(builder.nolint(&nolint));
+    out.extend(builder.nolint(&nolint, &raven_blocks));
 
     // Directives Raven doesn't read where they stand, and unknown ones.
     for comment in comments {
@@ -355,28 +362,53 @@ impl Json<'_> {
         )
     }
 
-    /// lintr's markers, `(comment start, line, marker)` in source order,
-    /// with `start`/`end` paired as the lint track pairs them: a `start`
-    /// while a block is open, and an `end` with none open, do nothing; a
-    /// `start` nothing closes runs to the last line.
-    fn nolint(&self, markers: &[(usize, usize, LintrMarker)]) -> Vec<(usize, Value)> {
+    /// The directive objects for lintr's markers, `(comment start, line,
+    /// marker)` in source order. Block markers pair as the lint track
+    /// (`linting::nolint::Suppressions`) pairs them: in line order, one block
+    /// open at a time, a start inside an open block or an end with none open
+    /// doing nothing, any end closing the open block, and a start nothing
+    /// closes running to the last line, whether each is a `# nolint` marker or
+    /// a `# raven:` / `@lsp-` block marker (`raven_blocks`: line, and `true`
+    /// for a start).
+    fn nolint(
+        &self,
+        markers: &[(usize, usize, LintrMarker)],
+        raven_blocks: &[(usize, bool)],
+    ) -> Vec<(usize, Value)> {
         let last = self.lines.line_count() as usize;
-        let mut pairs: HashMap<usize, usize> = HashMap::new();
-        let mut open: Option<usize> = None;
-        let mut nested = Vec::new();
-        let mut unpaired_ends = Vec::new();
-        for (index, (_, _, marker)) in markers.iter().enumerate() {
+        // Every block marker in line order: `Some(index)` into `markers` for
+        // a `# nolint` one, `None` for a `# raven:` one.
+        let mut blocks: Vec<(usize, bool, Option<usize>)> = raven_blocks
+            .iter()
+            .map(|&(line, is_start)| (line, is_start, None))
+            .collect();
+        for (index, (_, line, marker)) in markers.iter().enumerate() {
             match marker {
-                LintrMarker::Start(_) if open.is_some() => nested.push(index),
-                LintrMarker::Start(_) => open = Some(index),
-                LintrMarker::End => match open.take() {
-                    Some(start) => {
-                        pairs.insert(start, index);
-                        pairs.insert(index, start);
-                    }
-                    None => unpaired_ends.push(index),
-                },
+                LintrMarker::Start(_) => blocks.push((*line, true, Some(index))),
+                LintrMarker::End => blocks.push((*line, false, Some(index))),
                 LintrMarker::Line(_) => {}
+            }
+        }
+        blocks.sort_by_key(|&(line, _, _)| line);
+        // A `# nolint` block marker's index, to the line of the marker it
+        // pairs with.
+        let mut paired_lines: HashMap<usize, usize> = HashMap::new();
+        let mut open: Option<(usize, Option<usize>)> = None;
+        let mut nested = Vec::new();
+        for &(line, is_start, index) in &blocks {
+            match (is_start, open) {
+                (true, Some(_)) => nested.extend(index),
+                (true, None) => open = Some((line, index)),
+                (false, Some((start_line, start_index))) => {
+                    open = None;
+                    if let Some(start_index) = start_index {
+                        paired_lines.insert(start_index, line);
+                    }
+                    if let Some(index) = index {
+                        paired_lines.insert(index, start_line);
+                    }
+                }
+                (false, None) => {}
             }
         }
         markers
@@ -384,7 +416,7 @@ impl Json<'_> {
             .enumerate()
             .map(|(index, (start, line, marker))| {
                 let line = *line;
-                let paired_line = pairs.get(&index).map(|&other| markers[other].1);
+                let paired_line = paired_lines.get(&index).copied();
                 let (scope, what, target, honored, reason) = match marker {
                     LintrMarker::Line(what) => {
                         ("line", what.clone(), self.line_range(line), true, None)

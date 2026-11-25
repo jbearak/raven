@@ -709,7 +709,9 @@ s <- t
             "nolint",
             "end",
             none.clone(),
-            lines(23, 25, line_end(25))
+            // The open `# raven: expect-start` block (line 19) is the one it
+            // closes, as in the lint track.
+            lines(19, 25, line_end(25))
         )
     );
     assert_eq!(
@@ -725,19 +727,40 @@ s <- t
             Value::Null
         )
     );
+    // Inside the open `# raven: expect-start` block, so the lint track
+    // ignores it.
     assert_eq!(
         directive(&all, "# nolint start"),
         &suppression(
             "nolint",
             "nolint",
-            true,
-            Value::Null,
+            false,
+            json!("nested"),
             "nolint",
             "start",
             json!([]),
-            lines(23, 25, line_end(25))
+            Value::Null
         )
     );
+}
+
+/// The lint track pairs `# nolint` and `# raven:` block markers as one family:
+/// a `# raven: ignore-end` closes an open `# nolint start`, and a `# nolint
+/// end` closes an open `# raven: ignore-start`. `raven lint` suppresses lines
+/// 0 to 2 here, not to the end of the file.
+#[test]
+fn nolint_blocks_pair_with_raven_block_markers() {
+    let all = directives("# nolint start\nx<-1\n# raven: ignore-end\ny<-2\nz<-3\n");
+    let start = directive(&all, "# nolint start");
+    assert_eq!(start["honored"], true);
+    assert_eq!(start["reason"], Value::Null);
+    assert_eq!(start["target"], lines(0, 2, 19));
+
+    let all = directives("# raven: ignore-start\nx<-1\n# nolint end\ny<-2\n");
+    let end = directive(&all, "# nolint end");
+    assert_eq!(end["honored"], true);
+    assert_eq!(end["reason"], Value::Null);
+    assert_eq!(end["target"], lines(0, 2, 12));
 }
 
 #[test]
