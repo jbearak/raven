@@ -40233,6 +40233,98 @@ mod project_config_initialize_tests {
         );
     }
 
+    /// One watched notification changes a closed parent and the closed
+    /// intermediate file it sources, so that both the parent's `source()` of
+    /// the intermediate file and the intermediate file's `source()` of the
+    /// open child go away: by deleting both files, or by rewriting both.
+    /// Whichever is committed first, the child must lose the parent's
+    /// directory. Committing the parent first takes the intermediate file's
+    /// ancestor edge with it, so the ancestor is read from the graph as it
+    /// was before the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_file_follows_its_closed_parents_changed_together_in_either_order() {
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        for (delete, parent_first) in [(true, true), (true, false), (false, true), (false, false)] {
+            let tmp = TempDir::new().unwrap();
+            let base = fs::canonicalize(tmp.path()).unwrap();
+            for dir in ["w", "mods"] {
+                fs::create_dir_all(base.join(dir)).unwrap();
+            }
+            let child_text = "source(\"util.R\")\n";
+            let (main_path, middle_path) = (base.join("main.R"), base.join("mods/middle.R"));
+            fs::write(&main_path, "# raven: cd w\nsource(\"../mods/middle.R\")\n").unwrap();
+            fs::write(&middle_path, "source(\"../mods/child.R\")\n").unwrap();
+            fs::write(base.join("mods/child.R"), child_text).unwrap();
+            let main_uri = Url::from_file_path(&main_path).unwrap();
+            let middle_uri = Url::from_file_path(&middle_path).unwrap();
+            let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+            let svc = service_in_workspace_with_options_at(
+                &base,
+                Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+            )
+            .await;
+            let backend = svc.inner();
+            backend.state.write().await.workspace_scan_complete = true;
+            // Both indexed from disk: the intermediate file's own entry holds
+            // no directory.
+            for uri in [&middle_uri, &main_uri] {
+                let install = resync_file_from_disk(
+                    &backend.state,
+                    uri,
+                    None,
+                    None,
+                    true,
+                    None,
+                    ResyncCommitMode::Immediate,
+                )
+                .await;
+                assert!(matches!(install, ResyncOutcome::Updated { .. }));
+            }
+            open_doc(backend, &child_uri, "r", 1, child_text).await;
+            {
+                let state = backend.state.read().await;
+                assert_eq!(inherited_directory(&state, &middle_uri), None);
+                assert_eq!(
+                    inherited_directory(&state, &child_uri),
+                    Some(base.join("w"))
+                );
+            }
+
+            if delete {
+                fs::remove_file(&main_path).unwrap();
+                fs::remove_file(&middle_path).unwrap();
+            } else {
+                fs::write(&main_path, "# raven: cd w\nx <- 1\n").unwrap();
+                fs::write(&middle_path, "z <- 1\n").unwrap();
+            }
+            let mut changed = vec![main_uri.clone(), middle_uri.clone()];
+            if !parent_first {
+                changed.reverse();
+            }
+            let typ = if delete {
+                FileChangeType::DELETED
+            } else {
+                FileChangeType::CHANGED
+            };
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: changed
+                        .into_iter()
+                        .map(|uri| FileEvent { uri, typ })
+                        .collect(),
+                })
+                .await;
+            assert!(
+                child_follows_the_watched_change(backend, &child_uri, None).await,
+                "deleted: {delete}, parent first: {parent_first}"
+            );
+        }
+    }
+
     /// A `didSave` of an open child races the refresh of its inherited
     /// directory (issue #885). The save computes its diagnostics before the
     /// refresh commits and takes the publish lock after it, while the

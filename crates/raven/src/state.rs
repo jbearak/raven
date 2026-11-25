@@ -10961,6 +10961,14 @@ impl WorldState {
         };
         let mut post_fanout = Vec::new();
         let mut wd_refresh = Vec::new();
+        // The targets something could pass a directory to before the batch
+        // (`has_wd_ancestor`). Read here because a target's own update, or
+        // an earlier mutation in the batch, can remove the edge that says so.
+        let had_wd_ancestor: HashSet<Url> = targets
+            .iter()
+            .filter(|uri| has_wd_ancestor(&self.cross_file_graph, uri))
+            .cloned()
+            .collect();
         let mut graph_changed = false;
         // Pending/Complete upserts hydrate prerequisites before their caller's
         // graph exists. Only observed disk mutations can retire their ownership.
@@ -11058,18 +11066,21 @@ impl WorldState {
                             .symmetric_difference(&proposals_after)
                             .map(|(child, _)| child.clone()),
                     );
-                    if observed && has_wd_ancestor(&self.cross_file_graph, &prepared.uri) {
-                        wd_refresh.extend(
-                            children_before
-                                .iter()
-                                .filter(|edge| !children_after.contains(edge))
-                                .chain(
-                                    children_after
-                                        .iter()
-                                        .filter(|edge| !children_before.contains(edge)),
-                                )
-                                .map(|(child, _)| child.clone()),
-                        );
+                    if observed {
+                        // Edges it dropped passed on the directory it had
+                        // before; edges it added pass on the one it has now.
+                        let before: std::collections::BTreeSet<_> =
+                            children_before.into_iter().collect();
+                        let after: std::collections::BTreeSet<_> =
+                            children_after.into_iter().collect();
+                        if had_wd_ancestor.contains(&prepared.uri) {
+                            wd_refresh
+                                .extend(before.difference(&after).map(|(child, _)| child.clone()));
+                        }
+                        if has_wd_ancestor(&self.cross_file_graph, &prepared.uri) {
+                            wd_refresh
+                                .extend(after.difference(&before).map(|(child, _)| child.clone()));
+                        }
                     }
                     self.cross_file_meta.invalidate_many(&prepared.wd_children);
                     if reserve_fanout || report_unmarked_fanout {
@@ -11093,7 +11104,7 @@ impl WorldState {
                 PreparedClosedMutation::Remove { basis: _, uri } => {
                     // A deleted parent stops proposing to its open children.
                     let children = forward_children(&self.cross_file_graph, &uri);
-                    if has_wd_ancestor(&self.cross_file_graph, &uri) {
+                    if had_wd_ancestor.contains(&uri) {
                         wd_refresh.extend(children.iter().map(|(child, _)| child.clone()));
                     }
                     wd_refresh.extend(
@@ -12611,6 +12622,10 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 /// re-derives the directory through the file's ancestors
 /// ([`enrich_open_metadata_with_inherited_wd`]). A file nothing runs has only
 /// the directory its own metadata gives it, and the comparison is exact.
+///
+/// `try_commit_closed_batch` asks this of the graph as it was before the
+/// batch for the edges a file dropped (and for a deleted file), and of the
+/// updated graph for the edges it added.
 fn has_wd_ancestor(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> bool {
     graph
         .get_dependents(uri)
