@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'bun';
-import { mkdtempSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -722,6 +722,32 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
             expect(again.body.expression).toBe(first.body.expression);
         },
         30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View() outside the global environment sends no expression: Refresh would re-run it at the prompt',
+        async () => {
+            const setup = 'x <- data.frame(n = 1)';
+            const inLocal = await viewDataBody(`${setup}; local({ x <- data.frame(n = 2); View(x) }); Sys.sleep(0.2)`);
+            expect(inLocal.body.panelName).toBe('x');
+            expect(inLocal.body.expression ?? '').toBe('');
+            const inFunction = await viewDataBody(`${setup}; f <- function() View(x); f(); Sys.sleep(0.2)`);
+            expect(inFunction.body.expression ?? '').toBe('');
+            // From the prompt, a native pipe, tryCatch(), and Raven's
+            // send-to-R temp file (sourced into the global environment).
+            for (const call of ['View(x)', 'x |> View()', 'tryCatch(View(x))']) {
+                const top = await viewDataBody(`${setup}; ${call}; Sys.sleep(0.2)`);
+                expect(top.body.expression).toBe('x');
+            }
+            const dir = mkdtempSync(join(tmpdir(), 'raven-dv-src-'));
+            const file = join(dir, 'send.R');
+            writeFileSync(file, 'View(x)\n', 'utf8');
+            const sent = await viewDataBody(
+                `${setup}; local({ .raven_src <- ${JSON.stringify(file)}; source(.raven_src, echo = TRUE) }); Sys.sleep(0.2)`,
+            );
+            expect(sent.body.expression).toBe('x');
+        },
+        60_000,
     );
 
     /** TRUE when `expr` (R source) evaluates, after `setup`, to the same
