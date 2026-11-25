@@ -169,11 +169,12 @@ describe('ProfileScheduler.refresh: a sort made exact quartiles available', () =
     test('a refresh that comes back still sampled is not posted again', async () => {
         // The sort key couldn't give quartiles (an integer64 column, say).
         const { s, runs, posted } = await holding(sampled(0));
+        const held = s.cached(0);
         s.refresh(0);
         runs[1].resolve(sampled(0));
         await tick();
         expect(posted).toEqual([]);
-        expect(s.cached(0)).toEqual({ state: 'ready', profile: sampled(0) });
+        expect(s.cached(0)).toBe(held);
         // Nor while the client is looking at the column.
         s.setInterest([0]);
         posted.length = 0;
@@ -181,6 +182,7 @@ describe('ProfileScheduler.refresh: a sort made exact quartiles available', () =
         runs[2].resolve(sampled(0));
         await tick();
         expect(posted).toEqual([]);
+        expect(s.cached(0)).toBe(held);
     });
 
     test('an exact, failed or unknown profile is left alone', async () => {
