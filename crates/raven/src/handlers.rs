@@ -10185,7 +10185,16 @@ fn attach_order(
                 .or_insert(path);
         }
     }
-    for edge in snapshot.cross_file_graph.get_dependencies(uri) {
+    // In execution order, so a file's first visit is its first run.
+    let mut edges = snapshot.cross_file_graph.get_dependencies(uri);
+    edges.sort_by_key(|edge| {
+        (
+            edge.call_site_line,
+            edge.call_site_column,
+            edge.tar_source_ordinal,
+        )
+    });
+    for edge in edges {
         let Some(line) = edge.call_site_line else {
             continue;
         };
