@@ -1273,6 +1273,18 @@ fn requested_path_follows_a_symlink_before_dot_dot() {
         requested_path(Path::new("alias/../only_here.R"), &root),
         base.join("other/only_here.R")
     );
+    // A directory missing under the link's target is missing there too.
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::write(root.join("nested/data.R"), "x <- 1\n").unwrap();
+    assert_eq!(
+        requested_path(Path::new("alias/../nested/data.R"), &root),
+        base.join("other/nested/data.R")
+    );
+    // A directory argument ending in `..` is the target's parent.
+    assert_eq!(
+        requested_path(Path::new("alias/.."), &root),
+        base.join("other")
+    );
     // Without a symlink, `..` still collapses lexically.
     assert_eq!(
         requested_path(Path::new("sub/../data.R"), &root),

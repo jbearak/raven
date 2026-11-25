@@ -303,26 +303,29 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> (Ve
 ///
 /// A `..` after a symlinked directory (`alias/../data.R`) leaves the link's
 /// target, not the link, so collapsing it lexically can name another file than
-/// the one the OS opens. When the directory the OS resolves for the file's
-/// parent differs from the collapsed path's, the file is taken in that
-/// directory, in canonical form, whether or not it exists there (a missing
-/// file gets its error document at the place the OS looked).
+/// the one the OS opens. So the path up to its last `..` is resolved as the OS
+/// resolves it; when that directory differs from the collapsed one, the rest
+/// of the path is taken under it, in canonical form, whether or not the file
+/// exists there (a missing file gets its error document at the place the OS
+/// looked).
 fn requested_path(file: &Path, root: &Path) -> PathBuf {
     let absolute = absolute_path(root, file);
     let lexical = crate::cross_file::path_resolve::normalize_path_public(&absolute)
         .unwrap_or_else(|| absolute.clone());
-    if absolute
-        .components()
-        .any(|component| component == std::path::Component::ParentDir)
-        && let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
-        && let Ok(opened_parent) = std::fs::canonicalize(parent)
-        && lexical
-            .parent()
-            .and_then(|collapsed| std::fs::canonicalize(collapsed).ok())
-            .as_ref()
-            != Some(&opened_parent)
+    let components: Vec<_> = absolute.components().collect();
+    if let Some(last) = components
+        .iter()
+        .rposition(|component| *component == std::path::Component::ParentDir)
     {
-        return opened_parent.join(name);
+        let prefix: PathBuf = components[..=last].iter().collect();
+        let rest: PathBuf = components[last + 1..].iter().collect();
+        let collapsed = crate::cross_file::path_resolve::normalize_path_public(&prefix)
+            .and_then(|collapsed| std::fs::canonicalize(collapsed).ok());
+        if let Ok(opened) = std::fs::canonicalize(&prefix)
+            && collapsed.as_ref() != Some(&opened)
+        {
+            return opened.join(rest);
+        }
     }
     if lexical.starts_with(root) {
         return lexical;
