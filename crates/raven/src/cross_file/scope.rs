@@ -8104,10 +8104,11 @@ where
     // subsumes earlier ones. Function-scoped CurrentFrame calls may belong to
     // unrelated invocation frames, so retain each distinct call site. Across
     // classes, combining a later prefix or package barrier with another call
-    // would invent an environment that never existed. Each `local()` body is
-    // its own frame too: a call in one block does not subsume a call in
-    // another (or at top level), since the earlier block's bindings are gone
-    // by the later call.
+    // would invent an environment that never existed. A CurrentFrame call in
+    // a `local()` body runs in that block's frame, so it does not subsume a
+    // call in another block (or at top level): the earlier block's bindings
+    // are gone by the later call. Other calls run outside the block's frame,
+    // so the block doesn't distinguish them.
     #[derive(PartialEq, Eq, Hash)]
     struct ParentInvocationKey {
         parent: Url,
@@ -8138,7 +8139,9 @@ where
             edge.call_site_line.unwrap_or(u32::MAX),
             edge.call_site_column.unwrap_or(u32::MAX),
         ));
-        let local_block = innermost_local_block(edge, get_artifacts);
+        let local_block = (edge.locality == super::types::SourceLocality::CurrentFrame)
+            .then(|| innermost_local_block(edge, get_artifacts))
+            .flatten();
         let key = ParentInvocationKey {
             parent: edge.from.clone(),
             declared_only: inheritance_class,
@@ -15905,17 +15908,14 @@ g <- function() {
         assert!(scope.symbols.contains_key("from_g"), "{scope:?}");
     }
 
-    /// Two `local()` blocks that source the same child are distinct frames:
-    /// the later call must not subsume the earlier one, so the child sees the
-    /// bindings of both blocks.
+    /// Two `local()` blocks that source the same child with `local = TRUE`
+    /// are distinct frames: the later call must not subsume the earlier one,
+    /// so the child sees the bindings of both blocks. A default `source()` in
+    /// a block runs in the global environment, so a later top-level call still
+    /// subsumes it and the block's bindings stay out of the child.
     #[test]
     fn same_parent_local_block_invocations_keep_distinct_frames() {
-        use crate::cross_file::dependency::DependencyGraph;
-
-        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
-        let child_uri = Url::parse("file:///project/child.R").unwrap();
-        let root = Url::parse("file:///project").unwrap();
-        let parent_code = r#"local({
+        let current_frame = r#"local({
   first_val <- 1
   source("child.R", local = TRUE)
 })
@@ -15924,6 +15924,27 @@ local({
   source("child.R", local = TRUE)
 })
 "#;
+        let global = r#"local({
+  only_local <- 1
+  source("child.R")
+})
+source("child.R")
+"#;
+        for (parent_code, name, visible) in [
+            (current_frame, "first_val", true),
+            (current_frame, "second_val", true),
+            (global, "only_local", false),
+        ] {
+            assert_same_parent_child_prefix(parent_code, name, visible);
+        }
+    }
+
+    fn assert_same_parent_child_prefix(parent_code: &str, name: &str, visible: bool) {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let root = Url::parse("file:///project").unwrap();
         let child_code = "child <- 1\n";
         let parent_meta = crate::cross_file::extract_metadata(parent_code);
         let parent_artifacts = Arc::new(compute_artifacts_with_metadata(
@@ -15984,10 +16005,12 @@ local({
         )
         .unwrap();
         stream.advance_to(1, 0);
-        for name in ["first_val", "second_val"] {
-            assert!(scope.symbols.contains_key(name), "recursive {name}");
-            assert!(stream.is_visible(name), "stream {name}");
-        }
+        assert_eq!(
+            scope.symbols.contains_key(name),
+            visible,
+            "recursive {name}"
+        );
+        assert_eq!(stream.is_visible(name), visible, "stream {name}");
     }
 
     /// A child sourced with `local = TRUE` into a `local()` block keeps its
