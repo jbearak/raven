@@ -40322,7 +40322,7 @@ mod project_config_initialize_tests {
     /// A closed parent's `# raven: cd` edited on disk reaches an open child it
     /// sources: the watched-file commit queues the child, and the handler
     /// re-derives it, so the child's `source("helper.R")` follows the new
-    /// directory.
+    /// directory. Deleting the parent takes the directory away again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watched_closed_parent_cd_change_rederives_open_forward_child() {
         use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
@@ -40409,6 +40409,23 @@ mod project_config_initialize_tests {
                 .any(|edge| edge.to == new_helper_uri),
             "the open child's source() follows the parent's new directory"
         );
+        drop(state);
+
+        // Deleting the parent takes its directory away from the child.
+        fs::remove_file(&main_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&main_path).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child_wd().await.is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(child_wd().await, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

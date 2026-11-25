@@ -11074,6 +11074,15 @@ impl WorldState {
                     graph_changed |= edges_changed;
                 }
                 PreparedClosedMutation::Remove { basis: _, uri } => {
+                    // A deleted parent stops proposing to its open children.
+                    wd_refresh.extend(
+                        forward_child_proposals(
+                            forward_children(&self.cross_file_graph, &uri),
+                            self.workspace_index.get_metadata(&uri).as_deref(),
+                        )
+                        .into_iter()
+                        .map(|(child, _)| child),
+                    );
                     self.workspace_index.invalidate(&uri);
                     self.cross_file_graph.remove_file(&uri);
                     self.cross_file_file_cache.invalidate(&uri);
@@ -12578,6 +12587,13 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 /// A commit re-derives the open children whose proposal changed between the
 /// parent's old and new sets, whether because the directory it runs them in
 /// changed or because it started or stopped sourcing them.
+///
+/// For a closed parent the old set comes from its index entry, which may hold
+/// a directory a forward parent passed on in the last workspace derivation,
+/// while the new set comes from disk metadata, which carries only what its
+/// backward directives give it. Such a parent can then queue a refresh that
+/// changes nothing, or miss one; that is the documented limit of a closed
+/// intermediate file keeping its old directory until it is re-indexed.
 fn forward_child_proposals(
     children: Vec<(Url, bool)>,
     metadata: Option<&crate::cross_file::CrossFileMetadata>,
