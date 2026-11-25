@@ -10982,10 +10982,13 @@ impl WorldState {
                     // A closed parent has no open commit to re-derive the
                     // open children its `source()` calls pass a directory
                     // to, so queue those whose proposal changes here.
+                    let children_before = forward_children(&self.cross_file_graph, &prepared.uri);
                     let proposals_before = forward_child_proposals(
-                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        children_before.clone(),
                         self.workspace_index.get_metadata(&prepared.uri).as_deref(),
                     );
+                    let observed =
+                        matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
                     let new_metadata = prepared.entry.metadata.clone();
                     let reserve_fanout = reserve_closed_fanout
                         && matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
@@ -11045,8 +11048,9 @@ impl WorldState {
                         prepared.snapshot,
                         prepared.content,
                     );
+                    let children_after = forward_children(&self.cross_file_graph, &prepared.uri);
                     let proposals_after = forward_child_proposals(
-                        forward_children(&self.cross_file_graph, &prepared.uri),
+                        children_after.clone(),
                         Some(new_metadata.as_ref()),
                     );
                     wd_refresh.extend(
@@ -11054,6 +11058,19 @@ impl WorldState {
                             .symmetric_difference(&proposals_after)
                             .map(|(child, _)| child.clone()),
                     );
+                    if observed && has_wd_ancestor(&self.cross_file_graph, &prepared.uri) {
+                        wd_refresh.extend(
+                            children_before
+                                .iter()
+                                .filter(|edge| !children_after.contains(edge))
+                                .chain(
+                                    children_after
+                                        .iter()
+                                        .filter(|edge| !children_before.contains(edge)),
+                                )
+                                .map(|(child, _)| child.clone()),
+                        );
+                    }
                     self.cross_file_meta.invalidate_many(&prepared.wd_children);
                     if reserve_fanout || report_unmarked_fanout {
                         let wd_open = prepared.wd_children.iter().filter_map(|child| {
@@ -11075,9 +11092,13 @@ impl WorldState {
                 }
                 PreparedClosedMutation::Remove { basis: _, uri } => {
                     // A deleted parent stops proposing to its open children.
+                    let children = forward_children(&self.cross_file_graph, &uri);
+                    if has_wd_ancestor(&self.cross_file_graph, &uri) {
+                        wd_refresh.extend(children.iter().map(|(child, _)| child.clone()));
+                    }
                     wd_refresh.extend(
                         forward_child_proposals(
-                            forward_children(&self.cross_file_graph, &uri),
+                            children,
                             self.workspace_index.get_metadata(&uri).as_deref(),
                         )
                         .into_iter()
@@ -12579,6 +12600,24 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
         .collect()
 }
 
+/// Whether another file can pass `uri` a working directory: something
+/// `source()`s it on a lending edge, or it names a parent in
+/// `# raven: sourced-by`.
+///
+/// For such a file, closed, [`forward_child_proposals`] cannot tell what it
+/// really proposes (see the note there on closed parents). A watched change
+/// or deletion of it therefore also queues the open children it started or
+/// stopped sourcing, whatever either side appears to propose: their refresh
+/// re-derives the directory through the file's ancestors
+/// ([`enrich_open_metadata_with_inherited_wd`]). A file nothing runs has only
+/// the directory its own metadata gives it, and the comparison is exact.
+fn has_wd_ancestor(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> bool {
+    graph
+        .get_dependents(uri)
+        .into_iter()
+        .any(is_wd_ancestor_edge)
+}
+
 /// What a parent proposes to each of its `forward_children`, given its
 /// metadata: the directory it runs them in, or `None` for a `chdir = TRUE`
 /// call, which runs the child in its own directory. A parent that proposes
@@ -12599,9 +12638,14 @@ fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Ve
 /// a directory a forward parent passed on in the last workspace derivation,
 /// while the new set comes from disk metadata, whose inherited directory
 /// comes only from its backward directives. Such a parent can then queue a
-/// refresh that changes nothing, or miss one; that is the documented limit of
-/// a closed intermediate file keeping its old directory until it is
-/// re-indexed.
+/// refresh that changes nothing, or appear to propose nothing while it in
+/// fact passes its own parent's directory on. For the second case
+/// `try_commit_closed_batch` also queues the children a file with an
+/// ancestor started or stopped sourcing ([`has_wd_ancestor`]). What remains
+/// is the documented limit of a closed intermediate file: its own index entry
+/// and graph edges keep the directory they were derived under until it is
+/// re-indexed, so a `source()` path that resolves to a different file under
+/// the directory its parent really runs it in is not followed.
 fn forward_child_proposals(
     children: Vec<(Url, bool)>,
     metadata: Option<&crate::cross_file::CrossFileMetadata>,

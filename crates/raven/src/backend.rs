@@ -40054,7 +40054,7 @@ mod project_config_initialize_tests {
 
     /// Wait for the open child to take `expected` as its directory with the
     /// refresh queue drained, without any further editor event.
-    async fn child_follows_the_retry(
+    async fn child_follows_the_watched_change(
         backend: &Backend,
         child_uri: &Url,
         expected: Option<std::path::PathBuf>,
@@ -40080,7 +40080,7 @@ mod project_config_initialize_tests {
         send_watched_change(backend, &main_uri).await;
 
         assert!(
-            child_follows_the_retry(backend, &child_uri, None).await,
+            child_follows_the_watched_change(backend, &child_uri, None).await,
             "the retry's removal must reach the open child"
         );
         assert!(
@@ -40113,7 +40113,7 @@ mod project_config_initialize_tests {
         fs::write(&main_path, "# raven: cd b\nsource(\"../mods/child.R\")\n").unwrap();
 
         assert!(
-            child_follows_the_retry(backend, &child_uri, Some(base.join("b"))).await,
+            child_follows_the_watched_change(backend, &child_uri, Some(base.join("b"))).await,
             "the retry's recovered commit must reach the open child"
         );
     }
@@ -40137,7 +40137,7 @@ mod project_config_initialize_tests {
         send_watched_change(backend, &main_uri).await;
 
         assert!(
-            child_follows_the_retry(backend, &child_uri, Some(base.join("b"))).await,
+            child_follows_the_watched_change(backend, &child_uri, Some(base.join("b"))).await,
             "the package retry's commit must reach the open child"
         );
         assert_eq!(
@@ -40149,6 +40149,87 @@ mod project_config_initialize_tests {
                 - attempts,
             4,
             "three rejected inline attempts, then the retry's commit"
+        );
+    }
+
+    /// A closed intermediate file starts, then stops, sourcing an open file
+    /// (issue #885): the open `main.R` (`# raven: cd w`) sources the closed
+    /// `mods/middle.R`, and a watched change makes `middle.R` source the open
+    /// `mods/child.R`. On the over-budget path the change is committed from
+    /// disk metadata, which holds no directory for `middle.R`, so neither its
+    /// old nor its new metadata proposes one; the child must still take
+    /// `w/` through it, and lose it when the call goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_file_follows_a_closed_intermediate_that_starts_and_stops_sourcing_it() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["w", "mods"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let main_text = "# raven: cd w\nsource(\"../mods/middle.R\")\n";
+        let child_text = "source(\"util.R\")\n";
+        let middle_path = base.join("mods/middle.R");
+        fs::write(base.join("main.R"), main_text).unwrap();
+        fs::write(&middle_path, "z <- 1\n").unwrap();
+        fs::write(base.join("mods/child.R"), child_text).unwrap();
+        let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
+        let middle_uri = Url::from_file_path(&middle_path).unwrap();
+        let child_uri = Url::from_file_path(base.join("mods/child.R")).unwrap();
+        let svc = service_in_workspace_with_options_at(
+            &base,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await;
+        let backend = svc.inner();
+        backend.state.write().await.workspace_scan_complete = true;
+        open_doc(backend, &main_uri, "r", 1, main_text).await;
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+        {
+            let mut state = backend.state.write().await;
+            assert!(state.workspace_index.contains(&middle_uri));
+            assert_eq!(inherited_directory(&state, &child_uri), None);
+            state.cross_file_config.max_transitive_dependents_visited = 1;
+            assert!(
+                state.workspace_index.graph_derivation_entries().len()
+                    + snapshot_workspace_graph_overlays(&state).len()
+                    > state.cross_file_config.max_transitive_dependents_visited,
+                "fixture must force the ordered traversal-budget fallback"
+            );
+        }
+
+        fs::write(&middle_path, "source(\"../mods/child.R\")\n").unwrap();
+        send_watched_change(backend, &middle_uri).await;
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, Some(base.join("w"))).await,
+            "the child takes w/ through the closed file that now sources it"
+        );
+
+        fs::write(&middle_path, "z <- 1\n").unwrap();
+        send_watched_change(backend, &middle_uri).await;
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, None).await,
+            "the child loses w/ once the closed file stops sourcing it"
+        );
+
+        // Deleting the closed file while it sources the child does the same.
+        fs::write(&middle_path, "source(\"../mods/child.R\")\n").unwrap();
+        send_watched_change(backend, &middle_uri).await;
+        assert!(child_follows_the_watched_change(backend, &child_uri, Some(base.join("w"))).await);
+        fs::remove_file(&middle_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![tower_lsp::lsp_types::FileEvent {
+                    uri: middle_uri.clone(),
+                    typ: tower_lsp::lsp_types::FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        assert!(
+            child_follows_the_watched_change(backend, &child_uri, None).await,
+            "the child loses w/ once the closed file is deleted"
         );
     }
 
