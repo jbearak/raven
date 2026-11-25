@@ -2344,7 +2344,7 @@ pub(crate) type SnapshotScopeStream<'a> =
 /// the file bounds how many there are: at each `source()` call, at the start
 /// of the file, and at each use in a file with no artifacts of its own (which
 /// has no stream to ask instead). At a use the stream cannot resolve it keeps
-/// at most the package sets. Keeping a full scope at each such use cost about
+/// at most a [`UseScope`]. Keeping a full scope at each such use cost about
 /// 1.3 MB per undefined name (issue #898).
 type PassScopes = HashMap<(u32, u32), PassScope>;
 
@@ -2353,10 +2353,10 @@ type PassScopes = HashMap<(u32, u32), PassScope>;
 struct PassScope {
     /// The point scope (`DiagnosticsSnapshot::get_scope`) at this position.
     full: Option<Box<scope::ScopeAtPosition>>,
-    /// The point scope's packages at a use the out-of-scope collector resolved
-    /// for its package guard. The undefined-variable collector reads them back
-    /// at the same use, so both collectors answer from one scope.
-    packages: Option<UsePackages>,
+    /// What the out-of-scope collector kept of the point scope at a use it
+    /// resolved for its package guard. The undefined-variable collector reads
+    /// it back at the same use, so both collectors answer from one scope.
+    at_use: Option<UseScope>,
 }
 
 /// The full scope `scopes` keeps at `key`, from `resolve` on first need.
@@ -2378,38 +2378,46 @@ fn full_pass_scope(
 pub struct PassScopeCounts {
     /// Positions with a full scope.
     pub full: usize,
-    /// Uses with only their package sets.
-    pub use_packages: usize,
+    /// Uses with only a `UseScope`.
+    pub at_use: usize,
 }
 
 impl PassScopeCounts {
     fn of(scopes: &PassScopes) -> Self {
         let full = scopes.values().filter(|kept| kept.full.is_some()).count();
-        let use_packages = scopes
+        let at_use = scopes
             .values()
-            .filter(|kept| kept.full.is_none() && kept.packages.is_some())
+            .filter(|kept| kept.full.is_none() && kept.at_use.is_some())
             .count();
-        Self { full, use_packages }
+        Self { full, at_use }
     }
 }
 
-/// The package sets of the point scope at one use.
-struct UsePackages {
+/// The parts of the point scope at one use that the undefined-variable
+/// collector reads: its package sets and, when the use heads a replacement
+/// call (`f(x) <- v`), the setter it binds.
+struct UseScope {
     inherited: HashSet<String>,
     loaded: HashSet<String>,
     attached: HashSet<String>,
+    setter: Option<scope::ScopedSymbol>,
 }
 
-impl UsePackages {
-    fn of(scope: scope::ScopeAtPosition) -> Self {
+impl UseScope {
+    /// `setter` is the replacement function's name (`f<-`) when the use heads
+    /// a replacement call.
+    fn of(scope: scope::ScopeAtPosition, setter: Option<&str>) -> Self {
         Self {
+            setter: setter
+                .and_then(|setter| replacement_setter(&scope.symbols, setter))
+                .cloned(),
             inherited: scope.inherited_packages,
             loaded: scope.loaded_packages,
             attached: scope.attached_packages,
         }
     }
 
-    fn view(&self) -> ScopePackages<'_> {
+    fn packages(&self) -> ScopePackages<'_> {
         ScopePackages {
             inherited: &self.inherited,
             loaded: &self.loaded,
@@ -2770,11 +2778,11 @@ fn diagnostics_from_snapshot_counting(
 
     *scope_counts = PassScopeCounts::of(&scopes);
     log::trace!(
-        "Diagnostics computed in {}ms (scope resolution: {}ms, {} scope cache entries, {} package-only entries)",
+        "Diagnostics computed in {}ms (scope resolution: {}ms, {} scope cache entries, {} use entries)",
         start.elapsed().as_millis(),
         scope_start.elapsed().as_millis(),
         scope_counts.full,
-        scope_counts.use_packages,
+        scope_counts.at_use,
     );
 
     // F2 Step 4: range- and file-level suppressions (`# raven: ignore-start/end`,
@@ -9478,7 +9486,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // emit a false "used before available" that the undefined-variable
             // collector already suppresses. Resolved lazily here — only at the
             // rare would-fire point, not per usage — so the streaming fast path
-            // stays cheap. Only the scope's package sets are kept, for the
+            // stays cheap. Only a `UseScope` is kept of it, for the
             // undefined-variable collector to read at this same use (see
             // `PassScopes`).
             // Position-awareness AND the load_all out-of-root sentinel gate both
@@ -9489,11 +9497,15 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 let packages = match &kept.full {
                     Some(scope) => ScopePackages::of(scope),
                     None => kept
-                        .packages
+                        .at_use
                         .get_or_insert_with(|| {
-                            UsePackages::of(snapshot.get_scope(uri, key.0, key.1, cancel))
+                            UseScope::of(
+                                snapshot.get_scope(uri, key.0, key.1, cancel),
+                                replacement_function_name_for_lhs_call(name, *usage_node)
+                                    .as_deref(),
+                            )
                         })
-                        .view(),
+                        .packages(),
                 };
                 let pkgs: Vec<String> = packages
                     .inherited
@@ -10558,9 +10570,12 @@ fn collect_undefined_variables_from_snapshot(
             //
             // `symbols` is the scope's symbol map wherever the checks below
             // look a name up in it: in the no-stream fallback and at a
-            // replacement call. `packages` is the scope's package sets.
+            // replacement call. At a use the pass kept (`UseScope`), the
+            // setter comes from `kept_setter` instead. `packages` is the
+            // scope's package sets.
             let key = (usage_line, usage_col_utf16);
             let transient;
+            let mut kept_setter = None;
             let (symbols, packages) = if let Some(stream) = stream_opt.as_mut() {
                 stream.advance_to(usage_line, usage_col_utf16);
                 // Fast path: if the symbol is visible AND not a forward
@@ -10586,23 +10601,19 @@ fn collect_undefined_variables_from_snapshot(
                 }
                 // Slow path: name is undefined or forward-referenced. The
                 // package checks below need the scope's package sets, and a
-                // replacement call needs its symbols. Nothing built here is
+                // replacement call needs its setter. Nothing built here is
                 // kept: a file can have thousands of these uses (see
                 // `PassScopes`).
                 //
-                // A scope the pass already holds at this position answers
-                // first. It came from the point resolver (`get_scope`), in the
+                // What the pass already holds at this position answers first.
+                // It came from the point resolver (`get_scope`), in the
                 // out-of-scope collector or at the start of the file.
                 let kept = scopes.get(&key);
                 if let Some(scope) = kept.and_then(|kept| kept.full.as_deref()) {
                     (Some(&scope.symbols), ScopePackages::of(scope))
-                } else if let Some(recorded) = kept.and_then(|kept| kept.packages.as_ref()) {
-                    if replacement_function_name.is_some() {
-                        transient = snapshot.get_scope(uri, key.0, key.1, cancel);
-                        (Some(&transient.symbols), recorded.view())
-                    } else {
-                        (None, recorded.view())
-                    }
+                } else if let Some(at_use) = kept.and_then(|kept| kept.at_use.as_ref()) {
+                    kept_setter = at_use.setter.as_ref();
+                    (None, at_use.packages())
                 } else if replacement_function_name.is_some() {
                     transient = stream.snapshot();
                     (Some(&transient.symbols), ScopePackages::of(&transient))
@@ -10637,17 +10648,8 @@ fn collect_undefined_variables_from_snapshot(
             {
                 continue;
             }
-            let replacement_backtick_name = replacement_function_name
-                .as_ref()
-                .map(|name| format!("`{name}`"));
-            let replacement_symbol = replacement_function_name
-                .as_deref()
-                .and_then(|name| symbols.and_then(|symbols| symbols.get(name)))
-                .or_else(|| {
-                    replacement_backtick_name
-                        .as_deref()
-                        .and_then(|name| symbols.and_then(|symbols| symbols.get(name)))
-                });
+            let replacement_symbol = kept_setter
+                .or_else(|| replacement_setter(symbols?, replacement_function_name.as_deref()?));
             if let Some(sym) = replacement_symbol
                 && (stream_opt
                     .as_ref()
@@ -10933,6 +10935,17 @@ fn is_destructuring_assignment_target(node: Node, text: &str) -> bool {
             _ => return false,
         }
     }
+}
+
+/// The binding of the replacement function `setter` (`name<-`) in `symbols`,
+/// under either spelling: `name<-` or `` `name<-` ``.
+fn replacement_setter<'a>(
+    symbols: &'a HashMap<Arc<str>, scope::ScopedSymbol>,
+    setter: &str,
+) -> Option<&'a scope::ScopedSymbol> {
+    symbols
+        .get(setter)
+        .or_else(|| symbols.get(format!("`{setter}`").as_str()))
 }
 
 /// If `name` is the call head in replacement syntax (`name(x) <- value`),
@@ -67678,10 +67691,7 @@ mod pass_scope_retention_tests {
             assert_eq!(messages, expected, "packages enabled: {packages}");
             assert_eq!(
                 counts,
-                PassScopeCounts {
-                    full: 1,
-                    use_packages: 0
-                },
+                PassScopeCounts { full: 1, at_use: 0 },
                 "packages enabled: {packages}"
             );
         }
@@ -67700,18 +67710,12 @@ mod pass_scope_retention_tests {
         let (state, uri) = state_with(&[("a.R", &code)]);
         let (messages, counts) = run(&state, &uri);
         assert_eq!(messages, ["missing_setter is not defined"]);
-        assert_eq!(
-            counts,
-            PassScopeCounts {
-                full: 1,
-                use_packages: 0
-            }
-        );
+        assert_eq!(counts, PassScopeCounts { full: 1, at_use: 0 });
     }
 
     /// Uses of a name that a later `source()` defines. Each gets both
-    /// diagnostics, as before the fix, and the pass keeps the package sets of
-    /// the scope at each use for the second collector. The two full scopes are
+    /// diagnostics, as before the fix, and the pass keeps only the package sets
+    /// of the scope at each use for the second collector. The two full scopes are
     /// the ones at the start of the file and at the `source()` call. Before
     /// the fix the pass kept a full scope at every use as well.
     #[test]
@@ -67735,7 +67739,7 @@ mod pass_scope_retention_tests {
             counts,
             PassScopeCounts {
                 full: 2,
-                use_packages: USES
+                at_use: USES
             }
         );
     }
@@ -67767,13 +67771,72 @@ mod pass_scope_retention_tests {
             counts,
             PassScopeCounts {
                 full: 2,
-                use_packages: USES
+                at_use: USES
             }
         );
     }
 
-    /// A replacement call at a use whose package sets were kept looks its
-    /// setter up in the point scope again. Here the getter comes from a later
+    /// The two collectors answer a kept use from one scope. Here a package
+    /// that exports the setter finishes loading after the first collector
+    /// resolved the call and before the second reads it. The second must not
+    /// resolve the call again and find the setter: the pass would then
+    /// describe two different states of the package library.
+    #[tokio::test]
+    async fn kept_use_keeps_its_setter_answer_when_a_package_loads_mid_pass() {
+        let code = "\
+box::use(lender[...])
+x <- 1
+shape(x) <- 2
+source(\"provider.R\")
+";
+        let (mut state, uri) =
+            state_with(&[("a.R", code), ("provider.R", "shape <- function(x) x\n")]);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        let snapshot = super::DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        let cancel = DiagCancelToken::never();
+        let mut diagnostics = Vec::new();
+        let mut scopes = std::collections::HashMap::new();
+        super::collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &uri,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut scopes,
+            &cancel,
+            None,
+        );
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "lender".to_string(),
+                HashSet::from(["shape<-".to_string()]),
+            ))
+            .await;
+        super::collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut scopes,
+            &cancel,
+            None,
+        );
+        let messages = sorted(diagnostics.into_iter().map(|d| d.message).collect());
+        assert_eq!(
+            messages,
+            [
+                "'shape' is used before it's available (sourced on line 4)",
+                "shape is not defined"
+            ]
+        );
+    }
+
+    /// A replacement call at a kept use resolves through the setter kept with
+    /// it. Here the getter comes from a later
     /// `source()` and the setter is defined above the call, so the call is
     /// used before it is available but is not undefined.
     #[test]
@@ -67793,13 +67856,7 @@ source(\"provider.R\")
             messages,
             ["'shape' is used before it's available (sourced on line 4)"]
         );
-        assert_eq!(
-            counts,
-            PassScopeCounts {
-                full: 2,
-                use_packages: 1
-            }
-        );
+        assert_eq!(counts, PassScopeCounts { full: 2, at_use: 1 });
     }
 }
 

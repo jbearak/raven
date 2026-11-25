@@ -1082,7 +1082,7 @@ A `ScopeAtPosition` copies every visible symbol, about 3,500 from the default pa
 
 - It keeps a full scope at each `source()` call, at the start of the file, and at each use in a file with no artifacts of its own (a rare fallback: there is then no scope stream to ask).
 - At a use the scope stream can't resolve, the undefined-variable collector reads `ScopeStream::package_snapshot()` and drops it. A replacement call (`f(x) <- v`) builds a full scope to look its setter up, then drops it.
-- At a use the out-of-scope collector resolves for its package guard, the pass keeps only the three package sets of that scope. The undefined-variable collector reads them back at the same use, so both collectors answer from one resolver.
+- At a use the out-of-scope collector resolves for its package guard, the pass keeps only the three package sets of that scope and, for a replacement call, the setter it binds (`UseScope`). The undefined-variable collector reads them back at the same use, so both collectors answer from one resolution of the scope even when a package finishes loading between them.
 
 Keeping a full scope per unresolved use took about 1.3 MB for each undefined name. `pass_scope_retention_tests` in `handlers.rs` count the entries a pass keeps (`diagnostics_via_snapshot_scope_counts`), and the trace line `Diagnostics computed in ...` (`RUST_LOG=raven::handlers=trace`) prints the same counts.
 
