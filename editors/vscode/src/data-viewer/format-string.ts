@@ -1,7 +1,11 @@
 // Source-file format string parser. Only used to decide whether a
 // numeric column whose underlying Arrow type is Float* should be
-// treated as integer-display (i.e. width.0 form), so the Format toggle
-// has no effect on it and we don't render "5" as "5.000".
+// treated as integer-display (i.e. width.0 form), so the digits dropdown
+// has no effect on it and we don't render "5" as "5.000". The format
+// says nothing about the stored values: such a column can hold 12.75,
+// and a recognized format then rounds it for display (`DOLLAR8` shows
+// `$13`), which is why the Format toggle stays available for it
+// (`webview/toolbar-effects.ts`).
 //
 // Conservative — recognizes only well-known integer-display formats:
 //

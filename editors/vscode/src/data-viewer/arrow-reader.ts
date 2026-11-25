@@ -108,15 +108,19 @@ export type ColumnSchema = {
      *  via raven.value_labels). Looked up by stringified cell value. */
     valueLabels?: Record<string, string>;
     /** Source-file format string (Stata %w.dC, SAS/SPSS F8.0, etc.).
-     *  Used to detect integer-display Float columns so Format doesn't
-     *  render "5" as "5.000". See format-string.ts. */
+     *  A recognized one formats a Float column while Format is on
+     *  (`parseDisplayFormat`), and it tells whether the column is
+     *  declared for whole numbers (format-string.ts). */
     format?: string;
     /** Dictionary level strings, present iff dictionaryShipped. */
     dictionary?: string[];
     /** True iff this column is dictionary-encoded AND its dictionary fits
      *  under the cardinality threshold. */
     dictionaryShipped: boolean;
-    /** True iff the column type is integer (Format toggle ignores these). */
+    /** True iff the column type is integer, or a Float whose format
+     *  declares whole numbers. The digits dropdown ignores these; Format
+     *  still applies a recognized source format to such a Float (it may
+     *  hold fractions all the same). */
     isInteger: boolean;
     /** pillar-style type tag from the R class (`<dbl>`, `<fct>`,
      *  `<dttm>`, `<drtn secs>`, `<dbl+lbl>`, ...), from `raven.type_tag`.

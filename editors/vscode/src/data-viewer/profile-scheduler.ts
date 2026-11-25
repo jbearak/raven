@@ -14,7 +14,11 @@
  *     hidden ({@link setActive});
  *   - caches results (ready or failed) for the reader's lifetime, so a
  *     column scrolled back into view, or a reloaded webview, gets its
- *     profile at once.
+ *     profile at once;
+ *   - **refreshes** a cached profile whose quartiles are sampled when a
+ *     sort commits on its column ({@link refresh}): the client never asks
+ *     again for a profile it holds, so the replacement is posted
+ *     unprompted, after everything the client is waiting for.
  *
  * Every state change is reported through `post` as `[column, state]`,
  * with `null` meaning "no longer pending" (a cancelled column).
@@ -35,7 +39,9 @@ export class ProfileScheduler {
     /** Columns the client was told are loading. */
     private readonly announced = new Set<number>();
     private readonly restarts = new Map<number, number>();
-    private running: { columnIndex: number; abort: AbortController } | undefined;
+    /** Columns whose cached profile is to be computed again. */
+    private readonly stale = new Set<number>();
+    private running: { columnIndex: number; abort: AbortController; refresh: boolean } | undefined;
     private active = true;
     private disposed = false;
     /** Columns started, in order (tests and the bench). */
@@ -73,7 +79,9 @@ export class ProfileScheduler {
             updates.push([c, null]);
         }
         this.wanted = next;
-        if (this.running && !wanted.has(this.running.columnIndex)) this.running.abort.abort();
+        // A refresh doesn't depend on the interest: the client holds the
+        // profile it replaces whether or not the column is in view.
+        if (this.running && !this.running.refresh && !wanted.has(this.running.columnIndex)) this.running.abort.abort();
         if (updates.length > 0) this.post(updates);
         this.pump();
     }
@@ -94,6 +102,20 @@ export class ProfileScheduler {
         this.running?.abort.abort();
     }
 
+    /**
+     * A sort committed on `columnIndex`: if its cached profile has sampled
+     * quartiles, run it again (the scan worker now has the column's sort
+     * key, which gives exact ones) and post the result. A profile that is
+     * already exact, failed, or not yet computed is left alone.
+     */
+    refresh(columnIndex: number): void {
+        if (this.disposed) return;
+        const done = this.results.get(columnIndex);
+        if (done?.state !== 'ready' || done.profile.quantiles?.exact !== false) return;
+        this.stale.add(columnIndex);
+        this.pump();
+    }
+
     /** A cached profile, if any. */
     cached(columnIndex: number): ProfileState | undefined {
         return this.results.get(columnIndex);
@@ -107,21 +129,34 @@ export class ProfileScheduler {
 
     private pump(): void {
         if (this.disposed || !this.active || this.running) return;
-        const next = this.wanted.find(c => !this.results.has(c));
+        let next = this.wanted.find(c => !this.results.has(c));
+        const refresh = next === undefined;
+        if (refresh) next = this.stale.values().next().value;
         if (next === undefined) return;
+        const columnIndex = next;
         const abort = new AbortController();
-        this.running = { columnIndex: next, abort };
-        this.started.push(next);
-        void this.run(next, abort.signal).then(
-            profile => this.finish(next, abort, { state: 'ready', profile }),
+        this.running = { columnIndex, abort, refresh };
+        this.started.push(columnIndex);
+        void this.run(columnIndex, abort.signal).then(
+            profile => {
+                if (refresh) this.stale.delete(columnIndex);
+                this.finish(columnIndex, abort, { state: 'ready', profile }, refresh);
+            },
             err => {
-                if (abort.signal.aborted) return this.finish(next, abort, undefined);
-                if (this.isAbort(err)) {
-                    const n = (this.restarts.get(next) ?? 0) + 1;
-                    this.restarts.set(next, n);
-                    if (n <= MAX_RESTARTS) return this.finish(next, abort, undefined);
+                if (refresh) {
+                    // Cancelled (hidden panel, reloaded webview): still
+                    // stale, so it runs again. Any other failure keeps
+                    // the profile the client has.
+                    if (!abort.signal.aborted) this.stale.delete(columnIndex);
+                    return this.finish(columnIndex, abort, undefined);
                 }
-                return this.finish(next, abort, {
+                if (abort.signal.aborted) return this.finish(columnIndex, abort, undefined);
+                if (this.isAbort(err)) {
+                    const n = (this.restarts.get(columnIndex) ?? 0) + 1;
+                    this.restarts.set(columnIndex, n);
+                    if (n <= MAX_RESTARTS) return this.finish(columnIndex, abort, undefined);
+                }
+                return this.finish(columnIndex, abort, {
                     state: 'failed',
                     error: err instanceof Error ? err.message : String(err),
                 });
@@ -129,12 +164,14 @@ export class ProfileScheduler {
         );
     }
 
-    private finish(columnIndex: number, abort: AbortController, state: ProfileState | undefined): void {
+    private finish(
+        columnIndex: number, abort: AbortController, state: ProfileState | undefined, refresh = false,
+    ): void {
         if (this.running?.abort === abort) this.running = undefined;
         if (this.disposed) return;
         if (state) {
             this.results.set(columnIndex, state);
-            if (this.announced.delete(columnIndex) || this.wanted.includes(columnIndex)) {
+            if (refresh || this.announced.delete(columnIndex) || this.wanted.includes(columnIndex)) {
                 this.post([[columnIndex, state]]);
             }
         }

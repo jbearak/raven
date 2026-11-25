@@ -149,6 +149,14 @@ describe('source display formats', () => {
     test('Format off ignores the source format', () => {
         expect(formatCell(1234.5, withFmt('DOLLAR10.2'), undefined, { ...on, formatOn: false }).text).toBe('1234.5');
     });
+    test('a zero-decimal format on a column holding a fraction: Format off shows and copies the stored value', () => {
+        // `isInteger` is what the reader sets for such a format.
+        const price: ColumnSchema = { ...withFmt('DOLLAR8'), isInteger: true };
+        const shown = formatCell(12.75, price, undefined, { ...on, alignPad: true });
+        expect([shown.text, shown.copyText]).toEqual(['$13', '$13']);
+        const stored = formatCell(12.75, price, undefined, { ...on, formatOn: false, alignPad: true });
+        expect([stored.text, stored.copyText]).toEqual(['12.75', '12.75']);
+    });
     test('formatNumber with a significant-digit spec on tiny values', () => {
         expect(formatNumber(0.000012345, {
             formatOn: true, digits: 3, isInteger: false, spec: { kind: 'significant', digits: 3 }, alignPad: false,
