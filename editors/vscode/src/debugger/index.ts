@@ -79,15 +79,44 @@ const links = new Map<string, ConsoleLink>();
 /** Consoles a session is being started for (a stop can be heard twice). */
 const attaching = new Set<string>();
 /**
- * Launches (F5, launch.json, Raven commands) still choosing their console,
- * and the consoles they chose, until their session starts. A stop heard
- * meanwhile is theirs to show: F5 can reattach a stopped persistent console,
- * whose subscription then replays the stop. The console replays it to the
+ * Consoles a launch (F5, launch.json, Raven commands) has chosen, until its
+ * session starts (or the claim expires). A stop heard meanwhile is the
+ * launch's to show: F5 can reattach a stopped persistent console, whose
+ * subscription then replays the stop, and the console replays it to the
  * launch's session too.
  */
-let launches_resolving = 0;
-const launch_claims = new Set<string>();
+const launch_claims = new Map<string, ReturnType<typeof setTimeout>>();
 const LAUNCH_CLAIM_MS = 10_000;
+/** Launches still choosing their console, which may be any of them. */
+let launches_choosing = 0;
+/**
+ * Consoles whose stop was held back for a claim or a launch still choosing.
+ * Reconsidered once neither applies, unless a session for it has started:
+ * the console pushes a stop only once.
+ */
+const deferred_stops = new Set<string>();
+
+function claim_console(ipc: string): void {
+    clearTimeout(launch_claims.get(ipc));
+    launch_claims.set(ipc, setTimeout(() => {
+        launch_claims.delete(ipc);
+        reconsider_stops();
+    }, LAUNCH_CLAIM_MS));
+}
+
+function release_console(ipc: string): void {
+    clearTimeout(launch_claims.get(ipc));
+    launch_claims.delete(ipc);
+}
+
+function reconsider_stops(): void {
+    if (launches_choosing > 0) return;
+    for (const ipc of deferred_stops) {
+        if (launch_claims.has(ipc)) continue;
+        deferred_stops.delete(ipc);
+        void auto_attach(ipc);
+    }
+}
 
 function wait_for_file(file: string, ms: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -483,7 +512,11 @@ async function auto_attach(ipc: string): Promise<void> {
         return;
     }
     // A stop replayed on subscribe can arrive next to the same stop's push.
-    if (attaching.has(ipc) || launches_resolving > 0 || launch_claims.has(ipc)) return;
+    if (attaching.has(ipc)) return;
+    if (launches_choosing > 0 || launch_claims.has(ipc)) {
+        deferred_stops.add(ipc);
+        return;
+    }
     attaching.add(ipc);
     try {
         await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
@@ -570,19 +603,19 @@ async function inspect_last_error(): Promise<void> {
 
 const configuration_provider: vscode.DebugConfigurationProvider = {
     async resolveDebugConfiguration(_folder, config) {
-        const ipc: unknown = config.consoleSocket;
-        if (typeof ipc === 'string' && attaching.has(ipc)) return resolve_configuration(config);
-        launches_resolving++;
+        const given: unknown = config.consoleSocket;
+        if (typeof given === 'string' && attaching.has(given)) return resolve_configuration(config);
+        if (typeof given === 'string') claim_console(given);
+        else launches_choosing++;
         try {
             const resolved = await resolve_configuration(config);
             const chosen: unknown = resolved?.consoleSocket;
-            if (typeof chosen === 'string') {
-                launch_claims.add(chosen);
-                setTimeout(() => launch_claims.delete(chosen), LAUNCH_CLAIM_MS);
-            }
+            if (typeof chosen === 'string') claim_console(chosen);
+            else if (typeof given === 'string') release_console(given);
             return resolved;
         } finally {
-            launches_resolving--;
+            if (typeof given !== 'string') launches_choosing--;
+            reconsider_stops();
         }
     },
 };
@@ -705,9 +738,12 @@ export function register_debugger(context: vscode.ExtensionContext): void {
         vscode.debug.onDidChangeBreakpoints(mirror_all),
         vscode.debug.onDidStartDebugSession((s) => {
             if (s.type === DEBUG_TYPE && s.configuration.consoleSocket) {
-                launch_claims.delete(s.configuration.consoleSocket);
+                release_console(s.configuration.consoleSocket);
+                // This session shows the console's stop.
+                deferred_stops.delete(s.configuration.consoleSocket);
                 sessions.set(s.configuration.consoleSocket, s);
                 update_status();
+                reconsider_stops();
             }
         }),
         vscode.debug.onDidTerminateDebugSession((s) => {

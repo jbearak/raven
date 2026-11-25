@@ -28,7 +28,7 @@ export const HAS_CHUNKS_CONTEXT = 'raven.editorHasChunks';
 export function has_navigable_chunks(document: vscode.TextDocument): boolean {
     // The keybindings fire only in these languages; don't scan other files.
     if (!['r', 'rmd', 'quarto'].includes(document.languageId)) return false;
-    return chunks_for_document(document).length > 0;
+    return supports_chunk_navigation(document) && chunks_for_document(document).length > 0;
 }
 
 /**

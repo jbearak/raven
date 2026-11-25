@@ -35,11 +35,13 @@
 //! A `subscribe` made while R is stopped in the debugger, with no debug
 //! session showing the stop, is followed by that stop's `stopped` event, so
 //! an editor that connects (or reconnects to a persistent console) after the
-//! stop still attaches. A `breakpoints` mirror
-//! is answered `not-ready` while R is starting (the console pushes `ready`
-//! once the debugger runs) and `unavailable` when the debugger will never
-//! run in this console; a client should stop resending it then. Clients
-//! that predate `unavailable` treat it as "not applied" and stop too.
+//! stop still attaches.
+//!
+//! A `breakpoints` mirror is answered `not-ready` while R is starting (the
+//! console pushes `ready` once the debugger runs) and `unavailable` when the
+//! debugger will never run in this console; a client should stop resending
+//! it then. Clients that predate `unavailable` treat it as "not applied" and
+//! stop too.
 //!
 //! ```text
 //! → {"v":1,"id":13,"op":"inspect"}                    // Inspect Last Error

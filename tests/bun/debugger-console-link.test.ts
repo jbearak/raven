@@ -592,7 +592,47 @@ describe('an explicit launch', () => {
         con.push({ event: 'stopped', reason: 'breakpoint' });
         await settle(300);
         expect(started.filter((c) => c.consoleSocket === sock).length - before).toBe(0);
+        // The launch's session starts and shows the stop.
+        for (const l of start_listeners) l({ type: 'raven-r', id: 'f5', configuration: { consoleSocket: sock } });
     });
+
+    test("one console's launch doesn't hold back another console's stop", async () => {
+        const a = await console_at();
+        const b = await console_at();
+        set_breakpoints([]);
+        attach(a.sock);
+        attach(b.sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === b.sock));
+        await settle(200);
+        // A's launch waits for A's DAP socket, which doesn't exist yet.
+        const resolving = config_providers[0].resolveDebugConfiguration(
+            undefined,
+            { type: 'raven-r', request: 'launch', name: 'Source R file', consoleSocket: a.sock },
+        );
+        b.con.push({ event: 'stopped', reason: 'breakpoint' });
+        await until(() => started.some((c) => c.consoleSocket === b.sock), 2_000);
+        fs.writeFileSync(path.join(path.dirname(a.sock), 'd'), '');
+        await resolving;
+        for (const l of start_listeners) l({ type: 'raven-r', id: 'fa', configuration: { consoleSocket: a.sock } });
+    });
+
+    test("a stop held for a launch whose session never starts isn't lost", async () => {
+        const { con, sock } = await console_at();
+        set_breakpoints([]);
+        attach(sock);
+        await until(() => ipc.live_console_sockets().some(([, s]) => s === sock));
+        await settle(200);
+        fs.writeFileSync(path.join(path.dirname(sock), 'd'), '');
+        await config_providers[0].resolveDebugConfiguration(
+            undefined,
+            { type: 'raven-r', request: 'launch', name: 'Source R file', consoleSocket: sock },
+        );
+        con.push({ event: 'stopped', reason: 'breakpoint' });
+        await settle(300);
+        expect(started.some((c) => c.consoleSocket === sock)).toBe(false);
+        // The claim expires (10 s) with no session: the stop auto-attaches.
+        await until(() => started.some((c) => c.consoleSocket === sock), 12_000);
+    }, 20_000);
 });
 
 describe('with the R console turned off', () => {

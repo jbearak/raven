@@ -149,4 +149,10 @@ describe('raven.editorHasChunks', () => {
         log.getText = () => { throw new Error('read'); };
         expect(has_navigable_chunks(log as never)).toBe(false);
     });
+
+    test('a Markdown file switched to R mode has no navigable chunks', () => {
+        // The commands treat it as Markdown, so the keys must not fire.
+        const md = doc('# T\n\n```{r}\nx <- 1\n```\n', 'r', '/w/notes.md');
+        expect(has_navigable_chunks(md as never)).toBe(false);
+    });
 });
