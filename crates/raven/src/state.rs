@@ -13737,21 +13737,24 @@ fn collect_files_matching_inner(
 
         // `is_dir()` follows symlinks, so a symlink to a directory is walked
         // (after the cycle check) and a symlink to a file falls through to the
-        // `accept` branch. A directory that lists its names but denies access
-        // to them (mode 0400) can't say which are directories, so that is a
-        // walk error of `dir`, reported once, unless the entry would be pruned
-        // as a directory anyway; a dangling symlink (not found) is just no
-        // directory.
+        // `accept` branch. An entry whose type can't be read for lack of
+        // permission is a walk error, unless it would be pruned as a directory
+        // anyway: a symlink whose target can't be reached is named itself; a
+        // directory that lists its names but denies access to them (mode 0400)
+        // is named once. A dangling symlink (not found) is just no directory.
         let is_dir = match fs::metadata(&path) {
             Ok(metadata) => metadata.is_dir(),
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::PermissionDenied
-                    && !unexamined_reported
                     && !skip_listed()
                     && !excluded()
                 {
-                    unexamined_reported = true;
-                    errors.push((dir.to_path_buf(), error));
+                    if fs::symlink_metadata(&path).is_ok() {
+                        errors.push((path.clone(), error));
+                    } else if !unexamined_reported {
+                        unexamined_reported = true;
+                        errors.push((dir.to_path_buf(), error));
+                    }
                 }
                 false
             }

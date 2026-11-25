@@ -362,14 +362,12 @@ impl Json<'_> {
         )
     }
 
-    /// lintr's markers, `(comment start, line, marker)` in source order,
-    /// with `start`/`end` paired as the lint track pairs them: a `start`
-    /// while a block is open, and an `end` with none open, do nothing; a
-    /// `start` nothing closes runs to the last line.
-    /// The `# nolint` markers' directive objects. Block markers pair as the
-    /// lint track (`linting::nolint::Suppressions`) pairs them: in line order,
-    /// one block open at a time, a start inside an open block ignored, and
-    /// any end closing the open block, whether each is a `# nolint` marker or
+    /// The directive objects for lintr's markers, `(comment start, line,
+    /// marker)` in source order. Block markers pair as the lint track
+    /// (`linting::nolint::Suppressions`) pairs them: in line order, one block
+    /// open at a time, a start inside an open block or an end with none open
+    /// doing nothing, any end closing the open block, and a start nothing
+    /// closes running to the last line, whether each is a `# nolint` marker or
     /// a `# raven:` / `@lsp-` block marker (`raven_blocks`: line, and `true`
     /// for a start).
     fn nolint(

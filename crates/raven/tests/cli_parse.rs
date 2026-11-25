@@ -102,6 +102,31 @@ fn workspace_mode_prints_only_the_workspace_files() {
     assert_eq!(paths(&documents(&output)), ["child.R", "main.R"]);
 }
 
+/// A symlink whose target sits behind a directory that can't be searched
+/// hides that target: the run is an operator error that names the link.
+#[cfg(unix)]
+#[test]
+fn symlink_into_unsearchable_directory_names_the_link() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (tmp, ws) = workspace();
+    write(&ws, "top.R", b"x <- 1\n");
+    write(tmp.path(), "vault/inner/a.R", b"y <- 1\n");
+    std::os::unix::fs::symlink(tmp.path().join("vault/inner"), ws.join("link")).unwrap();
+    let vault = tmp.path().join("vault");
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::metadata(ws.join("link")).is_ok() {
+        // Running as root: permissions don't stop the walk.
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let output = parse_in(&ws, &[]);
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(paths(&documents(&output)), ["top.R"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("/link: "), "{stderr}");
+}
+
 /// A directory that can't be listed (mode 0000), or whose entries can't be
 /// examined (mode 0400: names but not whether each is a directory), hides
 /// files that should have been printed: the rest are still printed, and the

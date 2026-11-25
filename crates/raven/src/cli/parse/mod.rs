@@ -324,7 +324,11 @@ fn requested_path(file: &Path, root: &Path) -> PathBuf {
         if let Ok(opened) = std::fs::canonicalize(&prefix)
             && collapsed.as_ref() != Some(&opened)
         {
-            return opened.join(rest);
+            return if rest.as_os_str().is_empty() {
+                opened
+            } else {
+                opened.join(rest)
+            };
         }
     }
     if lexical.starts_with(root) {
