@@ -1280,10 +1280,11 @@ fn requested_path_follows_a_symlink_before_dot_dot() {
         requested_path(Path::new("alias/../nested/data.R"), &root),
         base.join("other/nested/data.R")
     );
-    // A directory argument ending in `..` is the target's parent.
+    // A directory argument ending in `..` is the target's parent, with no
+    // trailing slash (`PathBuf` equality ignores one, so compare the text).
     assert_eq!(
-        requested_path(Path::new("alias/.."), &root),
-        base.join("other")
+        requested_path(Path::new("alias/.."), &root).as_os_str(),
+        base.join("other").as_os_str()
     );
     // Without a symlink, `..` still collapses lexically.
     assert_eq!(

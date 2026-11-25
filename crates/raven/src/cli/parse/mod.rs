@@ -260,7 +260,7 @@ fn requests(files: &[PathBuf], root: &Path, prepared: &PreparedWorkspace) -> (Ve
                 .state
                 .workspace_exclusions
                 .for_discovery_directory(&path);
-            let errors = crate::state::collect_files_matching_for_discovery_with_errors(
+            let errors = crate::state::collect_files_matching_for_discovery_with_entry_errors(
                 &path,
                 &mut walked,
                 is_r_file,

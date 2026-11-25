@@ -13626,7 +13626,17 @@ pub(crate) fn collect_files_matching(
     out: &mut Vec<PathBuf>,
     accept: fn(&Path) -> bool,
 ) {
-    collect_files_matching_impl(dir, out, accept, None, false, &mut Vec::new());
+    collect_files_matching_impl(
+        dir,
+        out,
+        accept,
+        None,
+        false,
+        &mut WalkErrors {
+            entry_types: false,
+            found: Vec::new(),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -13642,7 +13652,10 @@ pub(crate) fn collect_files_matching_with_exclusions(
         accept,
         (!exclusions.is_empty()).then_some(exclusions),
         false,
-        &mut Vec::new(),
+        &mut WalkErrors {
+            entry_types: false,
+            found: Vec::new(),
+        },
     );
 }
 
@@ -13655,17 +13668,57 @@ pub(crate) fn collect_files_matching_for_discovery(
     let _ = collect_files_matching_for_discovery_with_errors(dir, out, accept, exclusions);
 }
 
+/// The discovery walk, also returning each directory it couldn't list or
+/// resolve, with the error. `raven lint` exits 2 on any of them.
 pub(crate) fn collect_files_matching_for_discovery_with_errors(
     dir: &Path,
     out: &mut Vec<PathBuf>,
     accept: fn(&Path) -> bool,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> Vec<(PathBuf, std::io::Error)> {
-    let mut errors = Vec::new();
+    collect_for_discovery(dir, out, accept, exclusions, false)
+}
+
+/// [`collect_files_matching_for_discovery_with_errors`], also reporting each
+/// entry whose type can't be read for lack of permission, which the walk
+/// otherwise skips as "not a directory": a symlink whose target sits behind a
+/// directory that can't be searched (named by the link), and a directory that
+/// lists its names but can't be searched, such as mode 0444 (named once).
+/// Only `raven parse` and the scan behind `raven graph` ask for these; the
+/// files found are the same either way.
+pub(crate) fn collect_files_matching_for_discovery_with_entry_errors(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> Vec<(PathBuf, std::io::Error)> {
+    collect_for_discovery(dir, out, accept, exclusions, true)
+}
+
+fn collect_for_discovery(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    entry_types: bool,
+) -> Vec<(PathBuf, std::io::Error)> {
+    let mut errors = WalkErrors {
+        entry_types,
+        found: Vec::new(),
+    };
     if !exclusions.is_gitignored(dir, true) {
         collect_files_matching_impl(dir, out, accept, Some(exclusions), true, &mut errors);
     }
-    errors
+    errors.found
+}
+
+/// What the walk couldn't read.
+struct WalkErrors {
+    /// Whether to report entries whose type can't be read for lack of
+    /// permission, not just directories that can't be listed. See
+    /// [`collect_files_matching_for_discovery_with_entry_errors`].
+    entry_types: bool,
+    found: Vec<(PathBuf, std::io::Error)>,
 }
 
 fn collect_files_matching_impl(
@@ -13674,7 +13727,7 @@ fn collect_files_matching_impl(
     accept: fn(&Path) -> bool,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
     discovery: bool,
-    errors: &mut Vec<(PathBuf, std::io::Error)>,
+    errors: &mut WalkErrors,
 ) {
     let mut visited = HashSet::new();
     // Seed with the canonical root so a symlink pointing back at the root (or
@@ -13700,12 +13753,12 @@ fn collect_files_matching_inner(
     accept: fn(&Path) -> bool,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
     discovery: bool,
-    errors: &mut Vec<(PathBuf, std::io::Error)>,
+    errors: &mut WalkErrors,
 ) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
-            errors.push((dir.to_path_buf(), error));
+            errors.found.push((dir.to_path_buf(), error));
             return;
         }
     };
@@ -13716,7 +13769,7 @@ fn collect_files_matching_inner(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                errors.push((dir.to_path_buf(), error));
+                errors.found.push((dir.to_path_buf(), error));
                 continue;
             }
         };
@@ -13737,23 +13790,25 @@ fn collect_files_matching_inner(
 
         // `is_dir()` follows symlinks, so a symlink to a directory is walked
         // (after the cycle check) and a symlink to a file falls through to the
-        // `accept` branch. An entry whose type can't be read for lack of
-        // permission is a walk error, unless it would be pruned as a directory
-        // anyway: a symlink whose target can't be reached is named itself; a
-        // directory that lists its names but denies access to them (mode 0400)
-        // is named once. A dangling symlink (not found) is just no directory.
+        // `accept` branch. When `errors.entry_types` asks for it, an entry
+        // whose type can't be read for lack of permission is a walk error,
+        // unless it would be pruned as a directory anyway: a symlink whose
+        // target can't be reached is named itself; a directory that lists its
+        // names but denies access to them (mode 0400) is named once. A
+        // dangling symlink (not found) is just no directory.
         let is_dir = match fs::metadata(&path) {
             Ok(metadata) => metadata.is_dir(),
             Err(error) => {
-                if error.kind() == std::io::ErrorKind::PermissionDenied
+                if errors.entry_types
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
                     && !skip_listed()
                     && !excluded()
                 {
                     if fs::symlink_metadata(&path).is_ok() {
-                        errors.push((path.clone(), error));
+                        errors.found.push((path.clone(), error));
                     } else if !unexamined_reported {
                         unexamined_reported = true;
-                        errors.push((dir.to_path_buf(), error));
+                        errors.found.push((dir.to_path_buf(), error));
                     }
                 }
                 false
@@ -13772,7 +13827,7 @@ fn collect_files_matching_inner(
                 Ok(c) => c,
                 Err(e) => {
                     log::trace!("Skipping unresolvable dir {}: {}", path.display(), e);
-                    errors.push((path, e));
+                    errors.found.push((path, e));
                     continue;
                 }
             };
@@ -14103,7 +14158,7 @@ pub(crate) fn scan_workspace_reporting(
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            let errors = collect_files_matching_for_discovery_with_errors(
+            let errors = collect_files_matching_for_discovery_with_entry_errors(
                 &path,
                 &mut file_paths,
                 is_stat_model_extension,

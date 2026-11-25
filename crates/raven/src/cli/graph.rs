@@ -1414,6 +1414,46 @@ mod tests {
         );
     }
 
+    /// A symlink whose target sits behind a directory that can't be searched,
+    /// and a directory that lists its names but can't be searched (mode 0444),
+    /// hide files from the graph too, so the graph is incomplete and names
+    /// them.
+    #[cfg(unix)]
+    #[test]
+    fn unsearchable_entries_are_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(tmp.path(), "a.R", "x <- 1\n");
+        write(tmp.path(), "searchless/sub/b.R", "y <- 1\n");
+        write(outside.path(), "vault/inner/c.R", "z <- 1\n");
+        std::os::unix::fs::symlink(outside.path().join("vault/inner"), tmp.path().join("link"))
+            .unwrap();
+        let vault = outside.path().join("vault");
+        let searchless = tmp.path().join("searchless");
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&searchless, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let blocked = std::fs::metadata(tmp.path().join("link")).is_err();
+        let report = blocked.then(|| report(tmp.path(), true));
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&searchless, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(report) = report else {
+            // Running as root: permissions don't stop the walk.
+            return;
+        };
+        assert!(!report.complete);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("2 director(ies) couldn't be listed")
+                    && w.contains("link (")
+                    && w.contains("searchless (")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
     /// `source("https://...")` reads a URL, not a local file: no edge to a
     /// missing `https:/...` file, but a dropped row that says why.
     #[test]

@@ -142,3 +142,37 @@ fn lint_unreadable_directory_is_an_operator_error() {
         assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
     }
 }
+
+/// A symlink whose target sits behind a directory that can't be searched, and
+/// a directory that lists its names but can't be searched (mode 0444), hide
+/// no R file `raven lint` would read: the run lints the rest and exits as
+/// usual, without a walk error. Only a directory that can't be listed at all
+/// (above) is an operator error for lint.
+#[cfg(unix)]
+#[test]
+fn lint_unsearchable_entries_are_skipped_without_an_operator_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("ws");
+    write(&root, "top.R", "x <- 1   \n");
+    write(&root, "searchless/sub/a.R", "y <- 1\n");
+    write(temp.path(), "vault/inner/b.R", "z <- 1\n");
+    std::os::unix::fs::symlink(temp.path().join("vault/inner"), root.join("link")).unwrap();
+    let vault = temp.path().join("vault");
+    let searchless = root.join("searchless");
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(&searchless, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let blocked = std::fs::metadata(root.join("link")).is_err();
+    let output = run(&root, &["lint", "--no-config", "--no-color", "."]);
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&searchless, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        // Running as root: permissions don't stop the walk.
+        return;
+    }
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("top.R:1:7"), "{text}");
+    assert!(text.contains("trailing_whitespace"), "{text}");
+    assert!(!text.contains("cannot read dir"), "{text}");
+}
