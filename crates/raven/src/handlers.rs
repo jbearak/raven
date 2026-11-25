@@ -9979,6 +9979,12 @@ fn infix_sites_from_snapshot(
             let line = position.row as u32;
             let column = byte_offset_to_utf16_column(line_text(position.row), position.column);
             stream.advance_to(line, column);
+            // The file's own `library()` calls that have run at the call: those
+            // above it, or all of them for a call in a function body, which
+            // runs after the file's top level.
+            let in_function = std::iter::successors(operator.parent(), Node::parent)
+                .any(|node| node.kind() == "function_definition");
+            let attaches_before = (!in_function).then_some((line, column));
             // As the undefined-variable collector: a same-file binding made
             // later is no binding here, unless R binds it late.
             let found = stream.symbol_with_layer(op).filter(|(symbol, _)| {
@@ -10016,11 +10022,12 @@ fn infix_sites_from_snapshot(
                         }
                         Some(Some(_)) => InfixSite::Shadowed,
                         // A non-function value: R's lookup skips it.
-                        Some(None) => attached_at(stream, snapshot, analysis),
+                        Some(None) => attached_at(stream, snapshot, uri, analysis, attaches_before),
                         // A binding with no assignment to read (`assign()`, a
                         // `# raven: func` directive): the file's last binding.
-                        None => file_final_infix_site(op, analysis)
-                            .unwrap_or_else(|| attached_at(stream, snapshot, analysis)),
+                        None => file_final_infix_site(op, analysis).unwrap_or_else(|| {
+                            attached_at(stream, snapshot, uri, analysis, attaches_before)
+                        }),
                     }
                 }
                 // A contributed name is the package's own definition or what
@@ -10040,11 +10047,11 @@ fn infix_sites_from_snapshot(
                             tiers: vec![importers.iter().cloned().collect()],
                             inherited: Vec::new(),
                         },
-                        _ => attached_at(stream, snapshot, analysis),
+                        _ => attached_at(stream, snapshot, uri, analysis, attaches_before),
                     }
                 }
                 Some(_) => InfixSite::Shadowed,
-                None => attached_at(stream, snapshot, analysis),
+                None => attached_at(stream, snapshot, uri, analysis, attaches_before),
             };
             sites.insert(operator.start_byte(), site);
         }
@@ -10059,16 +10066,22 @@ fn infix_sites_from_snapshot(
 /// its bare name.
 ///
 /// In the package's own files the imports come first, as the namespace's
-/// imports environment precedes the search path. Elsewhere each package a
-/// top-level `library()` call in this file attaches is its own tier, the
-/// most recently attached first, since R puts each new attachment in front.
-/// Everything else (what callers attach, a package attached again after a
-/// caller attached it) was attached before this file ran, in an order Raven
-/// doesn't know, so it forms one last tier.
+/// imports environment precedes the search path. Elsewhere each package
+/// this file attaches, through a top-level `library()` call or one in a
+/// file it sources ([`attach_order`]), is its own tier, the most recently
+/// attached first, since R puts each new attachment in front. Only calls
+/// before `before` (the call's position) count; `None` counts them all, for
+/// a call in a function body. What callers attached came before this file
+/// ran, in an order Raven doesn't know, so it forms one last tier. A package
+/// attached some other way here (a `library()` in an enclosing function)
+/// could be more recent than any of the file's own, so when there is one,
+/// the file's own attachments and it share a single tier instead.
 fn attached_at(
     stream: &mut SnapshotScopeStream<'_>,
     snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
     analysis: &NseAnalysis,
+    before: Option<(u32, u32)>,
 ) -> InfixSite {
     let scope = stream.package_snapshot();
     let imports = &snapshot.scope_contribution.full_imports;
@@ -10078,29 +10091,53 @@ fn attached_at(
         tiers.push(imports.iter().cloned().collect());
     }
     let mut recent: Vec<&String> = Vec::new();
+    let mut first_attached = HashMap::new();
     if !package_file {
-        let mut calls: Vec<_> = snapshot
-            .directive_meta
-            .library_calls
+        attach_order(
+            snapshot,
+            &snapshot.directive_meta,
+            uri,
+            &[],
+            before,
+            &mut HashSet::new(),
+            &mut first_attached,
+        );
+        let mut ordered: Vec<(&String, &Vec<(u32, u32)>)> = first_attached
             .iter()
-            .filter(|call| call.attaches && call.function_scope.is_none())
+            .filter(|(package, _)| {
+                scope.attached_packages.contains(*package)
+                    && !scope.inherited_packages.contains(*package)
+            })
             .collect();
-        calls.sort_by_key(|call| (call.line, call.column));
-        for call in calls {
-            if scope.attached_packages.contains(&call.package)
-                && !scope.inherited_packages.contains(&call.package)
-                && !recent.contains(&&call.package)
-            {
-                recent.push(&call.package);
-            }
-        }
+        ordered.sort_by(|a, b| a.1.cmp(b.1));
+        recent = ordered.into_iter().map(|(package, _)| package).collect();
     }
-    tiers.extend(recent.iter().rev().map(|package| vec![(*package).clone()]));
+    let unplaced: Vec<String> = scope
+        .attached_packages
+        .iter()
+        .filter(|package| {
+            !package_file
+                && !recent.contains(package)
+                && !scope.inherited_packages.contains(*package)
+        })
+        .cloned()
+        .collect();
+    if unplaced.is_empty() {
+        tiers.extend(recent.iter().rev().map(|package| vec![(*package).clone()]));
+    } else {
+        tiers.push(
+            recent
+                .iter()
+                .map(|package| (*package).clone())
+                .chain(unplaced.iter().cloned())
+                .collect(),
+        );
+    }
     let mut rest: Vec<String> = scope
         .attached_packages
         .iter()
         .chain(imports.iter().filter(|_| !package_file))
-        .filter(|package| !recent.contains(package))
+        .filter(|package| !recent.contains(package) && !unplaced.contains(*package))
         .cloned()
         .collect();
     rest.sort();
@@ -10109,6 +10146,64 @@ fn attached_at(
     let mut inherited: Vec<String> = scope.inherited_packages.iter().cloned().collect();
     inherited.sort();
     InfixSite::Packages { tiers, inherited }
+}
+
+/// When each package the top level of `meta`'s file (at `uri`) attaches is
+/// first attached, before `before` (all of them when `None`): the path of
+/// call positions to its first top-level attaching `library()`, through the
+/// `source()` calls of the files it sources, which run whole. Paths compare
+/// in execution order. `prefix` is the path to this file; `visited` stops a
+/// cycle, and a file reached again attaches nothing new.
+fn attach_order(
+    snapshot: &DiagnosticsSnapshot,
+    meta: &crate::cross_file::CrossFileMetadata,
+    uri: &Url,
+    prefix: &[(u32, u32)],
+    before: Option<(u32, u32)>,
+    visited: &mut HashSet<Url>,
+    first_attached: &mut HashMap<String, Vec<(u32, u32)>>,
+) {
+    if !visited.insert(uri.clone()) {
+        return;
+    }
+    let runs = |position: (u32, u32)| before.is_none_or(|cursor| position < cursor);
+    let path = |position| prefix.iter().copied().chain([position]).collect::<Vec<_>>();
+    for call in &meta.library_calls {
+        let position = (call.line, call.column);
+        if call.attaches && call.function_scope.is_none() && runs(position) {
+            let path = path(position);
+            first_attached
+                .entry(call.package.clone())
+                .and_modify(|first| {
+                    if path < *first {
+                        first.clone_from(&path);
+                    }
+                })
+                .or_insert(path);
+        }
+    }
+    for edge in snapshot.cross_file_graph.get_dependencies(uri) {
+        let Some(line) = edge.call_site_line else {
+            continue;
+        };
+        let position = (line, edge.call_site_column.unwrap_or(0));
+        if edge.kind != crate::cross_file::dependency::DependencyEdgeKind::OrdinarySource
+            || !runs(position)
+        {
+            continue;
+        }
+        if let Some(child) = snapshot.metadata_map.get(&edge.to) {
+            attach_order(
+                snapshot,
+                child,
+                &edge.to,
+                &path(position),
+                None,
+                visited,
+                first_attached,
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33074,13 +33169,36 @@ d[n > 1, older] := 1
     /// Run the full diagnostics pipeline on the script `code` against
     /// [`where_library`]. Returns the names reported as undefined variables.
     async fn where_undefined_names(code: &str) -> Vec<String> {
+        where_undefined_names_sourcing(code, &[]).await
+    }
+
+    /// [`where_undefined_names`] for a `main.R` that may source `children`
+    /// (file name, text) from its directory.
+    async fn where_undefined_names_sourcing(code: &str, children: &[(&str, &str)]) -> Vec<String> {
         let (_root, lib) = where_library().await;
         let uri = Url::parse("file:///workspace/main.R").unwrap();
         let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.package_library_ready = true;
         state.package_library = Arc::new(lib);
-        state.open_document(uri.clone(), code, Some(1));
+        let files = children
+            .iter()
+            .map(|(name, text)| {
+                (
+                    Url::parse(&format!("file:///workspace/{name}")).unwrap(),
+                    *text,
+                )
+            })
+            .chain([(uri.clone(), code)]);
+        for (file, text) in files {
+            state.open_document(file.clone(), text, Some(1));
+            state.cross_file_graph.update_file(
+                &file,
+                &crate::cross_file::extract_metadata(text),
+                None,
+                |_| None,
+            );
+        }
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
         let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
             .expect("diagnostics");
@@ -33116,6 +33234,24 @@ d[n > 1, older] := 1
         assert_eq!(
             where_undefined_names(depends_attached).await,
             Vec::<String>::new()
+        );
+        // A sourced file's `library()` calls run at its `source()` call.
+        let source_setup = "source(\"setup.R\")\nd <- 1\nd %where% captured_setup\n";
+        let setup = [("setup.R", "library(plain)\nlibrary(capa)\n")];
+        assert_eq!(
+            where_undefined_names_sourcing(source_setup, &setup).await,
+            Vec::<String>::new()
+        );
+        let setup = [("setup.R", "library(capa)\nlibrary(plain)\n")];
+        assert_eq!(
+            where_undefined_names_sourcing(source_setup, &setup).await,
+            vec!["captured_setup"]
+        );
+        let source_after = "library(capa)\nsource(\"child.R\")\nd <- 1\nd %where% missing_child\n";
+        let child = [("child.R", "library(plain)\n")];
+        assert_eq!(
+            where_undefined_names_sourcing(source_after, &child).await,
+            vec!["missing_child"]
         );
         let agreeing = "library(capa)\nlibrary(capb)\nd <- 1\nd %where% captured\n";
         assert_eq!(where_undefined_names(agreeing).await, Vec::<String>::new());
