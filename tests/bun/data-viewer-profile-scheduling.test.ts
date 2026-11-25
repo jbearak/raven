@@ -287,6 +287,28 @@ describe('quartiles after a sort', () => {
         await reader.close();
     });
 
+    // The extension's engine: the profile cache and the sort keys live
+    // in the scan worker thread, and the host asks again after a sort.
+    test('worker threads: a profile asked for again after a sort has exact quartiles', async () => {
+        const engine = await WorkerEngine.start({
+            filePath: PATH,
+            nrow: NROW,
+            readerScript: join(THREADS, 'reader-thread.ts'),
+            scanScript: join(THREADS, 'scan-worker.ts'),
+        });
+        try {
+            const before = await engine.profile(0, signal());
+            expect(before.quantiles?.exact).toBe(false);
+            const t = await engine.compute({ sort: { keys: [{ columnIndex: 0, direction: 'asc' }], labelsOnWhenSorted: true } });
+            expect(await engine.coordinator.install(t)).toBe(true);
+            const after = await engine.profile(0, signal());
+            expect(after.quantiles).toEqual({ ...trueQuartiles(), exact: true });
+            expect((await engine.profile(1, signal())).quantiles?.exact).toBe(false);
+        } finally {
+            await engine.dispose();
+        }
+    }, 60_000);
+
     test('a profile whose scan a sort interrupted is exact when it finishes', async () => {
         const reader = await ArrowSliceReader.open(PATH);
         const engine = new LocalEngine(reader);
