@@ -200,6 +200,11 @@ class ThreadClient {
         opts: { onProgress?: (v: unknown) => void; reissue?: boolean; onId?: (id: number) => void } = {},
     ): Promise<T> {
         if (this.disposed) return Promise.reject(abortError(`${this.name} thread disposed`));
+        // A thread that never opened its file is not restarted (see
+        // onExit) and would never answer.
+        if (!this.worker || !this.opened.has(this.worker)) {
+            return Promise.reject(restartError(`${this.name} thread did not open its file`));
+        }
         const id = this.nextId++;
         opts.onId?.(id);
         const full = { ...msg, id };

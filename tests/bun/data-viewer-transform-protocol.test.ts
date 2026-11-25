@@ -467,6 +467,22 @@ describe('WorkerEngine: thread lifecycles', () => {
         expect(err).toBeInstanceOf(Error);
     }, 30_000);
 
+    test('a request issued while a cancel restarts onto a deleted file is rejected, not left waiting', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'raven-dv-gone-'));
+        const path = join(dir, 'tiny.arrow');
+        copyFileSync(TINY, path);
+        engine = await start(path, 5);
+        unlinkSync(path);
+        // A cancel or deadline terminates the scan thread and starts a
+        // replacement, which cannot open the deleted file. A request
+        // issued meanwhile waits for the restart, then must fail.
+        const restarted = engine.scan.terminateAndRestart(undefined, new Error('cancelled'));
+        const waiting = engine.compute({ sort: SORT_X_DESC }).then(() => undefined, e => e);
+        await restarted;
+        const err = await Promise.race([waiting, Bun.sleep(3000).then(() => 'still waiting')]);
+        expect(err).toBeInstanceOf(Error);
+    }, 30_000);
+
     test('a request naming a generation the reader does not hold is a protocol error', async () => {
         engine = await start(TINY, 5);
         const err = await engine.getRows({ start: 0, end: 1, columns: [0], viewportGeneration: 1 }, 123456)
