@@ -1635,6 +1635,70 @@ mod tests {
         assert!(report.complete);
     }
 
+    /// A batch in a file that inherits a working directory is expanded again
+    /// from that directory, and the warning is for that expansion: none when
+    /// only the first one (under the file's own directory) failed, and one
+    /// naming the inherited directory when only the final one did (issue
+    /// #886). A matching `.R` entry that is a directory fails a batch closed.
+    #[test]
+    fn list_files_batch_warning_is_for_the_final_expansion() {
+        // (own directory, inherited directory): `Some(true)` holds a member,
+        // `Some(false)` a failing entry, `None` exists and is empty.
+        for (own, inherited, edge, warns) in [
+            (Some(false), Some(true), true, false),
+            (Some(true), Some(false), false, true),
+            (Some(false), None, false, false),
+            (Some(true), Some(true), true, false),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write(
+                tmp.path(),
+                "main.R",
+                "# raven: cd wd\nsource(\"../scripts/child.R\")\n",
+            );
+            write(
+                tmp.path(),
+                "scripts/child.R",
+                "for (f in list.files(\"members\", pattern = \"[.]R$\", full.names = TRUE)) source(f)\n",
+            );
+            for (base, members) in [("scripts", own), ("wd", inherited)] {
+                let directory = tmp.path().join(base).join("members");
+                std::fs::create_dir_all(&directory).unwrap();
+                match members {
+                    Some(true) => std::fs::write(directory.join("ok.R"), "foo <- 3\n").unwrap(),
+                    Some(false) => std::fs::create_dir(directory.join("bad.R")).unwrap(),
+                    None => {}
+                }
+            }
+            let report = report(tmp.path(), true);
+            let case = format!(
+                "own {own:?}, inherited {inherited:?}: {:?}",
+                report.warnings
+            );
+            let members: Vec<&str> = report
+                .edges
+                .iter()
+                .filter(|e| e.kind == "list_files")
+                .map(|e| e.target.as_str())
+                .collect();
+            let expected: &[&str] = if edge { &["wd/members/ok.R"] } else { &[] };
+            assert_eq!(members, expected, "{case}");
+            let failed: Vec<&String> = report
+                .warnings
+                .iter()
+                .filter(|w| w.contains("list.files() source batch(es) failed"))
+                .collect();
+            assert_eq!(failed.len(), usize::from(warns), "{case}");
+            if warns {
+                let bad = Path::new("wd").join("members").join("bad.R");
+                assert!(failed[0].starts_with("1 list.files()"), "{case}");
+                assert!(failed[0].contains("scripts/child.R:1:"), "{case}");
+                assert!(failed[0].contains(bad.to_str().unwrap()), "{case}");
+            }
+            assert!(report.complete, "{case}");
+        }
+    }
+
     #[test]
     fn package_mode_is_reported() {
         let tmp = TempDir::new().unwrap();
