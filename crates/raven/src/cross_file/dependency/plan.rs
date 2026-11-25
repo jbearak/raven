@@ -128,6 +128,8 @@ pub(crate) enum DropReason {
     /// A forward directive stands in for this call (`update_file`'s
     /// directive-vs-AST coverage rule).
     Superseded,
+    /// A `source()` call that reads a URL, which names no local file.
+    Url,
 }
 
 /// One detected entry that produced no edge candidate.
@@ -409,6 +411,14 @@ where
     let mut ast_candidates: Vec<PlannedEdge> = Vec::new();
     for (index, source) in meta.sources.iter().enumerate() {
         if source.is_directive {
+            continue;
+        }
+        if source.is_url_source_call() {
+            plan.dropped.push(PlannedDrop {
+                entry: PlanEntry::Source(index),
+                reason: DropReason::Url,
+                target: None,
+            });
             continue;
         }
         let resolved = match &source.resolved_uri {

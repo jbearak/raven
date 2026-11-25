@@ -400,6 +400,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 - `superseded`: a forward directive stands in for the call. A `line=N` directive covers a call to the same file on line N; a call to another file on that line keeps its own edge. A plain `# raven: source` directive followed by a `line=eof` directive for the same file covers a later call to that file.
 - `duplicate`: merged with an identical edge, such as a repeated directive.
 - `no_path_context`: Raven couldn't resolve any path in the file. It shouldn't happen for files on disk.
+- `url`: a `source()` call that reads a URL, such as `source("https://example.com/setup.R")`. R reads it, but it names no local file.
 
 ### Graph limits
 

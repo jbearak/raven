@@ -404,6 +404,7 @@ fn reason_name(reason: DropReason) -> &'static str {
         DropReason::Unresolvable => "unresolvable",
         DropReason::SystemFileUnresolved => "system_file_unresolved",
         DropReason::Superseded => "superseded",
+        DropReason::Url => "url",
     }
 }
 
@@ -1411,6 +1412,32 @@ mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    /// `source("https://...")` reads a URL, not a local file: no edge to a
+    /// missing `https:/...` file, but a dropped row that says why.
+    #[test]
+    fn url_source_call_is_dropped_not_an_edge() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "main.R",
+            "source(\"https://example.invalid/setup.R\")\nsource(\"a.R\")\n",
+        );
+        write(tmp.path(), "a.R", "x <- 1\n");
+        let report = report(tmp.path(), true);
+        let targets: Vec<_> = report.edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["a.R"]);
+        assert_eq!(report.dropped.len(), 1);
+        let dropped = &report.dropped[0];
+        assert_eq!(dropped.reason, "url");
+        assert_eq!(
+            dropped.raw_path.as_deref(),
+            Some("https://example.invalid/setup.R")
+        );
+        assert_eq!(dropped.target, None);
+        assert!(report.complete, "{:?}", report.warnings);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     #[test]
