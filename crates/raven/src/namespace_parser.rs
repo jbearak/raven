@@ -138,6 +138,11 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
         if line.is_empty() {
             continue;
         }
+        // `export(x); if (FALSE)` starts with a known directive and still
+        // makes the next line conditional.
+        if !directive_is_whole_line(line) {
+            return None;
+        }
         let exported = extract_directive_args(line, "export")
             .or_else(|| extract_directive_args(line, "exportClasses"))
             .or_else(|| extract_directive_args(line, "exportMethods"));
@@ -157,7 +162,26 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
             None => {}
         }
     }
+    // The loader spells a pattern export as a name with this prefix, so a
+    // name that really starts with it can't be told from one.
+    if exports.iter().any(|name| name.starts_with("__PATTERN__:")) {
+        return None;
+    }
     Some(exports)
+}
+
+/// Whether `line` is one call and nothing else: the parenthesis that closes
+/// its first `(` is followed only by whitespace or a comment.
+fn directive_is_whole_line(line: &str) -> bool {
+    let Some(open) = line.find('(') else {
+        return false;
+    };
+    let after_open = &line[open + 1..];
+    let Some(close) = find_matching_paren(after_open) else {
+        return false;
+    };
+    let rest = after_open[close + 1..].trim_start();
+    rest.is_empty() || rest.starts_with('#')
 }
 
 /// Parse NAMESPACE file content to extract exported symbols and pattern markers.
@@ -937,6 +961,8 @@ mod tests {
             "export(keep)\nif (getRversion() < \"2.0.0\") {\n    export(pick)\n}\n",
             "if (FALSE) export(pick)\n",
             "export(keep)\nif (FALSE)\nexport(pick)\n",
+            "export(keep); if (FALSE)\nexport(pick)\n",
+            "export(keep) if (FALSE)\nexport(pick)\n",
         ] {
             assert_eq!(authoritative_exports(namespace), None, "{namespace}");
         }
@@ -952,6 +978,15 @@ mod tests {
         );
         assert_eq!(
             authoritative_exports("export(pick)\nexportClassPattern(\"^C\")\n"),
+            None
+        );
+    }
+
+    /// The loader's own marker for a pattern export, written as a name.
+    #[test]
+    fn an_export_spelled_like_the_pattern_marker_is_not_authoritative() {
+        assert_eq!(
+            authoritative_exports("export(\"__PATTERN__:pick\")\nexport(keep)\n"),
             None
         );
     }
