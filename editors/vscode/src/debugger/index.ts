@@ -53,6 +53,8 @@ export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
 let SOCKET_WAIT_MS = 10_000;
+/** How soon a refused control connection is tried again (`ConsoleLink.open_control`). */
+const CONTROL_RETRY_MS = 20;
 /**
  * How long a new console's first send waits for its breakpoints, and how
  * much longer it waits, once, for a mirror that is on its way to the console
@@ -370,6 +372,8 @@ class ConsoleLink {
     private mirrored_once: () => void = () => undefined;
     private gate_timer: ReturnType<typeof setTimeout> | undefined;
     private readonly gate_ms = MIRROR_GATE_MS;
+    /** The next attempt at a refused control connection (`open_control`). */
+    private retry_timer: ReturnType<typeof setTimeout> | undefined;
 
     constructor(readonly terminal: vscode.Terminal, readonly ipc: string) {
         // Code sent to a console before it knows the breakpoints would run
@@ -404,12 +408,34 @@ class ConsoleLink {
     }
 
     private async connect(): Promise<void> {
+        // One budget for the file and the connection: the file wait and the
+        // retries in `open_control` both end here.
+        const deadline = performance.now() + SOCKET_WAIT_MS;
         if (!(await wait_for_file(this.ipc, SOCKET_WAIT_MS)) || this.closed) return;
+        this.open_control(deadline);
+    }
+
+    /**
+     * Open the control connection. The first attempt is made however late
+     * the file appeared.
+     *
+     * The console's socket file exists from its `bind()`, and the console
+     * accepts from its `listen()`, a moment later (#912), so a connect that
+     * lands in between is refused. A refusal before the connection ever
+     * opened is retried every `CONTROL_RETRY_MS` while the link is open and
+     * `deadline` hasn't passed. Any other error (`ENOENT`: the file is gone)
+     * isn't retried. While the link is open, giving up is logged; a link
+     * that connects is the same as one whose first attempt did. Once
+     * connected, a lost connection is not re-established.
+     */
+    private open_control(deadline: number): void {
         const sock = net.createConnection(socket_endpoint(this.ipc));
         sock.setEncoding('utf8');
         this.control = sock;
+        let connected = false;
         let buf = '';
         sock.on('connect', () => {
+            connected = true;
             sock.write(JSON.stringify({ v: 1, id: 0, op: 'subscribe' }) + '\n');
         });
         sock.on('data', (chunk: string) => {
@@ -442,8 +468,29 @@ class ConsoleLink {
                 }
             }
         });
-        sock.on('error', () => undefined);
-        sock.on('close', () => { this.control = null; });
+        sock.on('error', (err: NodeJS.ErrnoException) => {
+            if (connected || this.closed) return;
+            const code = err.code ?? err.message;
+            if (code !== 'ECONNREFUSED' || performance.now() >= deadline) {
+                this.give_up(code);
+                return;
+            }
+            this.retry_timer = setTimeout(() => {
+                this.retry_timer = undefined;
+                if (this.closed) return;
+                if (performance.now() >= deadline) this.give_up(code);
+                else this.open_control(deadline);
+            }, CONTROL_RETRY_MS);
+        });
+        // A refused attempt's socket may close after its retry has begun.
+        sock.on('close', () => { if (this.control === sock) this.control = null; });
+    }
+
+    private give_up(code: string): void {
+        console.warn(
+            `raven: could not open the control connection to the R console at ${this.ipc} (${code}); `
+            + 'stop events and the breakpoint mirror are off for this console',
+        );
     }
 
     /**
@@ -597,6 +644,7 @@ class ConsoleLink {
     dispose(): void {
         this.mirrored_once();
         this.closed = true;
+        clearTimeout(this.retry_timer);
         deferred_stops.delete(this.ipc);
         this.control?.destroy();
         this.states = [];
