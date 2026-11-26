@@ -55329,7 +55329,7 @@ mod project_config_initialize_tests {
                 },
             })
             .await;
-        let installed = wait_for_state(backend, 5_000, |state| {
+        let installed = wait_for_state(backend, WATCHED_RESYNC_WAIT_MS, |state| {
             state
                 .cross_file_graph
                 .get_dependencies(&rmd_uri)
@@ -55357,7 +55357,7 @@ mod project_config_initialize_tests {
                 }],
             })
             .await;
-        let updated = wait_for_state(backend, 5_000, |state| {
+        let updated = wait_for_state(backend, WATCHED_RESYNC_WAIT_MS, |state| {
             let deps = state.cross_file_graph.get_dependencies(&rmd_uri);
             deps.iter().any(|e| e.to == extra_uri) && !deps.iter().any(|e| e.to == helpers_uri)
         })
@@ -63617,6 +63617,15 @@ infixContinuationStyle = "aligned"
         });
         state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
     }
+
+    /// Polling deadline for observing detached disk-backed resync work that a
+    /// passing run finishes in milliseconds. `wait_for_state` returns as soon
+    /// as its check passes, so only a lost or stalled update spends it; the
+    /// slack is for slow CI runners. The earlier five-second deadline failed
+    /// once on a runner about three times slower than usual (issue #621). It
+    /// does not bound a writer that never releases the state lock:
+    /// `wait_for_state` takes the read lock before checking the deadline.
+    const WATCHED_RESYNC_WAIT_MS: u64 = 30_000;
 
     /// Poll `check` against fresh `WorldState` read snapshots until it
     /// returns `true` or `timeout_ms` elapses. Returns whether the condition
