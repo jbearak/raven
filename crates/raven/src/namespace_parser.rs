@@ -112,9 +112,10 @@ pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
     exports
 }
 
-/// The names a NAMESPACE exports by name, when a static reader can vouch for
-/// them: `None` unless every line of the file is a directive this parser
-/// knows and none of them is a pattern export.
+/// The names a NAMESPACE exports with `export()`, when a static reader can
+/// vouch for them: `None` unless every line of the file is a directive this
+/// parser knows and none of them is a pattern export. S4 class and method
+/// exports are accepted as lines and contribute no name.
 ///
 /// R evaluates a NAMESPACE, and the file may hold `if` statements. An
 /// `export()` inside a branch R doesn't take exports nothing, and whether a
@@ -123,13 +124,18 @@ pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
 /// a file as evidence of anything. A missing or unreadable file is `None`
 /// too.
 pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Option<Vec<String>> {
-    const OTHER_DIRECTIVES: [&str; 6] = [
+    // `exportClasses(Rule)` exports the class's metadata object and
+    // `exportMethods(show)` a methods table: neither says that `pkg::Rule` or
+    // `pkg::show` is an exported function, so their names are not evidence.
+    const OTHER_DIRECTIVES: [&str; 8] = [
         "S3method",
         "import",
         "importFrom",
         "importClassesFrom",
         "importMethodsFrom",
         "useDynLib",
+        "exportClasses",
+        "exportMethods",
     ];
     let content = fs::read_to_string(namespace_path).ok()?;
     let normalized = normalize_multiline_directives(&content);
@@ -149,10 +155,13 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
         if line.contains('\\') {
             return None;
         }
-        let exported = extract_directive_args(line, "export")
-            .or_else(|| extract_directive_args(line, "exportClasses"))
-            .or_else(|| extract_directive_args(line, "exportMethods"));
-        match exported {
+        // The argument splitter trims a quoted name and splits a backticked
+        // one at its commas; R exports `" pick "` and `` `a,pick,b` `` as
+        // written.
+        if !quoted_names_are_plain(line) {
+            return None;
+        }
+        match extract_directive_args(line, "export") {
             Some(args) => exports.extend(
                 parse_comma_separated_args(&args)
                     .into_iter()
@@ -174,6 +183,22 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
         return None;
     }
     Some(exports)
+}
+
+/// Whether every quoted or backticked stretch of `line` is free of commas and
+/// whitespace, the characters the argument splitter trims or splits at.
+fn quoted_names_are_plain(line: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for ch in line.chars() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) if ch == ',' || ch.is_whitespace() => return false,
+            Some(_) => {}
+            None if matches!(ch, '"' | '\'' | '`') => quote = Some(ch),
+            None => {}
+        }
+    }
+    true
 }
 
 /// Whether `line` is one call and nothing else: the parenthesis that closes
@@ -951,11 +976,38 @@ mod tests {
                          S3method(print, widget)\nimportFrom(stats, sd)\nuseDynLib(pkg)\n";
         assert_eq!(
             authoritative_exports(namespace),
-            Some(vec![
-                "pick".to_string(),
-                "%where%".to_string(),
-                "show".to_string()
-            ])
+            Some(vec!["pick".to_string(), "%where%".to_string()])
+        );
+    }
+
+    /// `exportClasses(Rule)` exports the class's metadata, and R rejects
+    /// `pkg::Rule` unless `export(Rule)` is there too.
+    #[test]
+    fn an_s4_class_or_method_export_is_not_evidence_of_a_function() {
+        assert_eq!(
+            authoritative_exports("import(methods)\nexportClasses(Rule)\nexportMethods(show)\n"),
+            Some(vec![])
+        );
+        assert_eq!(
+            authoritative_exports("exportClasses(Rule)\nexport(Rule)\n"),
+            Some(vec!["Rule".to_string()])
+        );
+    }
+
+    /// R exports a quoted or backticked name as written; the splitter would
+    /// read `pick` out of each of these.
+    #[test]
+    fn a_quoted_name_with_a_comma_or_a_space_is_not_authoritative() {
+        for namespace in [
+            "export(`a,pick,b`)\n",
+            "export(\" pick \")\n",
+            "export('a, pick')\n",
+        ] {
+            assert_eq!(authoritative_exports(namespace), None, "{namespace}");
+        }
+        assert_eq!(
+            authoritative_exports("export(\"%where%\", \"[<-.widget\")\nS3method(\"[\", widget)\n"),
+            Some(vec!["%where%".to_string(), "[<-.widget".to_string()])
         );
     }
 

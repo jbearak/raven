@@ -22980,9 +22980,13 @@ fn resolve_call_arg_policy(
 /// the formals R binds them to, as far as the call's text shows. It doesn't
 /// when a label is no formal's exact name (R matches by prefix too), when
 /// the call forwards `...` (which may be empty, or carry a named argument),
-/// or when a pipe feeds the call (a placeholder may put the piped value
-/// anywhere). The mask is used regardless for every policy that predates
-/// issue #900; this guards only the one added there.
+/// when a pipe feeds the call (a placeholder may put the piped value
+/// anywhere), or when an argument is left empty (`f(, x)` binds `x` one
+/// formal later than its place among the written arguments). An argument
+/// holding `!!` fails it too: under `rlang::inject()` the injected name is
+/// evaluated before the call, whatever the formal captures. The mask is used
+/// regardless for every policy that predates issue #900; this guards only
+/// the one added there.
 fn arguments_bind_as_written(call: Node, text: &str, policy: &crate::nse::ArgPolicy) -> bool {
     let crate::nse::ArgPolicy::PerFormal { formals, .. } = policy else {
         return true;
@@ -22994,17 +22998,30 @@ fn arguments_bind_as_written(call: Node, text: &str, policy: &crate::nse::ArgPol
         return true;
     };
     let mut cursor = args.walk();
+    let (mut written, mut commas) = (0usize, 0usize);
+    for child in args.children(&mut cursor) {
+        match child.kind() {
+            "argument" => written += 1,
+            "comma" => commas += 1,
+            _ => {}
+        }
+    }
+    if commas > 0 && commas + 1 != written {
+        return false;
+    }
+    let mut cursor = args.walk();
     args.children(&mut cursor)
         .filter(|arg| arg.kind() == "argument")
         .all(|arg| {
-            let forwards_dots = arg
-                .child_by_field_name("value")
-                .is_some_and(|value| matches!(value.kind(), "dots" | "dot_dot_i"));
+            let value = arg.child_by_field_name("value");
+            let forwards_dots =
+                value.is_some_and(|value| matches!(value.kind(), "dots" | "dot_dot_i"));
+            let injects = value.is_some_and(|value| node_text(value, text).contains("!!"));
             let exact_label = arg.child_by_field_name("name").is_none_or(|label| {
                 let label = node_text(label, text);
                 formals.iter().any(|formal| formal == label)
             });
-            !forwards_dots && exact_label
+            !forwards_dots && !injects && exact_label
         })
 }
 

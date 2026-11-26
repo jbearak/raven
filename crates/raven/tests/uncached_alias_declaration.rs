@@ -15,6 +15,9 @@
 //! - `pkgb` exports the same two names, forces the second argument, and
 //!   declares nothing.
 //!
+//! Here both also export `ask`, whose first argument `cond` pkga captures
+//! and declares, and whose second, `data`, it evaluates.
+//!
 //! plus `pkgs`, which declares both an `[[operator]]` form and a
 //! `[[function]]` policy for its `%set%`.
 //!
@@ -40,6 +43,11 @@ captured = ["cond"]
 [[function]]
 name = "pick"
 formals = ["data", "cond"]
+captured = ["cond"]
+
+[[function]]
+name = "ask"
+formals = ["cond", "data"]
 captured = ["cond"]
 "#;
 
@@ -104,7 +112,7 @@ fn write(root: &Path, relative: &str, text: &str) {
 
 /// `declaring` is whether pkga ships its `raven/nse.toml`.
 fn install_fake_packages(lib: &Path, declaring: bool) {
-    let exports = "export(\"%where%\")\nexport(pick)\n";
+    let exports = "export(\"%where%\")\nexport(pick)\nexport(ask)\n";
     write(lib, "pkga/DESCRIPTION", "Package: pkga\nVersion: 0.1.0\n");
     write(lib, "pkga/NAMESPACE", exports);
     if declaring {
@@ -620,6 +628,50 @@ pick <- pkga::pick
     ]);
 }
 
+/// Calls where the declaration's per-formal mask would land on the wrong
+/// argument, or on a name R evaluates before the call. The declaration is
+/// not applied to them, so each is reported as it was before issue #900.
+#[test]
+fn calls_whose_arguments_the_declaration_would_misread_are_checked_as_before() {
+    check(&[
+        // R: object 't_empty' not found. The empty first argument leaves
+        // `cond` missing, so `t_empty` is `data`, which `ask` evaluates.
+        declared(
+            "empty_first_argument",
+            r#"
+--- main.R
+ask <- pkga::ask
+ask(, t_empty)
+"#,
+            &["t_empty"],
+            &["t_empty"],
+        ),
+        // R runs it: `t_asked` is `cond`, which `ask` captures.
+        declared(
+            "captured_first_argument",
+            r#"
+--- main.R
+ask <- pkga::ask
+ask(t_asked, 1)
+"#,
+            &[],
+            &["t_asked"],
+        ),
+        // R: object 't_inject' not found. `inject()` evaluates `!!t_inject`
+        // before `pick` is called.
+        declared(
+            "injected_argument",
+            r#"
+--- main.R
+pick <- pkga::pick
+rlang::inject(pick(1, !!t_inject))
+"#,
+            &["t_inject"],
+            &["t_inject"],
+        ),
+    ]);
+}
+
 /// Programs R stops on that go unreported once the alias's declaration is
 /// read. Each is equally unreported on main whenever pkga is in the package
 /// cache (a `library(pkga)` in any checked file, or the language server), so
@@ -641,18 +693,6 @@ f(cond = 1)
 "#,
             &[],
             &["t_dots"],
-        ),
-        // R: object 't_inject' not found. `inject()` evaluates `!!t_inject`
-        // before `pick` is called.
-        declared(
-            "injected_argument",
-            r#"
---- main.R
-pick <- pkga::pick
-rlang::inject(pick(1, !!t_inject))
-"#,
-            &[],
-            &["t_inject"],
         ),
         // R: object 't_assign' not found. The name of the replaced binding is
         // put together at run time.
