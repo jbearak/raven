@@ -125,8 +125,9 @@ pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
 /// too.
 pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Option<Vec<String>> {
     // `exportClasses(Rule)` exports the class's metadata object, never a
-    // function `Rule`: R rejects `pkg::Rule` unless `export(Rule)` is there
-    // too. So the line is accepted and its names are not evidence.
+    // function `Rule`: R rejects `pkg::Rule` unless an `export()` or
+    // `exportMethods()` line names it too. So the line is accepted and its
+    // names are not evidence.
     const OTHER_DIRECTIVES: [&str; 7] = [
         "S3method",
         "import",
@@ -157,9 +158,16 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
         let exported = extract_directive_args(line, "export")
             .or_else(|| extract_directive_args(line, "exportMethods"));
         match exported {
+            // The splitter unquotes `"name"` and leaves `` `name` `` as
+            // written; R reads both as the name.
             Some(args) => exports.extend(
                 parse_comma_separated_args(&args)
                     .into_iter()
+                    .map(|name| {
+                        name.strip_prefix('`')
+                            .and_then(|name| name.strip_suffix('`'))
+                            .map_or(name.clone(), str::to_string)
+                    })
                     .filter(|name| !name.is_empty()),
             ),
             // A pattern export, a conditional, a brace, or anything else.
@@ -975,6 +983,12 @@ mod tests {
         assert_eq!(
             authoritative_exports("exportClasses(Rule)\nexport(Rule)\nexportMethods(query)\n"),
             Some(vec!["Rule".to_string(), "query".to_string()])
+        );
+        // A class with a non-syntactic name, and its constructor exported in
+        // backticks.
+        assert_eq!(
+            authoritative_exports("exportClasses(\"text/html\")\nexport(`text/html`)\n"),
+            Some(vec!["text/html".to_string()])
         );
     }
 
