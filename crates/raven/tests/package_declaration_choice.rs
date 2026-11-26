@@ -35,17 +35,18 @@
 //! the function R calls captures its second argument (pkga's, or in one
 //! fixture the file's own), so nothing may be reported. Each one defeats
 //! some rule for picking the declaration from the text of the file, such as
-//! "the last `library()` call wins" or "a namespace load doesn't count". The
-//! last test holds the three kinds of program from the issue, which R stops
-//! on and Raven doesn't report, and says why they stay that way.
+//! "the last `library()` call wins" or "a namespace load doesn't count".
+//! [`programs_r_stops_on_apply_the_declaration_anyway`] holds the three kinds
+//! of program from issue #883, which R stops on and Raven doesn't report, and
+//! says why they stay that way. The last test pins issue #900's programs.
 //!
 //! Two checks keep a fixture from passing for the wrong reason. The harness
 //! appends an undefined `live_control` to every R file, which R never saw,
 //! and requires a report for each, so "nothing reported" can't mean "file
 //! not analyzed". And it runs every fixture that expects no report a second
-//! time against a library where pkga declares nothing, and requires Raven
-//! to report exactly the names the declaration hides, so the silence is
-//! pkga's declaration and not a call Raven skips anyway.
+//! time against a library where no package ships a declaration, and
+//! requires Raven to report exactly the names the declarations hide, so the
+//! silence is a declaration's and not a call Raven skips anyway.
 //!
 //! The binary runs with a cleared environment and an R path that doesn't
 //! exist, so the fake library is the only one.
@@ -310,7 +311,7 @@ fn run(case: &Case, declaring: &Path, undeclaring: &Path) -> Result<(), String> 
         let hidden = sorted(case.hidden);
         if undeclared != hidden {
             return Err(format!(
-                "{}: without pkga's declaration reported {undeclared:?}, expected {hidden:?}",
+                "{}: without package declarations reported {undeclared:?}, expected {hidden:?}",
                 case.name
             ));
         }
@@ -1295,11 +1296,12 @@ library(pkga)
     ]);
 }
 
-/// Issue #900: when two attached packages both declare a name, Raven applies
-/// the declaration of the package whose name sorts first, not the one R
-/// finds (the one attached last). Pinned at today's results, which are R's
-/// in some rows and not in others. The comment on each case says what R
-/// does with real packages built like the fakes.
+/// Issue #900: when two packages Raven counts at the call both declare a
+/// name, Raven applies the declaration of the package whose name sorts
+/// first, not the one R finds (the one attached last). Pinned at today's
+/// results, which are R's in some cases and not in others. The comment on
+/// each case says what R does with real packages built like the fakes. A
+/// change that makes a case agree with R should update its pin.
 ///
 /// The data-mask pair is why this wasn't fixed by following the attach
 /// order. zmask900 and zz884 ship the same declaration (the right operand is
@@ -1326,6 +1328,30 @@ suppressPackageStartupMessages(library(zz884))
 print(1 %pick884% r1_operand)
 "#,
             &["r1_operand"],
+        ),
+        // Both operands undefined, so the pin shows whose declaration
+        // applies: aa884's captures the left one. R: object 'lr1_left' not
+        // found (zz884 attached last evaluates the left operand).
+        reports(
+            "two_declarers_zz_last_both_operands",
+            r#"
+--- main.R
+library(aa884)
+suppressPackageStartupMessages(library(zz884))
+print(lr1_left %pick884% lr1_right)
+"#,
+            &["lr1_right"],
+        ),
+        // R: object 'lr2_right' not found (aa884 attached last).
+        reports(
+            "two_declarers_aa_last_both_operands",
+            r#"
+--- main.R
+library(zz884)
+suppressPackageStartupMessages(library(aa884))
+print(lr2_left %pick884% lr2_right)
+"#,
+            &["lr2_right"],
         ),
         // R: object 'r2_operand' not found (aa884 attached last).
         reports(
