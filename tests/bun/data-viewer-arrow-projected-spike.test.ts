@@ -110,7 +110,13 @@ let SOURCE: 'R' | 'JS' = 'JS';
 let FILE = '';
 
 beforeAll(async () => {
-    if (await rHasArrow()) {
+    const has_arrow = await rHasArrow();
+    // CI's real-R step sets RAVEN_TEST_REQUIRE_LIVE_SUITES=1 to require the
+    // R-written file; the plain `bun test` run (no arrow) takes the JS path.
+    if (!has_arrow && process.env.RAVEN_TEST_REQUIRE_LIVE_SUITES === '1') {
+        throw new Error('RAVEN_TEST_REQUIRE_LIVE_SUITES=1, but R with the `arrow` package is not available');
+    }
+    if (has_arrow) {
         FILE = await viewWithR(R_FRAME);
         SOURCE = 'R';
     } else {

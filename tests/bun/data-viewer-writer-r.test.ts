@@ -34,6 +34,12 @@ async function rWith(pkg: string): Promise<boolean> {
 const HAS_ARROW = await rWith('arrow');
 const HAS_HAVEN = HAS_ARROW && (await rWith('haven'));
 
+// CI sets RAVEN_TEST_REQUIRE_LIVE_SUITES=1: a missing R or arrow fails here
+// instead of skipping every test below. (haven stays optional.)
+test.if(process.env.RAVEN_TEST_REQUIRE_LIVE_SUITES === '1')('prerequisites (required on this run)', () => {
+    expect({ R_with_arrow: HAS_ARROW }).toEqual({ R_with_arrow: true });
+});
+
 async function runR(rCode: string): Promise<{ stdout: string; stderr: string; files: string[] }> {
     const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-writer-'));
     const dv = join(tmp, 'dv');

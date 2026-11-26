@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate, awaitActive, sleep } from './helper';
+import { activate, awaitActive, live_suites_required, sleep } from './helper';
 
 declare const suite: Mocha.SuiteFunction;
 declare const test: Mocha.TestFunction;
@@ -17,10 +17,17 @@ declare const suiteTeardown: Mocha.HookFunction;
  * can't: auto-attach on a stop, the editor's commands sending tagged code,
  * launch with `program`, and the toolbar's Continue and Stop.
  *
- * Needs a debug build (`cargo build -p raven`) and R with a shared libR;
- * skipped otherwise.
+ * Uses a debug build (`cargo build -p raven`) when there is one, else the
+ * binary bundled with the extension (CI). Needs R with a shared libR; skipped
+ * without a binary or R, and on Windows. With
+ * `RAVEN_TEST_REQUIRE_LIVE_SUITES=1` (CI), a missing binary or R fails
+ * instead of skipping.
+ *
+ * Its first test must run before any debug session has, so `.vscode-test.mjs`
+ * lists this file first.
  */
-const RAVEN = path.resolve(__dirname, '..', '..', '..', '..', 'target', 'debug', 'raven');
+const DEBUG_BUILD = path.resolve(__dirname, '..', '..', '..', '..', 'target', 'debug', 'raven');
+const BUNDLED = path.resolve(__dirname, '..', '..', 'bin', 'raven');
 
 function r_available(): boolean {
     const out = spawnSync('R', ['RHOME'], { encoding: 'utf8' });
@@ -74,19 +81,38 @@ async function open_at(file: string, line: number): Promise<vscode.TextEditor> {
 }
 
 suite('Raven R debugger (end to end)', function () {
-    if (process.platform === 'win32' || !fs.existsSync(RAVEN) || !r_available()) {
-        test('skipped: needs target/debug/raven and R with a shared libR', () => undefined);
+    if (process.platform === 'win32') {
+        test('skipped: not supported on Windows', () => undefined);
+        return;
+    }
+    const missing = [
+        !fs.existsSync(DEBUG_BUILD) && !fs.existsSync(BUNDLED) && `a raven binary (${DEBUG_BUILD} or ${BUNDLED})`,
+        !r_available() && 'R with a shared libR (`R RHOME`, then lib/libR.so or lib/libR.dylib)',
+    ].filter((m): m is string => typeof m === 'string');
+    if (missing.length > 0) {
+        if (live_suites_required()) {
+            test('prerequisites (required on this run)', () => {
+                throw new Error(`RAVEN_TEST_REQUIRE_LIVE_SUITES=1, but this suite is missing: ${missing.join('; ')}`);
+            });
+        } else {
+            test('skipped: needs a raven binary and R with a shared libR', () => undefined);
+        }
         return;
     }
     this.timeout(120_000);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rvdbg-'));
     let tracker: vscode.Disposable | undefined;
+    let set_server_path = false;
 
     suiteSetup(async () => {
         await activate();
-        await vscode.workspace
-            .getConfiguration('raven')
-            .update('server.path', RAVEN, vscode.ConfigurationTarget.Global);
+        // A debug build, when there is one, runs instead of the bundled
+        // binary (which the extension uses with the setting unset).
+        const config = vscode.workspace.getConfiguration('raven');
+        if (fs.existsSync(DEBUG_BUILD) && config.inspect('server.path')?.globalValue === undefined) {
+            await config.update('server.path', DEBUG_BUILD, vscode.ConfigurationTarget.Global);
+            set_server_path = true;
+        }
         tracker = vscode.debug.registerDebugAdapterTrackerFactory('raven-r', {
             createDebugAdapterTracker: () => ({ onDidSendMessage: (m) => sent.push(m) }),
         });
@@ -96,9 +122,11 @@ suite('Raven R debugger (end to end)', function () {
         tracker?.dispose();
         vscode.debug.removeBreakpoints(vscode.debug.breakpoints);
         for (const t of vscode.window.terminals) t.dispose();
-        await vscode.workspace
-            .getConfiguration('raven')
-            .update('server.path', undefined, vscode.ConfigurationTarget.Global);
+        if (set_server_path) {
+            await vscode.workspace
+                .getConfiguration('raven')
+                .update('server.path', undefined, vscode.ConfigurationTarget.Global);
+        }
     });
 
     // First, so no session has run yet: the default filters must already

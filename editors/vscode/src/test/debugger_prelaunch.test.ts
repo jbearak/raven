@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate, awaitActive, sleep } from './helper';
+import { activate, awaitActive, live_suites_required, sleep } from './helper';
 
 declare const suite: Mocha.SuiteFunction;
 declare const test: Mocha.TestFunction;
@@ -27,10 +27,14 @@ declare const suiteTeardown: Mocha.HookFunction;
  * it runs until the test releases it. Uses a debug build
  * (`target/debug/raven`) when there is one, else the binary bundled with
  * the extension (CI); skipped without either, without R with a shared libR,
- * and on Windows (the task is a `/bin/sh` loop).
+ * and on Windows (the task is a `/bin/sh` loop). With
+ * `RAVEN_TEST_REQUIRE_LIVE_SUITES=1` (CI), a missing binary, folder or R
+ * fails instead of skipping.
  *
- * Named to sort after debugger.test.ts, whose first test must run before
- * any debug session has. Leaves behind only what was there before it ran.
+ * Runs after debugger.test.ts, whose first test must run before any debug
+ * session has: `.vscode-test.mjs` lists that file first, since the test CLI
+ * keeps glob order, which is not alphabetical. Leaves behind only what was
+ * there before it ran.
  */
 const DEBUG_BUILD = path.resolve(__dirname, '..', '..', '..', '..', 'target', 'debug', 'raven');
 const BUNDLED = path.resolve(__dirname, '..', '..', 'bin', 'raven');
@@ -65,8 +69,23 @@ async function open_at(file: string, line: number): Promise<vscode.TextEditor> {
 suite('Raven R debugger: a launch with a slow preLaunchTask (end to end)', function () {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const have_binary = fs.existsSync(DEBUG_BUILD) || fs.existsSync(BUNDLED);
-    if (process.platform === 'win32' || !folder || !have_binary || !r_available()) {
-        test('skipped: needs a raven binary, a workspace folder and R with a shared libR', () => undefined);
+    if (process.platform === 'win32') {
+        test('skipped: the preLaunchTask is a /bin/sh loop', () => undefined);
+        return;
+    }
+    const missing = [
+        !folder && 'a workspace folder',
+        !have_binary && `a raven binary (${DEBUG_BUILD} or ${BUNDLED})`,
+        !r_available() && 'R with a shared libR (`R RHOME`, then lib/libR.so or lib/libR.dylib)',
+    ].filter((m): m is string => typeof m === 'string');
+    if (missing.length > 0 || !folder) {
+        if (live_suites_required()) {
+            test('prerequisites (required on this run)', () => {
+                throw new Error(`RAVEN_TEST_REQUIRE_LIVE_SUITES=1, but this suite is missing: ${missing.join('; ')}`);
+            });
+        } else {
+            test('skipped: needs a raven binary, a workspace folder and R with a shared libR', () => undefined);
+        }
         return;
     }
     this.timeout(180_000);

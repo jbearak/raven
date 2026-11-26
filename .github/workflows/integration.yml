@@ -501,6 +501,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Posit Package Manager snapshot the `arrow` binaries come from. Bump
+      # it deliberately; it is part of the R library cache key.
+      P3M_SNAPSHOT: '2026-11-20'
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
@@ -538,10 +542,10 @@ jobs:
       # block also works if the image rolls back to 22.04.
       #
       # R goes alongside so suites that drive the live R session (help,
-      # send-to-r, future knit / rmarkdown coverage) can run instead of
-      # skipping. `r-base-core` is the minimal install; tests that need
-      # specific packages (e.g. `arrow` for the data-viewer suite) still
-      # skip themselves when those packages aren't installed.
+      # send-to-r, the debugger, future knit / rmarkdown coverage) can run
+      # instead of skipping. `r-base-core` is the minimal install; the data
+      # viewer's `arrow` comes from Posit Package Manager after the Bun
+      # tests (below).
       #
       # `r-cran-plyr` is needed by the cross-file LSP test
       # (`lsp.test.ts: cross-file: sibling package propagation …`): the
@@ -614,12 +618,132 @@ jobs:
           bun run vscode:prepublish
 
       - name: Compile tests
+        id: compile
         working-directory: editors/vscode
         run: bun run pretest
 
+      # The data viewer suite and the real-R data viewer Bun tests need the
+      # `arrow` R package, which Ubuntu does not package. Posit Package
+      # Manager's explicit binary URL serves prebuilt packages for apt's R.
+      # They go in R's default user library (Renviron sets R_LIBS_USER to
+      # it, even under --vanilla, once the directory exists), so every R the
+      # tests start sees them without an environment variable. This comes
+      # after the Bun run above, which keeps testing the arrow-free paths.
+      - name: Locate the R user library
+        id: rlib
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        run: |
+          . /etc/os-release
+          lib=$(Rscript --vanilla -e 'cat(path.expand(Sys.getenv("R_LIBS_USER")))')
+          rminor=$(Rscript --vanilla -e 'cat(R.version$major, sub("[.].*", "", R.version$minor), sep = ".")')
+          rfull=$(Rscript --vanilla -e 'cat(as.character(getRversion()))')
+          mkdir -p "$lib"
+          {
+            echo "lib=$lib"
+            echo "repo=https://p3m.dev/cran/$P3M_SNAPSHOT/bin/linux/$VERSION_CODENAME-$(uname -m)/$rminor"
+            echo "key=r-arrow-$VERSION_CODENAME-$(uname -m)-r$rfull-$P3M_SNAPSHOT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Runner image: ${ImageOS:-?} ${ImageVersion:-?}; R $rfull; library $lib"
+
+      - name: Cache R packages for the data viewer
+        id: rcache
+        if: ${{ steps.rlib.outcome == 'success' }}
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ steps.rlib.outputs.lib }}
+          key: ${{ steps.rlib.outputs.key }}
+
+      # Fails, rather than letting the data viewer suites skip, when the
+      # install, the binary's loading, or the IPC round trip goes wrong. A
+      # source build is refused: it means the binary URL stopped serving this
+      # R and platform. httpgd must stay invisible: the Bun test "View() works
+      # even when httpgd is missing" hides only the user library from R.
+      - name: Install arrow (prebuilt binary)
+        id: arrow
+        if: ${{ steps.rlib.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          REPO: ${{ steps.rlib.outputs.repo }}
+          LIB: ${{ steps.rlib.outputs.lib }}
+        run: |
+          # A runtime library the arrow binary needs, which the image has only
+          # by accident. Here, not in the shared apt step, so an image without
+          # this package name fails only the arrow setup.
+          sudo apt-get install -y --no-install-recommends libxml2-16
+          echo "R library cache hit: ${{ steps.rcache.outputs.cache-hit }}"
+          Rscript --vanilla -e 'if (!requireNamespace("arrow", quietly = TRUE)) install.packages("arrow", lib = Sys.getenv("LIB"), repos = Sys.getenv("REPO"))' 2>&1 \
+            | tee "$RUNNER_TEMP/r-install.log"
+          if grep -F 'installing *source*' "$RUNNER_TEMP/r-install.log"; then
+            echo "::error::A package was built from source; $REPO no longer serves binaries for this R"
+            exit 1
+          fi
+          Rscript --vanilla -e 'library(arrow); f <- tempfile(); write_ipc_file(mtcars, f); stopifnot(nrow(read_ipc_file(f)) == 32); cat("arrow", format(packageVersion("arrow")), "\n")'
+          R_LIBS="$LIB" R_LIBS_USER="$(mktemp -d)" Rscript --vanilla -e 'stopifnot(!requireNamespace("httpgd", quietly = TRUE))'
+
+      # RAVEN_TEST_REQUIRE_LIVE_SUITES=1 makes the live-R suites (debugger
+      # and data viewer) fail, naming what is missing, where they would skip
+      # locally. `!cancelled()` lets the Electron run go ahead after a failed
+      # arrow setup, so only the data viewer suite is lost to it. Bash gives
+      # `pipefail`, so `tee` keeps the test run's exit status.
       - name: Run integration tests under Xvfb
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         working-directory: editors/vscode
-        run: xvfb-run -a bun run test
+        shell: bash
+        env:
+          RAVEN_TEST_REQUIRE_LIVE_SUITES: '1'
+        run: xvfb-run -a bun run test 2>&1 | tee "$RUNNER_TEMP/vscode-test.log"
+
+      # A later `this.skip()` or `test.skip` in the live-R suites would not
+      # trip the switch above. With the switch on, the main config reports in
+      # TAP (.vscode-test.mjs): one `ok N <suite> <test>` result per test,
+      # with `# SKIP` when pending (a test's unterminated output may precede
+      # it on the line). Each suite must have results, and none of them may
+      # be skipped or a `skipped:` placeholder, nested suites included.
+      - name: Check the live-R suites did not skip
+        shell: bash
+        run: |
+          sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/vscode-test.log" | awk '
+            BEGIN {
+              n = split("Raven R debugger (end to end)|Raven R debugger: a launch with a slow preLaunchTask (end to end)|data-viewer smoke tests", want, "|")
+            }
+            match($0, /(not )?ok [0-9]+ /) {
+              t = substr($0, RSTART + RLENGTH)
+              for (i = 1; i <= n; i++) if (index(t, want[i] " ") == 1) {
+                seen[i] = 1
+                if (t ~ / # SKIP/ || index(t, " skipped:") > 0) { print "::error::did not run: " t; bad = 1 }
+              }
+            }
+            END {
+              for (i = 1; i <= n; i++) if (!(i in seen)) { print "::error::no results for suite: " want[i]; bad = 1 }
+              exit bad
+            }'
+          echo "The debugger and data viewer suites ran with no pending or placeholder tests."
+
+      # The real-R data viewer Bun tests, now that arrow is installed. The
+      # switch fails them when R or arrow is missing. R_LIBS keeps arrow
+      # visible to the test that points R_LIBS_USER at an empty directory to
+      # hide httpgd. haven is not installed, so its 4 tests skip; any other
+      # skip fails the step.
+      - name: Run real-R data viewer Bun tests
+        if: ${{ !cancelled() && steps.arrow.outcome == 'success' }}
+        shell: bash
+        env:
+          RAVEN_TEST_REQUIRE_LIVE_SUITES: '1'
+          R_LIBS: ${{ steps.rlib.outputs.lib }}
+        run: |
+          files=(tests/bun/data-viewer-bootstrap-r-integration.test.ts
+                 tests/bun/data-viewer-writer-r.test.ts
+                 tests/bun/data-viewer-arrow-projected-spike.test.ts)
+          # bun passes when one of several named files is missing.
+          for f in "${files[@]}"; do test -f "$f" || { echo "::error::$f not found"; exit 1; }; done
+          bun test "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/bun-real-r.log"
+          grep -F '[spike] source file written by R' "$RUNNER_TEMP/bun-real-r.log"
+          skips=$(sed -nE 's/^ *([0-9]+) skip$/\1/p' "$RUNNER_TEMP/bun-real-r.log")
+          if [ "${skips:-0}" -gt 4 ]; then
+            echo "::error::$skips tests skipped; only the 4 haven tests may"
+            exit 1
+          fi
 
   # ── Data-viewer benchmark (report-only) ────────────────────────────────
   # Design F0 (docs/development.md, "Data viewer performance"): fixtures A

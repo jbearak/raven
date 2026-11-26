@@ -49,6 +49,12 @@ const HAS_R = await has_R();
 const HAS_ARROW = HAS_R && (await r_with('arrow'));
 const HAS_HAVEN = HAS_R && (await r_with('haven'));
 
+// CI sets RAVEN_TEST_REQUIRE_LIVE_SUITES=1: a missing R or arrow fails here
+// instead of skipping every test below. (haven stays optional.)
+test.if(process.env.RAVEN_TEST_REQUIRE_LIVE_SUITES === '1')('prerequisites (required on this run)', () => {
+    expect({ R: HAS_R, arrow: HAS_ARROW }).toEqual({ R: true, arrow: true });
+});
+
 /**
  * R code that runs `viewCall`, then reads back the single Arrow file the
  * View() override wrote into RAVEN_DATA_VIEWER_DIR and prints a structured
