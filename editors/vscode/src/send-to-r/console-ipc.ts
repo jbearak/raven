@@ -125,9 +125,9 @@ export function make_console_socket_path(): string {
 }
 
 /**
- * `owns_dir: false` is for a console in a Perch session: its socket lives in
- * the session directory, which outlives the terminal (closing a Perch
- * terminal only detaches) and which Perch removes when the session ends.
+ * `owns_dir: false` leaves the socket's directory in place when the terminal
+ * is forgotten, for a console that outlives its terminal (the debugger tests
+ * detach a console and reattach it).
  */
 export function register_console_terminal(
     terminal: vscode.Terminal,

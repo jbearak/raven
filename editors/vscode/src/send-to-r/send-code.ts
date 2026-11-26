@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { console_route, send_via_console, send_when_listening, type_in_order, type SendLocation } from './console-ipc';
 import { choose_send_transport, SendMethod } from './send-method';
-import { type_into } from './perch';
 import { create_temp_file, schedule_temp_file_cleanup } from './temp-file';
 
 export interface SendOptions {
@@ -64,7 +63,7 @@ function send_by_typing(
     );
     switch (transport) {
         case 'direct-paste':
-            type_into(terminal, code);
+            terminal.sendText(code);
             return;
         case 'bracketed-paste':
             send_via_bracketed_paste(terminal, code);
@@ -79,7 +78,7 @@ function send_via_bracketed_paste(
     terminal: vscode.Terminal,
     code: string,
 ): void {
-    type_into(terminal, '\x1b[200~' + code + '\x1b[201~');
+    terminal.sendText('\x1b[200~' + code + '\x1b[201~');
 }
 
 function send_via_tempfile(terminal: vscode.Terminal, code: string): void {
@@ -89,8 +88,7 @@ function send_via_tempfile(terminal: vscode.Terminal, code: string): void {
     // fallback below only runs if R never reaches the source() line (e.g.
     // session crashed).
     const path_literal = JSON.stringify(tmp);
-    type_into(
-        terminal,
+    terminal.sendText(
         `local({ .raven_src <- ${path_literal}; on.exit(unlink(dirname(.raven_src), recursive = TRUE)); source(.raven_src, echo = TRUE) })`
     );
     schedule_temp_file_cleanup(tmp);

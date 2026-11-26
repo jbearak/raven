@@ -47,8 +47,7 @@ import {
     type ConsolePick,
     type PickerOptions,
 } from './send-to-r/console-picker';
-import { _reset_console_choice_for_test, new_console_in_perch } from './send-to-r/r-terminal-manager';
-import { type_into } from './send-to-r/perch';
+import { _reset_console_choice_for_test } from './send-to-r/r-terminal-manager';
 import { register_build_commands } from './build-commands';
 import {
     register_chunks_navigation_and_highlight,
@@ -472,17 +471,6 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_debugger_unavailable(context);
     }
 
-    // Perch's list of new terminals runs this (Raven's `perch.launchers` entry
-    // in package.json) whether or not the R console is on, so it always exists.
-    context.subscriptions.push(
-        vscode.commands.registerCommand('raven.perch.newConsole', async () => {
-            if (r_console_resolved !== 'enabled') {
-                throw new Error("Raven's R console is turned off in this window (raven.rConsole.activation).");
-            }
-            await new_console_in_perch();
-        }),
-    );
-
     // Package-mode context key. The `raven.isRPackage` key gates the
     // Build commands' palette entries and editor-title submenu — every
     // `when` clause that uses it is also gated on `raven.rConsoleEnabled`,
@@ -829,7 +817,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         getLanguageClient: () => client,
         sendToRTerminal: async (code: string) => {
             const terminal = await get_or_create_r_terminal();
-            type_into(terminal, code);
+            terminal.sendText(code, true);
         },
         getDataViewerPanelNames: () => data_viewer_manager?.getPanelNames() ?? [],
         getDataViewerPanelColumnNames: (panelName: string) =>

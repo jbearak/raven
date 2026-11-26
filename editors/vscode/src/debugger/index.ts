@@ -93,8 +93,8 @@ const attaching = new Map<string, number>();
  * Consoles a launch (F5, launch.json, Raven commands) has chosen: held while
  * the launch resolves, then until its session starts or the claim expires
  * (the timer). A stop heard meanwhile is the launch's to show: F5 can
- * reattach a stopped persistent console, whose subscription then replays the
- * stop, and the console replays it to the launch's session too.
+ * connect to a stopped console started elsewhere, whose subscription then
+ * replays the stop, and the console replays it to the launch's session too.
  */
 const launch_claims = new Map<string, { holds: number; timer?: ReturnType<typeof setTimeout> }>();
 let LAUNCH_CLAIM_MS = 10_000;
@@ -318,9 +318,9 @@ function probe_path(ipc: string): string {
  *
  * Each connection brings the console's breakpoints to exactly the editor's,
  * including files that no longer have any. A console can outlive the
- * connection that armed it (a Perch console is detached and reattached; a
- * window reloads), and the IPC protocol only replaces breakpoints file by
- * file, so the link can't know from its own history which files to clear.
+ * connection that armed it (another window connected to it first; a window
+ * reloads), and the IPC protocol only replaces breakpoints file by file, so
+ * the link can't know from its own history which files to clear.
  * It asks the console instead: every mirror carries `probe_path`, the
  * console answers with its summary, and any file in that summary the editor
  * has no breakpoints in is cleared by the next mirror (`reconcile`). This
