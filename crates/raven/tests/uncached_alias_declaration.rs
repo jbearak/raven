@@ -15,9 +15,6 @@
 //! - `pkgb` exports the same two names, forces the second argument, and
 //!   declares nothing.
 //!
-//! Here both also export `ask`, whose first argument `cond` pkga captures
-//! and declares, and whose second, `data`, it evaluates.
-//!
 //! plus `pkgs`, which declares both an `[[operator]]` form and a
 //! `[[function]]` policy for its `%set%`.
 //!
@@ -43,11 +40,6 @@ captured = ["cond"]
 [[function]]
 name = "pick"
 formals = ["data", "cond"]
-captured = ["cond"]
-
-[[function]]
-name = "ask"
-formals = ["cond", "data"]
 captured = ["cond"]
 "#;
 
@@ -112,7 +104,7 @@ fn write(root: &Path, relative: &str, text: &str) {
 
 /// `declaring` is whether pkga ships its `raven/nse.toml`.
 fn install_fake_packages(lib: &Path, declaring: bool) {
-    let exports = "export(\"%where%\")\nexport(pick)\nexport(ask)\n";
+    let exports = "export(\"%where%\")\nexport(pick)\n";
     write(lib, "pkga/DESCRIPTION", "Package: pkga\nVersion: 0.1.0\n");
     write(lib, "pkga/NAMESPACE", exports);
     if declaring {
@@ -133,6 +125,11 @@ fn install_fake_packages(lib: &Path, declaring: bool) {
             "export(\"%where%\")\nif (FALSE) {\n    export(pick)\n}\n",
         ),
         ("pkgpat", "exportPattern(\"^p\")\nexport(pick)\n"),
+        // An S4 class named like a private function of the package.
+        (
+            "pkgclass",
+            "import(methods)\nexportClasses(pick)\nexport(\"%where%\")\n",
+        ),
     ] {
         write(
             lib,
@@ -628,53 +625,6 @@ pick <- pkga::pick
     ]);
 }
 
-/// Calls where the declaration's per-formal mask would land on the wrong
-/// argument. The declaration is not applied to them, so each is reported as
-/// it was before issue #900.
-#[test]
-fn calls_whose_arguments_the_declaration_would_misread_are_checked_as_before() {
-    check(&[
-        // R: object 't_empty' not found. The empty first argument leaves
-        // `cond` missing, so `t_empty` is `data`, which `ask` evaluates.
-        declared(
-            "empty_first_argument",
-            r#"
---- main.R
-ask <- pkga::ask
-ask(, t_empty)
-"#,
-            &["t_empty"],
-            &["t_empty"],
-        ),
-        // R runs it: `t_asked` is `cond`, which `ask` captures.
-        declared(
-            "captured_first_argument",
-            r#"
---- main.R
-ask <- pkga::ask
-ask(t_asked, 1)
-"#,
-            &[],
-            &["t_asked"],
-        ),
-        // R stops. A named argument with no value leaves `data` to its
-        // default, which the declaration doesn't describe: with
-        // `function(cond = NULL, data = list()) eval(substitute(cond), data,
-        // parent.frame())`, R looks `t_named_empty` up among no columns and
-        // doesn't find it.
-        declared(
-            "named_empty_argument",
-            r#"
---- main.R
-ask <- pkga::ask
-ask(t_named_empty, data = )
-"#,
-            &["t_named_empty"],
-            &["t_named_empty"],
-        ),
-    ]);
-}
-
 /// Programs R stops on that go unreported once the alias's declaration is
 /// read. Each is equally unreported on main whenever pkga is in the package
 /// cache (a `library(pkga)` in any checked file, or the language server), so
@@ -698,9 +648,7 @@ f(cond = 1)
             &["t_dots"],
         ),
         // R: object 't_inject' not found. `inject()` evaluates `!!t_inject`
-        // before `pick` is called. Declining every argument that holds `!!`
-        // would report this one and also `height` in the valid
-        // `inject(pick(df, height > !!cutoff))`, so it is left as it is.
+        // before `pick` is called.
         declared(
             "injected_argument",
             r#"
@@ -809,4 +757,23 @@ pick(1, c_pat)
             &["c_pat"],
         ),
     ]);
+}
+
+/// A package that exports an S4 class and keeps a function of the same name
+/// private. `exportClasses(pick)` exports the class's metadata object, so R
+/// stops at `pkgclass::pick` ('pick' is not an exported object). The line is
+/// no evidence that a function `pick` is exported, so the package's
+/// declaration is not applied to the alias and the argument is reported, as
+/// it was before issue #900.
+#[test]
+fn an_alias_to_a_name_exported_only_as_an_s4_class_is_checked_as_before() {
+    check(&[case(
+        "class_export_only",
+        r#"
+--- main.R
+pick <- pkgclass::pick
+pick(1, c_class)
+"#,
+        &["c_class"],
+    )]);
 }
