@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -58,7 +58,14 @@ fn scratch() -> PathBuf {
 /// while other processes allocate PTYs (issue #908). Calls are serialized
 /// within this test process, and a failed call is retried until `TIMEOUT`. A
 /// PTY that never comes still fails the test, with the error.
-fn open_pty(ws: &libc::winsize) -> (File, OwnedFd) {
+///
+/// Both descriptors are close-on-exec, so no console inherits another
+/// console's PTY, or its own master. A console holding its own master never
+/// sees its terminal hang up, and outlives a test process that is killed.
+/// The returned guard keeps other threads from opening a PTY or spawning a
+/// console until the caller has spawned its own; hold it through
+/// `Command::spawn`.
+fn open_pty(ws: &libc::winsize) -> (MutexGuard<'static, ()>, File, OwnedFd) {
     static OPENPTY: Mutex<()> = Mutex::new(());
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -78,12 +85,23 @@ fn open_pty(ws: &libc::winsize) -> (File, OwnedFd) {
             )
         };
         let err = std::io::Error::last_os_error();
-        drop(serialized);
         if rc == 0 {
+            for fd in [master, slave] {
+                // SAFETY: a descriptor openpty just returned.
+                let set = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                assert_eq!(set, 0, "FD_CLOEXEC: {}", std::io::Error::last_os_error());
+            }
             // SAFETY: both descriptors were just returned by openpty and are
             // owned here.
-            return unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+            return unsafe {
+                (
+                    serialized,
+                    File::from_raw_fd(master),
+                    OwnedFd::from_raw_fd(slave),
+                )
+            };
         }
+        drop(serialized);
         assert!(Instant::now() < deadline, "openpty failed: {err}");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -139,7 +157,7 @@ impl Console {
 
     /// As `launch`, with the sockets in `dir`.
     fn launch_in(dir: PathBuf, env: &[(&str, &str)], dap: DapArg, r_args: &[&str]) -> Console {
-        let (master, slave) = open_pty(&libc::winsize {
+        let (spawning, master, slave) = open_pty(&libc::winsize {
             ws_row: 30,
             ws_col: 120,
             ws_xpixel: 0,
@@ -175,6 +193,7 @@ impl Console {
             });
         }
         let child = cmd.spawn().expect("spawn raven console");
+        drop(spawning);
         let out = Arc::new(Mutex::new(Vec::new()));
         let mut reader = master.try_clone().unwrap();
         let mut answer = master.try_clone().unwrap();
