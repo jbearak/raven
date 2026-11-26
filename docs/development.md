@@ -88,8 +88,9 @@ Locally each skips without them. The `VS Code Mocha Suite` CI job sets
 failing test that names it. It installs `arrow` as a Posit Package Manager
 binary into R's user library, with the snapshot date set by the job's
 `P3M_SNAPSHOT` (part of the cache key; bump it on purpose). With the switch on,
-the main config reports in TAP, and the job checks that every test in the
-three Electron suites has a result and none was skipped. CI forbids `.only`
+the main config reports in TAP, and the job requires results from each of
+the three Electron suites and rejects any of them that is pending or a
+`skipped:` placeholder. CI forbids `.only`
 (`forbidOnly` in `.vscode-test.mjs`). `.vscode-test.mjs` lists
 `debugger.test.js` first, because its first test must run before any debug
 session and the test CLI keeps glob order, which is not alphabetical.

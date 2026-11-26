@@ -696,9 +696,10 @@ jobs:
 
       # A later `this.skip()` or `test.skip` in the live-R suites would not
       # trip the switch above. With the switch on, the main config reports in
-      # TAP (.vscode-test.mjs): one `ok N <suite> <test>` line per test, with
-      # `# SKIP` when pending. Each suite must have results, and none of them
-      # may be skipped or a `skipped:` placeholder.
+      # TAP (.vscode-test.mjs): one `ok N <suite> <test>` result per test,
+      # with `# SKIP` when pending (a test's unterminated output may precede
+      # it on the line). Each suite must have results, and none of them may
+      # be skipped or a `skipped:` placeholder, nested suites included.
       - name: Check the live-R suites did not skip
         shell: bash
         run: |
@@ -706,11 +707,11 @@ jobs:
             BEGIN {
               n = split("Raven R debugger (end to end)|Raven R debugger: a launch with a slow preLaunchTask (end to end)|data-viewer smoke tests", want, "|")
             }
-            /^(not )?ok [0-9]+ / {
-              t = $0; sub(/^(not )?ok [0-9]+ /, "", t)
+            match($0, /(not )?ok [0-9]+ /) {
+              t = substr($0, RSTART + RLENGTH)
               for (i = 1; i <= n; i++) if (index(t, want[i] " ") == 1) {
                 seen[i] = 1
-                if (t ~ / # SKIP/ || index(substr(t, length(want[i]) + 2), "skipped:") == 1) { print "::error::did not run: " t; bad = 1 }
+                if (t ~ / # SKIP/ || index(t, " skipped:") > 0) { print "::error::did not run: " t; bad = 1 }
               }
             }
             END {
