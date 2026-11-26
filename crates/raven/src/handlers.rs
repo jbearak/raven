@@ -1525,6 +1525,8 @@ pub(crate) struct DiagnosticsSnapshot {
     pub workspace_folders: Vec<Url>,
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
+    /// [`WorldState::alias_declarations`]: empty outside `raven check`.
+    pub(crate) alias_declarations: Arc<HashMap<String, crate::nse_declarations::DeclaredPolicies>>,
     pub workspace_scan_complete: bool,
 
     /// Short-circuit signal for cross-file NSE/func collection: `true` iff some
@@ -1930,6 +1932,7 @@ impl DiagnosticsSnapshot {
                 workspace_folders: state.workspace_folders.clone(),
                 base_exports: empty_base_exports().clone(),
                 package_library_ready: false,
+                alias_declarations: Arc::default(),
                 workspace_scan_complete: state.workspace_scan_complete,
                 any_nse_or_func_directives: false,
                 artifacts_map: HashMap::new(),
@@ -2146,6 +2149,7 @@ impl DiagnosticsSnapshot {
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
             package_library_ready: state.package_library_ready,
+            alias_declarations: Arc::clone(&state.alias_declarations),
             workspace_scan_complete: state.workspace_scan_complete,
             any_nse_or_func_directives,
             artifacts_map,
@@ -10182,54 +10186,6 @@ fn infix_sites_from_snapshot(
     })
 }
 
-/// [`NseAnalysis::uncached_alias_policies`] for the analysis's file.
-///
-/// `resolve_call_arg_policy` and `declared_infix_operator` resolve a
-/// `name <- pkg::target` alias through the package cache, and `raven check`
-/// loads only the packages a checked file attaches or imports, so an alias
-/// to any other package found no declaration there (issue #900). The
-/// language server loads the packages a document names with `pkg::` before
-/// it publishes, so it had the declaration already. Loading the package
-/// here as well would change how unrelated calls are checked (a cached
-/// package's exports resolve calls that are otherwise left alone), so only
-/// its declaration is read, from disk, and only the alias uses it.
-///
-/// A name the package also declares as an `[[operator]]` is left out. With
-/// the package cached, the operator's form decides how `x[...] OP value` is
-/// read and still checks the call heads in `value`; the `[[function]]`
-/// policy alone would skip `value` whole.
-fn uncached_alias_policies(
-    snapshot: &DiagnosticsSnapshot,
-    analysis: &NseAnalysis,
-) -> HashMap<String, crate::nse_declarations::DeclaredPolicies> {
-    let mut policies = HashMap::new();
-    if !snapshot.cross_file_config.packages_enabled || !snapshot.package_library_ready {
-        return policies;
-    }
-    let last = analysis
-        .local_callee_aliases
-        .values()
-        .filter_map(|alias| match alias {
-            LocalCalleeAlias::Qualified { package, .. } => Some(package),
-            LocalCalleeAlias::Unknown => None,
-        });
-    let mut read = HashSet::new();
-    for package in last {
-        if !read.insert(package) || !crate::r_subprocess::is_valid_package_name(package) {
-            continue;
-        }
-        if let Some(mut declared) = snapshot.package_library.uncached_declarations(package) {
-            declared
-                .policies
-                .retain(|name, _| !declared.operators.contains_key(name));
-            if !declared.policies.is_empty() {
-                policies.insert(package.clone(), declared.policies);
-            }
-        }
-    }
-    policies
-}
-
 /// [`NseAnalysis::stable_callees`]: of the names the suppression added in
 /// issue #900 can rest on (the file's aliases to packages the cache doesn't
 /// hold), those whose top-level assignments are the only thing in sight
@@ -10442,7 +10398,7 @@ fn collect_undefined_variables_from_snapshot(
         &cross_file_nse.deferred_nse,
         &cross_file_nse.deferred_funcs,
     );
-    nse_analysis.uncached_alias_policies = uncached_alias_policies(snapshot, &nse_analysis);
+    nse_analysis.uncached_alias_policies = Arc::clone(&snapshot.alias_declarations);
     nse_analysis.infix_sites =
         infix_sites_from_snapshot(snapshot, uri, node, text, &nse_analysis, cancel);
     nse_analysis.stable_callees = stable_callees(snapshot, uri, node, text, &nse_analysis);
@@ -20800,11 +20756,21 @@ pub(crate) struct NseAnalysis<'a> {
     /// pipeline, where [`declared_infix_operator`] falls back to the
     /// file-wide package set.
     infix_sites: Option<HashMap<usize, InfixSite>>,
-    /// The `[[function]]` policies of packages that a top-level
-    /// `name <- pkg::target` alias names and the package cache doesn't hold,
-    /// by package (see [`uncached_alias_policies`]). Read only through
-    /// [`NseAnalysis::uncached_alias_policy`], for a call of such an alias.
-    uncached_alias_policies: HashMap<String, crate::nse_declarations::DeclaredPolicies>,
+    /// [`DiagnosticsSnapshot::alias_declarations`]: the `[[function]]`
+    /// policies `raven check` read from disk for packages the cache doesn't
+    /// hold. Empty in the language server, which loads the packages a
+    /// document names with `pkg::` instead. Read only through
+    /// [`NseAnalysis::uncached_alias_policy`], for a call of an alias
+    /// `name <- pkg::target`.
+    ///
+    /// `resolve_call_arg_policy` and `declared_infix_operator` resolve such
+    /// an alias through the package cache, and `raven check` loads only the
+    /// packages a checked file attaches or imports, so an alias to any other
+    /// package found no declaration there (issue #900). Loading the package
+    /// as well would change how unrelated calls are checked (a cached
+    /// package's exports resolve calls that are otherwise left alone), so
+    /// only its declaration is read, and only the alias uses it.
+    uncached_alias_policies: Arc<HashMap<String, crate::nse_declarations::DeclaredPolicies>>,
     /// The alias names (keyed like `local_callee_bindings`) whose top-level
     /// assignments are the only thing in sight that can decide what a call
     /// of the name runs (see [`stable_callees`]). The suppression added in
@@ -21013,7 +20979,7 @@ impl<'a> NseAnalysis<'a> {
             directive_nse: HashMap::new(),
             deferred_directive_nse: HashMap::new(),
             infix_sites: None,
-            uncached_alias_policies: HashMap::new(),
+            uncached_alias_policies: Arc::default(),
             stable_callees: HashSet::new(),
         };
         // Issue #433, second (context-aware) inference pass: a local function
@@ -73522,6 +73488,77 @@ my_func <- function(a = default_value) {
                 .iter()
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #900: the diagnostics pass applies an alias's declaration only
+    /// when it is handed one. It never reads an uncached package from disk
+    /// itself: that read belongs to `raven check`, and in the language
+    /// server the pass sits on the publishing path.
+    #[test]
+    fn test_uncached_alias_declaration_is_used_only_when_supplied() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let lib = temp_dir.path().to_path_buf();
+        let pkg_dir = lib.join("pkga");
+        fs::create_dir_all(pkg_dir.join("raven")).expect("create pkg dir");
+        fs::write(pkg_dir.join("DESCRIPTION"), "Package: pkga\n").expect("write DESCRIPTION");
+        fs::write(pkg_dir.join("NAMESPACE"), "export(pick)\n").expect("write NAMESPACE");
+        fs::write(
+            pkg_dir.join("raven").join("nse.toml"),
+            "[[function]]\nname = \"pick\"\nformals = [\"data\", \"cond\"]\ncaptured = [\"cond\"]\n",
+        )
+        .expect("write sidecar");
+
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![lib]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "pick <- pkga::pick\npick(1, alias_captured)\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let reports_the_argument = |state: &WorldState| {
+            let mut diagnostics = Vec::new();
+            let snapshot = DiagnosticsSnapshot::build(state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &snapshot,
+                &uri,
+                tree.root_node(),
+                code,
+                DiagnosticSeverity::WARNING,
+                &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
+                None,
+            );
+            diagnostics
+                .iter()
+                .any(|d| d.message == "alias_captured is not defined")
+        };
+
+        // The sidecar is on disk and the package is installed and uncached,
+        // as in the language server before its background load finishes.
+        assert!(
+            reports_the_argument(&state),
+            "without a supplied declaration the pass must not read the sidecar"
+        );
+
+        let policies = state
+            .package_library
+            .uncached_function_policies("pkga")
+            .expect("pkga declares pick");
+        state.alias_declarations = std::sync::Arc::new(std::collections::HashMap::from([(
+            "pkga".to_string(),
+            policies,
+        )]));
+        assert!(
+            !reports_the_argument(&state),
+            "the declaration `raven check` supplies applies to the alias"
         );
     }
 

@@ -112,6 +112,28 @@ fn install_fake_packages(lib: &Path, declaring: bool) {
     }
     write(lib, "pkgb/DESCRIPTION", "Package: pkgb\nVersion: 0.1.0\n");
     write(lib, "pkgb/NAMESPACE", exports);
+    // Packages whose NAMESPACE a static reader can't vouch for. Each ships
+    // pkga's sidecar whatever `declaring` says.
+    for (package, namespace) in [
+        (
+            "pkgcond",
+            "exportPattern(\"^doesnotmatch\")\nexport(\"%where%\")\n\
+             if (getRversion() < \"2.0.0\") {\n    export(pick)\n}\n",
+        ),
+        (
+            "pkgif",
+            "export(\"%where%\")\nif (FALSE) {\n    export(pick)\n}\n",
+        ),
+        ("pkgpat", "exportPattern(\"^p\")\nexport(pick)\n"),
+    ] {
+        write(
+            lib,
+            &format!("{package}/DESCRIPTION"),
+            &format!("Package: {package}\nVersion: 0.1.0\n"),
+        );
+        write(lib, &format!("{package}/NAMESPACE"), namespace);
+        write(lib, &format!("{package}/raven/nse.toml"), PKGA_SIDECAR);
+    }
     write(lib, "pkgs/DESCRIPTION", "Package: pkgs\nVersion: 0.1.0\n");
     write(lib, "pkgs/NAMESPACE", "export(\"%set%\")\n");
     write(lib, "pkgs/raven/nse.toml", PKGS_SIDECAR);
@@ -679,6 +701,55 @@ x[1, s_col] %set% s_typo_fn(s_v)
 library(pkgs)
 "#,
             &["s_typo_fn"],
+        ),
+    ]);
+}
+
+/// A package whose `NAMESPACE` holds a conditional or a pattern export. R
+/// evaluates the file, so an `export(pick)` in a branch R doesn't take
+/// exports nothing, and with the package loaded Raven asks R what a pattern
+/// exports. Reading such a file statically is no evidence that `pick` is
+/// exported, so the package's declaration is not applied to an alias and the
+/// argument is reported, as it was before issue #900. (These pin Raven's two
+/// lookups against each other, not against R.)
+#[test]
+fn an_alias_to_a_package_with_a_conditional_or_pattern_export_is_checked_as_before() {
+    check(&[
+        case(
+            "export_in_a_branch_with_a_pattern",
+            r#"
+--- main.R
+pick <- pkgcond::pick
+pick(1, c_cond)
+"#,
+            &["c_cond"],
+        ),
+        case(
+            "export_in_a_branch_reached_with_triple_colon",
+            r#"
+--- main.R
+pick <- pkgcond:::pick
+pick(1, c_internal)
+"#,
+            &["c_internal"],
+        ),
+        case(
+            "export_in_a_branch",
+            r#"
+--- main.R
+pick <- pkgif::pick
+pick(1, c_if)
+"#,
+            &["c_if"],
+        ),
+        case(
+            "pattern_next_to_a_plain_export",
+            r#"
+--- main.R
+pick <- pkgpat::pick
+pick(1, c_pat)
+"#,
+            &["c_pat"],
         ),
     ]);
 }

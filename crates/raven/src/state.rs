@@ -1447,6 +1447,12 @@ pub struct WorldState {
     /// capture and mutate that successor during a post-commit restart gap.
     libpath_watcher_owner_generation: u64,
     pub package_library_ready: bool,
+    /// `[[function]]` policies of packages that the checked files name with
+    /// `pkg::` and the package cache doesn't hold, by package. Only
+    /// `raven check` fills this, once, before it computes diagnostics (see
+    /// `cli::check::read_alias_declarations`); in the language server it
+    /// stays empty, and the server never reads a package from disk for it.
+    pub(crate) alias_declarations: Arc<HashMap<String, crate::nse_declarations::DeclaredPolicies>>,
     /// ABA-safe ownership token for detached full-workspace scans.
     ///
     /// Closed-file writers and scan-affecting configuration changes advance
@@ -7826,6 +7832,7 @@ impl WorldState {
             libpath_watcher: LibpathWatcherState::Disabled,
             libpath_watcher_owner_generation: Self::mint_libpath_watcher_owner_generation(),
             package_library_ready: false,
+            alias_declarations: Arc::default(),
             workspace_scan_generation: 0,
             discovery_refresh_generation: 0,
             workspace_scan_intent: None,

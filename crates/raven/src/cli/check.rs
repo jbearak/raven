@@ -527,6 +527,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Warm the package-export cache before computing diagnostics, matching the
     // editor's post-scan prefetch (see [`prefetch_reported_packages`]).
     prefetch_reported_packages(&state, &targets).await;
+    state.alias_declarations = std::sync::Arc::new(read_alias_declarations(&state, &targets));
 
     let (all_diags, reported_loaded_packages, collect_operator_error) =
         collect_target_diagnostics(&mut state, &targets).await;
@@ -1273,6 +1274,66 @@ pub(crate) async fn prefetch_reported_packages(
         .collect();
     // `prefetch_packages` is a no-op on an empty slice, so no length guard here.
     state.package_library.prefetch_packages(&packages).await;
+}
+
+/// [`crate::state::WorldState::alias_declarations`] for a run over `targets`:
+/// what each package that a target names with `pkg::`, and that
+/// [`prefetch_reported_packages`] left uncached, declares on disk for its
+/// functions.
+///
+/// A file can reach a package function through an alias,
+/// `pick <- pkga::pick`, with nothing attaching pkga. The prefetch doesn't
+/// load such a package (loading it would change how unrelated calls are
+/// checked), so its `raven/nse.toml` was never read and the argument it
+/// captures was reported (issue #900). The language server loads `pkg::`
+/// packages and needs none of this, which is why the read lives here and
+/// not in the diagnostics pass: there it would probe library paths on the
+/// server's publishing path.
+///
+/// Empty when packages are disabled or the library isn't ready. Reads a
+/// target's chunk file best-effort, as the prefetch does.
+fn read_alias_declarations(
+    state: &crate::state::WorldState,
+    targets: &[PathBuf],
+) -> std::collections::HashMap<String, crate::nse_declarations::DeclaredPolicies> {
+    let mut declarations = std::collections::HashMap::new();
+    if !state.cross_file_config.packages_enabled || !state.package_library_ready {
+        return declarations;
+    }
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in targets {
+        let Ok(uri) = Url::from_file_path(path) else {
+            continue;
+        };
+        if let Some(entry) = state.workspace_index.get(&uri) {
+            packages.extend(
+                entry
+                    .metadata
+                    .namespace_references
+                    .iter()
+                    .map(|reference| reference.package.clone()),
+            );
+        } else if is_chunk_file(path)
+            && let Ok(text) = crate::state::read_source(path)
+        {
+            let doc =
+                crate::state::Document::new_with_language_id(&text, Some(1), &uri, Some("rmd"));
+            packages.extend(
+                crate::cross_file::extract_metadata(&doc.analysis_text())
+                    .namespace_references
+                    .into_iter()
+                    .map(|reference| reference.package),
+            );
+        }
+    }
+    for package in packages {
+        if crate::r_subprocess::is_valid_package_name(&package)
+            && let Some(policies) = state.package_library.uncached_function_policies(&package)
+        {
+            declarations.insert(package, policies);
+        }
+    }
+    declarations
 }
 
 /// Pure (R-free) computation of the package set [`prefetch_reported_packages`]
@@ -4543,6 +4604,102 @@ infixContinuationStyle = "indented"
         let mut operator_error = false;
         let targets = collect_report_targets(&[], &canon, &mut operator_error);
         reported_packages_to_warm(&state, &targets)
+    }
+
+    /// [`read_alias_declarations`] for the workspace at `root`, with `lib` as
+    /// the only library path. R-free.
+    fn alias_declarations_for(
+        root: &Path,
+        lib: &Path,
+        library_ready: bool,
+    ) -> std::collections::HashMap<String, crate::nse_declarations::DeclaredPolicies> {
+        let canon = std::fs::canonicalize(root).unwrap();
+        let workspace_url = Url::from_file_path(&canon).unwrap();
+        let mut state = build_indexed_state(&canon, &workspace_url, true, None, &canon).unwrap();
+        let mut library = crate::package_library::PackageLibrary::new_empty();
+        library.set_lib_paths(vec![lib.to_path_buf()]);
+        state.package_library = std::sync::Arc::new(library);
+        state.package_library_ready = library_ready;
+        state.cross_file_config.packages_enabled = true;
+        let mut operator_error = false;
+        let targets = collect_report_targets(&[], &canon, &mut operator_error);
+        read_alias_declarations(&state, &targets)
+    }
+
+    /// An installed package `name` under `lib` that declares `pick`'s second
+    /// argument captured, with this `NAMESPACE`.
+    fn install_declaring_package(lib: &Path, name: &str, namespace: &str) {
+        let dir = lib.join(name);
+        fs::create_dir_all(dir.join("raven")).unwrap();
+        fs::write(dir.join("DESCRIPTION"), format!("Package: {name}\n")).unwrap();
+        fs::write(dir.join("NAMESPACE"), namespace).unwrap();
+        fs::write(
+            dir.join("raven").join("nse.toml"),
+            "[[function]]\nname = \"pick\"\nformals = [\"data\", \"cond\"]\ncaptured = [\"cond\"]\n",
+        )
+        .unwrap();
+    }
+
+    /// Issue #900: `raven check` reads the declaration of a package a target
+    /// names with `pkg::` and nothing attaches, from an R file and from a
+    /// chunk file.
+    #[test]
+    fn alias_declarations_are_read_for_packages_named_with_double_colon() {
+        let lib = TempDir::new().unwrap();
+        install_declaring_package(lib.path(), "pkga", "export(pick)\n");
+        install_declaring_package(lib.path(), "pkgc", "export(pick)\n");
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("analysis.R"), "pick <- pkga::pick\n").unwrap();
+        fs::write(
+            tmp.path().join("report.Rmd"),
+            "# Title\n\n```{r}\npick <- pkgc::pick\n```\n",
+        )
+        .unwrap();
+        let declarations = alias_declarations_for(tmp.path(), lib.path(), true);
+        for package in ["pkga", "pkgc"] {
+            assert!(
+                declarations
+                    .get(package)
+                    .is_some_and(|policies| policies.contains_key("pick")),
+                "{package}: {declarations:?}"
+            );
+        }
+    }
+
+    /// A conditional or pattern export is no evidence that the package
+    /// exports the name, so its declaration is not read; the run then
+    /// reports what it reported before.
+    #[test]
+    fn alias_declarations_skip_a_namespace_that_is_not_authoritative() {
+        let lib = TempDir::new().unwrap();
+        install_declaring_package(
+            lib.path(),
+            "pkgcond",
+            "export(keep)\nif (getRversion() < \"2.0.0\") {\n    export(pick)\n}\n",
+        );
+        install_declaring_package(
+            lib.path(),
+            "pkgpat",
+            "exportPattern(\"^p\")\nexport(pick)\n",
+        );
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("analysis.R"),
+            "a <- pkgcond::pick\nb <- pkgpat::pick\n",
+        )
+        .unwrap();
+        let declarations = alias_declarations_for(tmp.path(), lib.path(), true);
+        assert!(declarations.is_empty(), "{declarations:?}");
+    }
+
+    #[test]
+    fn alias_declarations_are_not_read_before_the_library_is_ready() {
+        let lib = TempDir::new().unwrap();
+        install_declaring_package(lib.path(), "pkga", "export(pick)\n");
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("analysis.R"), "pick <- pkga::pick\n").unwrap();
+        let declarations = alias_declarations_for(tmp.path(), lib.path(), false);
+        assert!(declarations.is_empty(), "{declarations:?}");
     }
 
     #[test]

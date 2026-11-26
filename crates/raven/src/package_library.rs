@@ -2025,33 +2025,42 @@ impl PackageLibrary {
             .and_then(|info| info.nse_declarations.policies.get(name).cloned())
     }
 
-    /// What an installed package that is **not** in the cache declares in
-    /// `raven/nse.toml`, read from disk without loading the package: its
-    /// `NAMESPACE` for the names it exports by name (a pattern export proves
-    /// nothing here) and the sidecar itself. `None` for a cached package
-    /// (its cache entry is the authority), one that isn't installed, and one
-    /// that declares nothing for such a name.
+    /// The `[[function]]` policies an installed package that is **not** in
+    /// the cache declares in `raven/nse.toml`, read from disk without loading
+    /// the package. `None` for a cached package (its cache entry is the
+    /// authority), one that isn't installed, one with no sidecar, and one
+    /// whose `NAMESPACE` is not authoritative evidence of what it exports
+    /// ([`parse_namespace_authoritative_exports`]): a conditional or a
+    /// pattern export, which the loader resolves by asking R.
     ///
-    /// Synchronous, two small reads, and the cache is not touched: whether a
+    /// A name the package also declares as an `[[operator]]` is left out.
+    /// With the package cached, the operator's form decides how
+    /// `x[...] OP value` is read and still checks the call heads in `value`;
+    /// the function policy alone would skip `value` whole.
+    ///
+    /// Synchronous disk reads, and the cache is not touched: whether a
     /// package is cached decides how other calls are checked, so a caller
-    /// that only wants this package's declaration must not warm it. Callers
-    /// read once per diagnostic pass, outside the usage walk.
-    pub(crate) fn uncached_declarations(
+    /// that only wants this package's declaration must not warm it. For
+    /// `raven check` only, before diagnostics; never from a diagnostics pass.
+    ///
+    /// [`parse_namespace_authoritative_exports`]: crate::namespace_parser::parse_namespace_authoritative_exports
+    pub(crate) fn uncached_function_policies(
         &self,
         package: &str,
-    ) -> Option<crate::nse_declarations::Declarations> {
+    ) -> Option<crate::nse_declarations::DeclaredPolicies> {
         if is_load_all_sentinel(package) || self.is_cached_sync(package) {
             return None;
         }
         let dir = self.find_package_directory(package)?;
         let exports: HashSet<String> =
-            crate::namespace_parser::parse_namespace_attachment_visible_explicit_exports(
-                &dir.join("NAMESPACE"),
-            )
-            .into_iter()
-            .collect();
-        let declared = crate::nse_declarations::load_declared_policies(&dir, &exports);
-        (!declared.is_empty()).then_some(declared)
+            crate::namespace_parser::parse_namespace_authoritative_exports(&dir.join("NAMESPACE"))?
+                .into_iter()
+                .collect();
+        let mut declared = crate::nse_declarations::load_declared_policies(&dir, &exports);
+        declared
+            .policies
+            .retain(|name, _| !declared.operators.contains_key(name));
+        (!declared.policies.is_empty()).then_some(declared.policies)
     }
 
     /// The `[[operator]]` form `package` declares for its exported infix
