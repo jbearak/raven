@@ -695,23 +695,26 @@ jobs:
         run: xvfb-run -a bun run test 2>&1 | tee "$RUNNER_TEMP/vscode-test.log"
 
       # A later `this.skip()` or `test.skip` in the live-R suites would not
-      # trip the switch above. Each suite's heading must appear, and no test
-      # under it may be pending or a `skipped:` placeholder. A section runs
-      # to the next two-space-indented line that starts with a letter (the
-      # next Mocha suite); extension-host noise at that indent is JSON.
+      # trip the switch above. With the switch on, the main config reports in
+      # TAP (.vscode-test.mjs): one `ok N <suite> <test>` line per test, with
+      # `# SKIP` when pending. Each suite must have results, and none of them
+      # may be skipped or a `skipped:` placeholder.
       - name: Check the live-R suites did not skip
         shell: bash
         run: |
           sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/vscode-test.log" | awk '
             BEGIN {
-              want["Raven R debugger (end to end)"]
-              want["Raven R debugger: a launch with a slow preLaunchTask (end to end)"]
-              want["data-viewer smoke tests"]
+              n = split("Raven R debugger (end to end)|Raven R debugger: a launch with a slow preLaunchTask (end to end)|data-viewer smoke tests", want, "|")
             }
-            /^  [A-Za-z]/ { cur = substr($0, 3); live = (cur in want); if (live) seen[cur] = 1; next }
-            live && /^ {4,}(- |✔ skipped:)/ { print "::error::" cur ": " $0; bad = 1 }
+            /^(not )?ok [0-9]+ / {
+              t = $0; sub(/^(not )?ok [0-9]+ /, "", t)
+              for (i = 1; i <= n; i++) if (index(t, want[i] " ") == 1) {
+                seen[i] = 1
+                if (t ~ / # SKIP/ || index(substr(t, length(want[i]) + 2), "skipped:") == 1) { print "::error::did not run: " t; bad = 1 }
+              }
+            }
             END {
-              for (h in want) if (!(h in seen)) { print "::error::suite not found in the test output: " h; bad = 1 }
+              for (i = 1; i <= n; i++) if (!(i in seen)) { print "::error::no results for suite: " want[i]; bad = 1 }
               exit bad
             }'
           echo "The debugger and data viewer suites ran with no pending or placeholder tests."

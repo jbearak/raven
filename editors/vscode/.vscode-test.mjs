@@ -39,6 +39,10 @@ mkdirSync(gettingStartedUserData, { recursive: true });
 // CI (GitHub Actions sets CI=true) rejects a stray `.only`, which would
 // otherwise quietly drop every other test from the run.
 const forbidOnly = process.env.CI === 'true';
+// With the live-R suites required (CI), the main config reports in TAP: one
+// line per test with its full suite title and a `# SKIP` mark, which the
+// workflow reads to check that no test in those suites was skipped.
+const liveSuitesRequired = process.env.RAVEN_TEST_REQUIRE_LIVE_SUITES === '1';
 
 export default defineConfig([
     {
@@ -52,6 +56,7 @@ export default defineConfig([
         mocha: {
             timeout: 60000,
             forbidOnly,
+            ...(liveSuitesRequired ? { reporter: 'tap' } : {}),
         },
         launchArgs: [
             '--disable-gpu',
