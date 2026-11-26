@@ -629,8 +629,8 @@ pick <- pkga::pick
 }
 
 /// Calls where the declaration's per-formal mask would land on the wrong
-/// argument, or on a name R evaluates before the call. The declaration is
-/// not applied to them, so each is reported as it was before issue #900.
+/// argument. The declaration is not applied to them, so each is reported as
+/// it was before issue #900.
 #[test]
 fn calls_whose_arguments_the_declaration_would_misread_are_checked_as_before() {
     check(&[
@@ -657,17 +657,20 @@ ask(t_asked, 1)
             &[],
             &["t_asked"],
         ),
-        // R: object 't_inject' not found. `inject()` evaluates `!!t_inject`
-        // before `pick` is called.
+        // R stops. A named argument with no value leaves `data` to its
+        // default, which the declaration doesn't describe: with
+        // `function(cond = NULL, data = list()) eval(substitute(cond), data,
+        // parent.frame())`, R looks `t_named_empty` up among no columns and
+        // doesn't find it.
         declared(
-            "injected_argument",
+            "named_empty_argument",
             r#"
 --- main.R
-pick <- pkga::pick
-rlang::inject(pick(1, !!t_inject))
+ask <- pkga::ask
+ask(t_named_empty, data = )
 "#,
-            &["t_inject"],
-            &["t_inject"],
+            &["t_named_empty"],
+            &["t_named_empty"],
         ),
     ]);
 }
@@ -693,6 +696,20 @@ f(cond = 1)
 "#,
             &[],
             &["t_dots"],
+        ),
+        // R: object 't_inject' not found. `inject()` evaluates `!!t_inject`
+        // before `pick` is called. Declining every argument that holds `!!`
+        // would report this one and also `height` in the valid
+        // `inject(pick(df, height > !!cutoff))`, so it is left as it is.
+        declared(
+            "injected_argument",
+            r#"
+--- main.R
+pick <- pkga::pick
+rlang::inject(pick(1, !!t_inject))
+"#,
+            &[],
+            &["t_inject"],
         ),
         // R: object 't_assign' not found. The name of the replaced binding is
         // put together at run time.
