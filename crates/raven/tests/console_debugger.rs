@@ -51,6 +51,44 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// Open a pseudo-terminal pair for a console.
+///
+/// macOS `openpty` fails when called from several threads of one process at
+/// once (errno -6, a negated `ENXIO`), and now and then even when serialized,
+/// while other processes allocate PTYs (issue #908). Calls are serialized
+/// within this test process, and a failed call is retried until `TIMEOUT`. A
+/// PTY that never comes still fails the test, with the error.
+fn open_pty(ws: &libc::winsize) -> (File, OwnedFd) {
+    static OPENPTY: Mutex<()> = Mutex::new(());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let serialized = OPENPTY.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: openpty fills two descriptors; the winsize pointer is
+        // valid. The pointer constness of the last two parameters differs
+        // between macOS and Linux, hence the casts.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut::<libc::termios>() as _,
+                ws as *const libc::winsize as _,
+            )
+        };
+        let err = std::io::Error::last_os_error();
+        drop(serialized);
+        if rc == 0 {
+            // SAFETY: both descriptors were just returned by openpty and are
+            // owned here.
+            return unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        }
+        assert!(Instant::now() < deadline, "openpty failed: {err}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// How a test console is given `--dap`.
 enum DapArg {
     Socket,
@@ -101,27 +139,12 @@ impl Console {
 
     /// As `launch`, with the sockets in `dir`.
     fn launch_in(dir: PathBuf, env: &[(&str, &str)], dap: DapArg, r_args: &[&str]) -> Console {
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-        let ws = libc::winsize {
+        let (master, slave) = open_pty(&libc::winsize {
             ws_row: 30,
             ws_col: 120,
             ws_xpixel: 0,
             ws_ypixel: 0,
-        };
-        // SAFETY: openpty fills two descriptors; the winsize pointer is valid.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut::<libc::termios>() as _,
-                &ws as *const libc::winsize as _,
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: both descriptors were just returned by openpty.
-        let (master, slave) = unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        });
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_raven"));
         cmd.arg("console")
             .args(["--no-history", "--ipc"])
