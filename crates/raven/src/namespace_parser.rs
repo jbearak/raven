@@ -143,6 +143,12 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
         if !directive_is_whole_line(line) {
             return None;
         }
+        // An escaped quote can hide a comma or a parenthesis inside a name
+        // (`export("a\",pick,\"b")` exports one name); the argument splitter
+        // doesn't read escapes.
+        if line.contains('\\') {
+            return None;
+        }
         let exported = extract_directive_args(line, "export")
             .or_else(|| extract_directive_args(line, "exportClasses"))
             .or_else(|| extract_directive_args(line, "exportMethods"));
@@ -978,6 +984,16 @@ mod tests {
         );
         assert_eq!(
             authoritative_exports("export(pick)\nexportClassPattern(\"^C\")\n"),
+            None
+        );
+    }
+
+    /// R reads `export("a\",pick,\"b")` as one name; splitting on commas
+    /// would find `pick`.
+    #[test]
+    fn an_escaped_quote_in_a_namespace_is_not_authoritative() {
+        assert_eq!(
+            authoritative_exports("export(\"a\\\",pick,\\\"b\")\n"),
             None
         );
     }
