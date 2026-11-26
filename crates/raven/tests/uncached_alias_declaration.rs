@@ -125,6 +125,11 @@ fn install_fake_packages(lib: &Path, declaring: bool) {
             "export(\"%where%\")\nif (FALSE) {\n    export(pick)\n}\n",
         ),
         ("pkgpat", "exportPattern(\"^p\")\nexport(pick)\n"),
+        // An S4 class named like a private function of the package.
+        (
+            "pkgclass",
+            "import(methods)\nexportClasses(pick)\nexport(\"%where%\")\n",
+        ),
     ] {
         write(
             lib,
@@ -752,4 +757,23 @@ pick(1, c_pat)
             &["c_pat"],
         ),
     ]);
+}
+
+/// A package that exports an S4 class and keeps a function of the same name
+/// private. `exportClasses(pick)` exports the class's metadata object, so R
+/// stops at `pkgclass::pick` ('pick' is not an exported object). The line is
+/// no evidence that a function `pick` is exported, so the package's
+/// declaration is not applied to the alias and the argument is reported, as
+/// it was before issue #900.
+#[test]
+fn an_alias_to_a_name_exported_only_as_an_s4_class_is_checked_as_before() {
+    check(&[case(
+        "class_export_only",
+        r#"
+--- main.R
+pick <- pkgclass::pick
+pick(1, c_class)
+"#,
+        &["c_class"],
+    )]);
 }

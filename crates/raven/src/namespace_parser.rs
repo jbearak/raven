@@ -114,7 +114,8 @@ pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
 
 /// The names a NAMESPACE exports by name, when a static reader can vouch for
 /// them: `None` unless every line of the file is a directive this parser
-/// knows and none of them is a pattern export.
+/// knows and none of them is a pattern export. An S4 class export is accepted
+/// as a line and contributes no name.
 ///
 /// R evaluates a NAMESPACE, and the file may hold `if` statements. An
 /// `export()` inside a branch R doesn't take exports nothing, and whether a
@@ -123,13 +124,18 @@ pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
 /// a file as evidence of anything. A missing or unreadable file is `None`
 /// too.
 pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Option<Vec<String>> {
-    const OTHER_DIRECTIVES: [&str; 6] = [
+    // `exportClasses(Rule)` exports the class's metadata object, never a
+    // function `Rule`: R rejects `pkg::Rule` unless an `export()` or
+    // `exportMethods()` line names it too. So the line is accepted and its
+    // names are not evidence.
+    const OTHER_DIRECTIVES: [&str; 7] = [
         "S3method",
         "import",
         "importFrom",
         "importClassesFrom",
         "importMethodsFrom",
         "useDynLib",
+        "exportClasses",
     ];
     let content = fs::read_to_string(namespace_path).ok()?;
     let normalized = normalize_multiline_directives(&content);
@@ -150,12 +156,18 @@ pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Op
             return None;
         }
         let exported = extract_directive_args(line, "export")
-            .or_else(|| extract_directive_args(line, "exportClasses"))
             .or_else(|| extract_directive_args(line, "exportMethods"));
         match exported {
+            // The splitter unquotes `"name"` and leaves `` `name` `` as
+            // written; R reads both as the name.
             Some(args) => exports.extend(
                 parse_comma_separated_args(&args)
                     .into_iter()
+                    .map(|name| {
+                        name.strip_prefix('`')
+                            .and_then(|name| name.strip_suffix('`'))
+                            .map_or(name.clone(), str::to_string)
+                    })
                     .filter(|name| !name.is_empty()),
             ),
             // A pattern export, a conditional, a brace, or anything else.
@@ -956,6 +968,27 @@ mod tests {
                 "%where%".to_string(),
                 "show".to_string()
             ])
+        );
+    }
+
+    /// `exportClasses(Rule)` exports the class's metadata, and R rejects
+    /// `pkg::Rule` unless `export(Rule)` is there too. A generic exported
+    /// through `exportMethods` can be called as `pkg::name`.
+    #[test]
+    fn an_s4_class_export_is_not_evidence_of_a_function() {
+        assert_eq!(
+            authoritative_exports("import(methods)\nexportClasses(Rule)\n"),
+            Some(vec![])
+        );
+        assert_eq!(
+            authoritative_exports("exportClasses(Rule)\nexport(Rule)\nexportMethods(query)\n"),
+            Some(vec!["Rule".to_string(), "query".to_string()])
+        );
+        // A class with a non-syntactic name, and its constructor exported in
+        // backticks.
+        assert_eq!(
+            authoritative_exports("exportClasses(\"text/html\")\nexport(`text/html`)\n"),
+            Some(vec!["text/html".to_string()])
         );
     }
 
