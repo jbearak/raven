@@ -3,34 +3,23 @@
 //! next attempt starts from them.
 //!
 //! A `source("child.R", local = TRUE)` inside `local({ ... })` runs the child
-//! in the block's frame, and Raven drops everything the child contributes
-//! when the block ends, the packages it attached included. In R, `library()`
+//! in the block's frame. Raven keeps the packages the child attaches in that
+//! frame, as it keeps the child's ordinary variables, so they are visible in
+//! the rest of the block and forgotten when it ends. In R, `library()`
 //! attaches for the whole session, so a later `ns()` runs. Raven reports it.
 //! That is a documented limitation (`docs/cross-file.md`, "Limitations"). A
 //! `library()` written directly in the block does carry past it. Inside a
 //! function body, v0.21.1 accepted these scripts; at the top level it
-//! reported them too.
-//!
-//! A fix was planned and dropped. It let only the undefined-variable check
-//! see the remembered package, so the infix-operator, Shiny and NSE
-//! consumers kept today's results. It still accepted inputs R stops on and
-//! main reports only because it forgets the package. In those inputs R lacks
-//! a package Raven believes attached, for example after
-//! `withr::local_package()`, under `conflicted`, or in a worker process, and
-//! Raven misses each of them for a direct `library()` call as well. The record
-//! is the comment on #884 that accompanies these pins.
+//! reported them too. A fix was planned and dropped; the record is the
+//! comment on #884 that accompanies these pins.
 //!
 //! The binary runs with a cleared environment, an R path that doesn't exist,
-//! and a fake library holding `splines` and `shiny` stubs that export the
-//! names the fixtures call, so the results don't depend on the machine's R.
-//! Every input was run in R 4.6.2 with the real packages
+//! and a fake library, so the results don't depend on the machine's R. The
+//! stubs export the names the fixtures call. `aa884` and `zz884` both export
+//! `%pick884%`; their `raven/nse.toml` files say `aa884`'s operator checks
+//! its right operand and `zz884`'s doesn't, as the real test packages behave.
+//! Every input was run in R 4.6.2 with real packages
 //! (`Rscript --vanilla main.R`).
-//!
-//! The infix-operator input (a child attaching a package whose `%op%`
-//! evaluates its operand, then a second package whose `%op%` doesn't) is not
-//! pinned here. Raven learns an operator's evaluation from R, and a fake
-//! library's `raven/nse.toml` can only declare an argument captured, so with
-//! stubs the input is clean whether the first package is remembered or not.
 
 use std::path::Path;
 use std::process::Command;
@@ -58,6 +47,25 @@ fn install_fake_packages(lib: &Path) {
         "shiny/NAMESPACE",
         "export(observe)\nexport(reactive)\n",
     );
+    for (package, captured) in [("aa884", "x"), ("zz884", "y")] {
+        write(
+            lib,
+            &format!("{package}/DESCRIPTION"),
+            &format!("Package: {package}\nVersion: 0.1.0\n"),
+        );
+        write(
+            lib,
+            &format!("{package}/NAMESPACE"),
+            "export(\"%pick884%\")\n",
+        );
+        write(
+            lib,
+            &format!("{package}/raven/nse.toml"),
+            &format!(
+                "schema = 1\n\n[[function]]\nname = \"%pick884%\"\nformals = [\"x\", \"y\"]\ncaptured = [\"{captured}\"]\n"
+            ),
+        );
+    }
 }
 
 /// `(path, 0-based line, name)` of every undefined-variable diagnostic,
@@ -136,6 +144,7 @@ fn undefined(files: &[(&str, &str)], lib: &Path) -> Vec<(String, u64, String)> {
 
 const CHILD: &str = "library(splines)\nprivate884 <- 3\n";
 const OBSERVE: &str = "observe <- function(expr) force(expr)\n";
+const SHINY_CHILD: &str = "suppressPackageStartupMessages(library(shiny))\n";
 
 #[test]
 fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
@@ -146,30 +155,31 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
         &'static [(&'static str, u64, &'static str)],
     );
     let cases: &[Case] = &[
-        // Documented limitation: R prints the spline basis in both, and
-        // Raven reports `ns`. v0.21.1 accepted the first and reported the
-        // second.
+        // Documented limitation: R prints the spline basis twice in both.
+        // Raven accepts the `ns()` inside the block and reports the one after
+        // it. v0.21.1 accepted both calls in the first input, and reported
+        // both in the second.
         (
             "in a function, a child attaches the package in a block",
             &[
                 (
                     "main.R",
-                    "f <- function() { local({ source(\"child.R\", local = TRUE) }); ns(1:10, df = 3)[1, ] }\nprint(f())\n",
+                    "f <- function() {\n  local({\n    source(\"child.R\", local = TRUE)\n    print(ns(1:10, df = 3)[1, ])\n  })\n  ns(1:10, df = 3)[1, ]\n}\nprint(f())\n",
                 ),
                 ("child.R", CHILD),
             ],
-            &[("main.R", 0, "ns")],
+            &[("main.R", 5, "ns")],
         ),
         (
             "at the top level, a child attaches the package in a block",
             &[
                 (
                     "main.R",
-                    "local({ source(\"child.R\", local = TRUE) })\nprint(ns(1:10, df = 3)[1, ])\n",
+                    "local({\n  source(\"child.R\", local = TRUE)\n  print(ns(1:10, df = 3)[1, ])\n})\nprint(ns(1:10, df = 3)[1, ])\n",
                 ),
                 ("child.R", CHILD),
             ],
-            &[("main.R", 1, "ns")],
+            &[("main.R", 4, "ns")],
         ),
         // Correct: the child's other names stay in the block, and R stops on
         // `private884`.
@@ -226,17 +236,6 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
             &[],
         ),
         (
-            "workaround: qualify the call",
-            &[
-                (
-                    "main.R",
-                    "f <- function() { local({ source(\"child.R\", local = TRUE) }); splines::ns(1:10, df = 3)[1, ] }\nprint(f())\n",
-                ),
-                ("child.R", CHILD),
-            ],
-            &[],
-        ),
-        (
             "workaround: declare the function after the block",
             &[
                 (
@@ -248,10 +247,11 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
             &[],
         ),
         // Right today only because the package is forgotten. A sourced
-        // `observe` that forces its argument masks Shiny's, so R prints 1.
-        // A fix that lets the remembered package reach the Shiny helpers
-        // would scope the braces as a deferred Shiny body and report
-        // `made884`, as Raven does for a direct `library(shiny)` (next case).
+        // `observe` that forces its argument masks Shiny's, so R prints 1 in
+        // both of the next two inputs. Raven scopes the braces as a deferred
+        // Shiny body wherever it sees shiny attached, and reports `made884`.
+        // A fix that lets the remembered package reach that rule would turn
+        // the first input into the second.
         (
             "a child attaches shiny in a block; a sourced observe masks it",
             &[
@@ -260,29 +260,57 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
                     "source(\"defs.R\")\nf <- function() { local({ source(\"child.R\", local = TRUE) }); observe({ made884 <- 1 }); print(made884) }\nf()\n",
                 ),
                 ("defs.R", OBSERVE),
-                (
-                    "child.R",
-                    "suppressPackageStartupMessages(library(shiny))\n",
-                ),
+                ("child.R", SHINY_CHILD),
             ],
             &[],
         ),
-        // Wrong on both v0.21.1 and main: R prints 1. Kept as the control
-        // that the shiny stub turns on Raven's Shiny handling.
+        // Wrong on both v0.21.1 and main. The same child sourced outside a
+        // block, so the clean result above is the block's doing.
         (
-            "the function attaches shiny directly; a sourced observe masks it",
+            "a child attaches shiny outside a block; a sourced observe masks it",
             &[
                 (
                     "main.R",
-                    "source(\"defs.R\")\nf <- function() { suppressPackageStartupMessages(library(shiny)); observe({ made884 <- 1 }); print(made884) }\nf()\n",
+                    "source(\"defs.R\")\nf <- function() { source(\"child.R\", local = TRUE); observe({ made884 <- 1 }); print(made884) }\nf()\n",
                 ),
                 ("defs.R", OBSERVE),
+                ("child.R", SHINY_CHILD),
             ],
             &[("main.R", 1, "made884")],
         ),
-        // Pairs no rule can separate: each pair differs only in a value
-        // Raven doesn't evaluate, and Raven reports both. Clearing the first
-        // of a pair would clear the second, where the report is right.
+        // The same for an infix operator. The child attaches `aa884`, whose
+        // `%pick884%` checks its right operand; the function then attaches
+        // `zz884`, whose operator doesn't, and R finds `zz884`'s first, so R
+        // prints 1 in both inputs. Raven doesn't follow attach order and
+        // takes `aa884`'s policy wherever it sees `aa884` attached, so it
+        // reports `missing884` there.
+        (
+            "a child attaches aa884 in a block; zz884's operator is the one found",
+            &[
+                (
+                    "main.R",
+                    "f <- function() { local({ source(\"child.R\", local = TRUE) }); suppressPackageStartupMessages(library(zz884)); 1 %pick884% missing884 }\nprint(f())\n",
+                ),
+                ("child.R", "library(aa884)\n"),
+            ],
+            &[],
+        ),
+        // Wrong on both v0.21.1 and main.
+        (
+            "a child attaches aa884 outside a block; zz884's operator is the one found",
+            &[
+                (
+                    "main.R",
+                    "f <- function() { source(\"child.R\", local = TRUE); suppressPackageStartupMessages(library(zz884)); 1 %pick884% missing884 }\nprint(f())\n",
+                ),
+                ("child.R", "library(aa884)\n"),
+            ],
+            &[("main.R", 0, "missing884")],
+        ),
+        // Pairs that differ only in a value Raven doesn't evaluate: a
+        // literal condition, and a loop count. Raven reports all four; R
+        // stops only in the second of each pair. A fix that accepts the first
+        // of a pair has to tell the two apart.
         //
         // R prints the spline basis; v0.21.1 accepted it.
         (
@@ -310,11 +338,11 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
         ),
         // R prints the spline basis; v0.21.1 accepted it.
         (
-            "the block runs in a loop over 1:2",
+            "the block runs in a loop over seq_len(2)",
             &[
                 (
                     "main.R",
-                    "f <- function() { for (i in 1:2) local({ source(\"child.R\", local = TRUE) }); ns(1:10, df = 3)[1, ] }\nprint(f())\n",
+                    "f <- function(n = 2) { for (i in seq_len(n)) local({ source(\"child.R\", local = TRUE) }); ns(1:10, df = 3)[1, ] }\nprint(f())\n",
                 ),
                 ("child.R", "library(splines)\n"),
             ],
