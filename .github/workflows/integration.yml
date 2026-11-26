@@ -545,8 +545,7 @@ jobs:
       # send-to-r, the debugger, future knit / rmarkdown coverage) can run
       # instead of skipping. `r-base-core` is the minimal install; the data
       # viewer's `arrow` comes from Posit Package Manager after the Bun
-      # tests (below), and `libxml2-16` is a runtime library its binary
-      # needs that the runner image has only by accident.
+      # tests (below).
       #
       # `r-cran-plyr` is needed by the cross-file LSP test
       # (`lsp.test.ts: cross-file: sibling package propagation …`): the
@@ -572,8 +571,7 @@ jobs:
             dpkg-dev \
             gnupg \
             r-base-core \
-            r-cran-plyr \
-            libxml2-16
+            r-cran-plyr
 
       - name: Run Debian packaging script tests
         run: bash tests/shell/debian-packaging-test.sh
@@ -669,6 +667,10 @@ jobs:
           REPO: ${{ steps.rlib.outputs.repo }}
           LIB: ${{ steps.rlib.outputs.lib }}
         run: |
+          # A runtime library the arrow binary needs, which the image has only
+          # by accident. Here, not in the shared apt step, so an image without
+          # this package name fails only the arrow setup.
+          sudo apt-get install -y --no-install-recommends libxml2-16
           echo "R library cache hit: ${{ steps.rcache.outputs.cache-hit }}"
           Rscript --vanilla -e 'if (!requireNamespace("arrow", quietly = TRUE)) install.packages("arrow", lib = Sys.getenv("LIB"), repos = Sys.getenv("REPO"))' 2>&1 \
             | tee "$RUNNER_TEMP/r-install.log"
@@ -692,26 +694,27 @@ jobs:
           RAVEN_TEST_REQUIRE_LIVE_SUITES: '1'
         run: xvfb-run -a bun run test 2>&1 | tee "$RUNNER_TEMP/vscode-test.log"
 
-      # A later `this.skip()` in these files would not trip the switch above:
-      # fail on any pending (or placeholder) test whose title is one of
-      # theirs. Titles come from the sources, so there is no list to keep.
+      # A later `this.skip()` or `test.skip` in the live-R suites would not
+      # trip the switch above. Each suite's heading must appear, and no test
+      # under it may be pending or a `skipped:` placeholder. A section runs
+      # to the next two-space-indented line that starts with a letter (the
+      # next Mocha suite); extension-host noise at that indent is JSON.
       - name: Check the live-R suites did not skip
         shell: bash
         run: |
-          cd editors/vscode/src/test
-          sed -nE "s/^(.*[^A-Za-z0-9_.])?test\('([^']+)'.*$/\2/p" debugger.test.ts debugger_prelaunch.test.ts data-viewer.test.ts \
-            | sort -u > "$RUNNER_TEMP/live-titles.txt"
-          test -s "$RUNNER_TEMP/live-titles.txt" || { echo "::error::Found no test titles in the live-R suites"; exit 1; }
-          sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/vscode-test.log" \
-            | sed -nE 's/^ {4,}(- |✔ )(.*)$/\1\2/p' > "$RUNNER_TEMP/vscode-results.txt"
-          bad=$( { sed -n 's/^- //p' "$RUNNER_TEMP/vscode-results.txt" | grep -Fxf "$RUNNER_TEMP/live-titles.txt"
-                   grep -E '^✔ skipped:' "$RUNNER_TEMP/vscode-results.txt"; } || true)
-          if [ -n "$bad" ]; then
-            echo "::error::Live-R suite tests did not run:"
-            echo "$bad"
-            exit 1
-          fi
-          echo "No pending or placeholder tests in the debugger and data viewer suites."
+          sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/vscode-test.log" | awk '
+            BEGIN {
+              want["Raven R debugger (end to end)"]
+              want["Raven R debugger: a launch with a slow preLaunchTask (end to end)"]
+              want["data-viewer smoke tests"]
+            }
+            /^  [A-Za-z]/ { cur = substr($0, 3); live = (cur in want); if (live) seen[cur] = 1; next }
+            live && /^ {4,}(- |✔ skipped:)/ { print "::error::" cur ": " $0; bad = 1 }
+            END {
+              for (h in want) if (!(h in seen)) { print "::error::suite not found in the test output: " h; bad = 1 }
+              exit bad
+            }'
+          echo "The debugger and data viewer suites ran with no pending or placeholder tests."
 
       # The real-R data viewer Bun tests, now that arrow is installed. The
       # switch fails them when R or arrow is missing. R_LIBS keeps arrow
@@ -725,9 +728,12 @@ jobs:
           RAVEN_TEST_REQUIRE_LIVE_SUITES: '1'
           R_LIBS: ${{ steps.rlib.outputs.lib }}
         run: |
-          bun test tests/bun/data-viewer-bootstrap-r-integration.test.ts \
-            tests/bun/data-viewer-writer-r.test.ts \
-            tests/bun/data-viewer-arrow-projected-spike.test.ts 2>&1 | tee "$RUNNER_TEMP/bun-real-r.log"
+          files=(tests/bun/data-viewer-bootstrap-r-integration.test.ts
+                 tests/bun/data-viewer-writer-r.test.ts
+                 tests/bun/data-viewer-arrow-projected-spike.test.ts)
+          # bun passes when one of several named files is missing.
+          for f in "${files[@]}"; do test -f "$f" || { echo "::error::$f not found"; exit 1; }; done
+          bun test "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/bun-real-r.log"
           grep -F '[spike] source file written by R' "$RUNNER_TEMP/bun-real-r.log"
           skips=$(sed -nE 's/^ *([0-9]+) skip$/\1/p' "$RUNNER_TEMP/bun-real-r.log")
           if [ "${skips:-0}" -gt 4 ]; then
