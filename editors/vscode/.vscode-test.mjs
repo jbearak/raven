@@ -36,13 +36,22 @@ cpSync(join(here, '..', '..', 'docs', 'examples', 'snippets', 'getting-started-b
 const gettingStartedUserData = join(tmpdir(), `raven-vscode-test-gs-${process.pid}`);
 mkdirSync(gettingStartedUserData, { recursive: true });
 
+// CI (GitHub Actions sets CI=true) rejects a stray `.only`, which would
+// otherwise quietly drop every other test from the run.
+const forbidOnly = process.env.CI === 'true';
+
 export default defineConfig([
     {
         label: 'main',
-        files: 'out/test/**/*.test.js',
+        // debugger.test.js first: its first test must run before any debug
+        // session has (debugger_prelaunch.test.js starts one). The test CLI
+        // keeps the order given and drops the glob's duplicate; the glob's
+        // own order is the filesystem's, not alphabetical.
+        files: ['out/test/debugger.test.js', 'out/test/**/*.test.js'],
         workspaceFolder: './src/test/fixtures',
         mocha: {
-            timeout: 60000
+            timeout: 60000,
+            forbidOnly,
         },
         launchArgs: [
             '--disable-gpu',
@@ -56,7 +65,8 @@ export default defineConfig([
         files: 'out/test-getting-started/**/*.test.js',
         workspaceFolder: gettingStartedWs,
         mocha: {
-            timeout: 60000
+            timeout: 60000,
+            forbidOnly,
         },
         launchArgs: [
             '--disable-gpu',

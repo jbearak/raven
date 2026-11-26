@@ -4,7 +4,8 @@
  *   - The `arrow` R package installed
  *
  * Skipped automatically when R is not found in the system PATH or when
- * the `arrow` package is not installed.
+ * the `arrow` package is not installed. With
+ * `RAVEN_TEST_REQUIRE_LIVE_SUITES=1` (CI), those fail the suite instead.
  *
  * Tests run sequentially and share a single Raven R terminal created on
  * first call to `api.sendToRTerminal`. The terminal persists for the
@@ -16,7 +17,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { spawnSync } from 'child_process';
 import type { RavenExtensionApi } from '../extension';
-import { activate, sleep } from './helper';
+import { activate, live_suites_required, sleep } from './helper';
 
 /** Poll until a data-viewer panel named `panelName` exists, or the deadline
  *  elapses. Default 60 s: the first `View()` in a suite pays the cold R-session
@@ -78,6 +79,9 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         // Skip the whole suite if R is not reachable on the system PATH.
         const r_check = spawnSync('R', ['--version'], { timeout: 5000 });
         if (r_check.error) {
+            if (live_suites_required()) {
+                throw new Error(`RAVEN_TEST_REQUIRE_LIVE_SUITES=1, but R is not on PATH: ${r_check.error.message}`);
+            }
             this.skip();
             return;
         }
@@ -90,13 +94,24 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             { timeout: 10000 },
         );
         if (arrow_check.status !== 0) {
+            if (live_suites_required()) {
+                throw new Error(
+                    'RAVEN_TEST_REQUIRE_LIVE_SUITES=1, but the `arrow` R package is not installed '
+                    + `(requireNamespace probe: status ${arrow_check.status}, signal ${arrow_check.signal}, `
+                    + `stderr ${JSON.stringify(String(arrow_check.stderr ?? '').trim())})`,
+                );
+            }
             this.skip();
             return;
         }
 
         await activate();
         const ext = vscode.extensions.getExtension<RavenExtensionApi>('jbearak.raven-r');
-        if (!ext) { this.skip(); return; }
+        if (!ext) {
+            if (live_suites_required()) throw new Error('RAVEN_TEST_REQUIRE_LIVE_SUITES=1, but the extension is not loaded');
+            this.skip();
+            return;
+        }
         if (!ext.isActive) await ext.activate();
         api = ext.exports as RavenExtensionApi;
 

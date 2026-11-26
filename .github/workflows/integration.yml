@@ -614,12 +614,43 @@ jobs:
           bun run vscode:prepublish
 
       - name: Compile tests
+        id: compile
         working-directory: editors/vscode
         run: bun run pretest
 
+      # RAVEN_TEST_REQUIRE_LIVE_SUITES=1 makes the live-R suites (debugger
+      # and data viewer) fail, naming what is missing, where they would skip
+      # locally. `!cancelled()` lets the Electron run go ahead after a failed
+      # arrow setup, so only the data viewer suite is lost to it. Bash gives
+      # `pipefail`, so `tee` keeps the test run's exit status.
       - name: Run integration tests under Xvfb
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         working-directory: editors/vscode
-        run: xvfb-run -a bun run test
+        shell: bash
+        env:
+          RAVEN_TEST_REQUIRE_LIVE_SUITES: '1'
+        run: xvfb-run -a bun run test 2>&1 | tee "$RUNNER_TEMP/vscode-test.log"
+
+      # A later `this.skip()` in these files would not trip the switch above:
+      # fail on any pending (or placeholder) test whose title is one of
+      # theirs. Titles come from the sources, so there is no list to keep.
+      - name: Check the live-R suites did not skip
+        shell: bash
+        run: |
+          cd editors/vscode/src/test
+          sed -nE "s/^(.*[^A-Za-z0-9_.])?test\('([^']+)'.*$/\2/p" debugger.test.ts debugger_prelaunch.test.ts data-viewer.test.ts \
+            | sort -u > "$RUNNER_TEMP/live-titles.txt"
+          test -s "$RUNNER_TEMP/live-titles.txt" || { echo "::error::Found no test titles in the live-R suites"; exit 1; }
+          sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/vscode-test.log" \
+            | sed -nE 's/^ {4,}(- |✔ )(.*)$/\1\2/p' > "$RUNNER_TEMP/vscode-results.txt"
+          bad=$( { sed -n 's/^- //p' "$RUNNER_TEMP/vscode-results.txt" | grep -Fxf "$RUNNER_TEMP/live-titles.txt"
+                   grep -E '^✔ skipped:' "$RUNNER_TEMP/vscode-results.txt"; } || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Live-R suite tests did not run:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "No pending or placeholder tests in the debugger and data viewer suites."
 
   # ── Data-viewer benchmark (report-only) ────────────────────────────────
   # Design F0 (docs/development.md, "Data viewer performance"): fixtures A

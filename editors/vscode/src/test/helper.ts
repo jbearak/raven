@@ -233,3 +233,14 @@ export async function removeEmptyWorkspaceSettings(): Promise<void> {
         // No settings.json — nothing to clean.
     }
 }
+
+/**
+ * Whether this run must execute the live-R suites (the debugger and data
+ * viewer end-to-end suites) instead of skipping them. CI sets
+ * `RAVEN_TEST_REQUIRE_LIVE_SUITES=1`; there, a missing prerequisite (no
+ * raven binary, no R, no `arrow`) fails a test that names it, where a local
+ * run without the variable skips as before.
+ */
+export function live_suites_required(): boolean {
+    return process.env.RAVEN_TEST_REQUIRE_LIVE_SUITES === '1';
+}
