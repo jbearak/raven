@@ -34,32 +34,6 @@ import {
     show_console_picker,
     target_label,
 } from './console-picker';
-import type { PerchApiV1, SessionInfo } from './perch-api';
-import {
-    _connect_perch_for_test,
-    perch_for_new_console,
-    perch_lookup_settled,
-    usable_perch,
-    perch_session_of,
-    perch_sessions_open_here,
-    PerchDeps,
-    PerchHandlers,
-    start_perch,
-    track_perch_terminal,
-    untrack_perch_terminal,
-} from './perch';
-import {
-    escape_perch_env,
-    escape_perch_text,
-    is_ended,
-    PERCH_CONSOLE_SOCKET,
-    PERCH_R_KIND,
-    perch_annotations,
-    RAVEN_CALLER_ID,
-    reattach_candidates,
-    session_console_socket,
-    session_program,
-} from './perch-sessions';
 import { console_binary, ServerBinaries } from './console-binary';
 
 /**
@@ -70,12 +44,6 @@ import { console_binary, ServerBinaries } from './console-binary';
  * else the setting; see `effective_target`. A choice is authoritative: sends
  * only reuse a managed terminal running the chosen program, never one that
  * merely was active more recently.
- *
- * In a remote window with Perch installed next to Raven, new R terminals run
- * in Perch sessions, which survive a closed window or dropped connection. In
- * any window with Perch, Perch's list of new terminals can start one too
- * (`new_console_in_perch`). See `perch.ts` for when and the invariants. A
- * Perch terminal is managed like any other while it is open in this window.
  */
 
 const PROFILE_ID = 'raven.rTerminal';
@@ -99,16 +67,6 @@ const creation_in_flight = new Map<TerminalProgram, Promise<vscode.Terminal>>();
 // Profile launches VS Code hasn't opened yet, keyed by RAVEN_TERMINAL_ID.
 const pending_profiles = new Map<string, PendingProfile>();
 const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
-/**
- * Perch sessions this activation started, by Perch session ID: what each
- * runs and its plot/data-viewer session. A session not in here was started
- * by an earlier activation, whose plot server is gone.
- */
-const launched_here = new Map<string, { program: TerminalProgram; plot_session_id?: string }>();
-let stale_plots_notice_shown = false;
-// Perch profile terminals VS Code has opened whose session hasn't been
-// reported yet; a new console waits for them rather than start a second one.
-const perch_profiles_starting = new Set<Promise<void>>();
 
 // What the user picked this session; beats the setting. In memory only.
 let session_choice: ConsoleTarget | null = null;
@@ -149,15 +107,6 @@ function most_recent(
 /** The program a managed terminal runs, or undefined for other terminals. */
 export function terminal_program_of(terminal: vscode.Terminal): TerminalProgram | undefined {
     return managed_terminals.get(terminal);
-}
-
-// Perch terminals Raven opened whose session hasn't been reported yet: not
-// managed until then, but already named like one of Raven's consoles.
-const perch_terminals_starting = new WeakSet<vscode.Terminal>();
-
-/** Whether Raven opened `terminal` for an R console, including one still starting in Perch. */
-export function is_raven_console_terminal(terminal: vscode.Terminal): boolean {
-    return managed_terminals.has(terminal) || perch_terminals_starting.has(terminal);
 }
 
 /**
@@ -248,12 +197,7 @@ export async function resolve_send_target(): Promise<SendTarget | null> {
             continue;
         }
         if (target === 'vscode-R') return { kind: 'vscode-r' };
-        try {
-            return { kind: 'terminal', terminal: await get_or_create_terminal_for(target) };
-        } catch (err) {
-            if (err instanceof vscode.CancellationError) return null;
-            throw err;
-        }
+        return { kind: 'terminal', terminal: await get_or_create_terminal_for(target) };
     }
 }
 
@@ -342,18 +286,15 @@ export async function build_r_terminal_launch(program: string): Promise<RTermina
     const socket = make_console_socket_path();
     return {
         shellPath: binary,
-        shellArgs: console_args(socket, (s) => s),
+        shellArgs: console_args(socket),
         consoleSocket: socket,
     };
 }
 
 const R_ARGS = ['--no-save', '--no-restore'];
 
-/**
- * Arguments of Raven's console listening on `socket`. `literal` wraps each
- * argument that comes from settings rather than from Raven.
- */
-function console_args(socket: string, literal: (s: string) => string): string[] {
+/** Arguments of Raven's console listening on `socket`. */
+function console_args(socket: string): string[] {
     const config = vscode.workspace.getConfiguration('raven.console');
     // The debugger's DAP socket sits next to the IPC socket (see
     // debugger/index.ts `dap_socket_for`).
@@ -364,59 +305,10 @@ function console_args(socket: string, literal: (s: string) => string): string[] 
         'console',
         '--ipc', socket,
         ...dap,
-        '--edit-mode', literal(config.get<string>('editMode', 'emacs')),
-        '--color-output', literal(config.get<string>('colorOutput', 'streams')),
+        '--edit-mode', config.get<string>('editMode', 'emacs'),
+        '--color-output', config.get<string>('colorOutput', 'streams'),
         ...R_ARGS,
     ];
-}
-
-/**
- * The `command` of a Perch session running `program`. Raven's console
- * listens in the session directory (`{dir}/ipc`, DAP at `{dir}/d`); every
- * other argument is escaped so Perch passes it literally.
- */
-export async function build_perch_r_command(program: TerminalProgram): Promise<{ command: string[]; console_socket: boolean }> {
-    const binary = program === RAVEN_CONSOLE_PROGRAM ? await resolve_console_binary() : undefined;
-    if (binary === undefined) {
-        return { command: [escape_perch_text(program), ...R_ARGS], console_socket: false };
-    }
-    return {
-        command: [escape_perch_text(binary), ...console_args(PERCH_CONSOLE_SOCKET, escape_perch_text)],
-        console_socket: true,
-    };
-}
-
-/**
- * Describes a Perch session for `program`, remembering it as started here.
- *
- * Invariant: the session-server token never reaches a command line. Perch
- * turns `env` into `perch new --env NAME=VALUE` arguments, which any user on
- * the host can list, so the token goes in the terminal's own environment
- * instead: `perch new` passes its whole environment to the program (Perch
- * `docs/cli.md`, "The program gets the environment of `perch new`"). The
- * other plot variables aren't secret and stay in `env`. A reattached or
- * reconnected session keeps the environment it started with.
- */
-async function prepare_perch_launch(
-    api: PerchApiV1,
-    program: TerminalProgram,
-    plot_env: { env: RavenPlotEnv; sessionId: string } | null,
-): Promise<{ id: string; options: vscode.TerminalOptions }> {
-    const { command, console_socket } = await build_perch_r_command(program);
-    const { RAVEN_SESSION_TOKEN: token, ...public_env } = plot_env?.env ?? {};
-    const launch = api.prepareLaunch({
-        name: terminal_name_for(program),
-        kind: PERCH_R_KIND,
-        command,
-        env: plot_env ? escape_perch_env(public_env) : undefined,
-        annotations: perch_annotations(program, console_socket),
-    });
-    launched_here.set(launch.id, { program, plot_session_id: plot_env?.sessionId });
-    if (token === undefined) return launch;
-    return {
-        id: launch.id,
-        options: { ...launch.options, env: { ...launch.options.env, RAVEN_SESSION_TOKEN: token } },
-    };
 }
 
 const exec_async = promisify(exec);
@@ -479,9 +371,6 @@ export function _dispose_cached_r_terminal_for_test(): void {
     managed_terminals.clear();
     creation_in_flight.clear();
     pending_profiles.clear();
-    launched_here.clear();
-    perch_profiles_starting.clear();
-    stale_plots_notice_shown = false;
 }
 
 // Probes for the program in the user's interactive-login shell, where rc-file
@@ -643,19 +532,6 @@ function handle_terminal_opened(terminal: vscode.Terminal): void {
         PENDING_TTL_MS,
     );
     if (!entry) return;
-    if (entry.perch) {
-        // Its console socket is in the session directory, known once Perch
-        // reports the session.
-        const api = entry.perch;
-        perch_terminals_starting.add(terminal);
-        const starting = api.waitForSession(id as string, terminal).then(
-            (session) => adopt_perch_terminal(session, terminal, api),
-            (err) => report_perch_start_failure(err),
-        );
-        perch_profiles_starting.add(starting);
-        void starting.finally(() => perch_profiles_starting.delete(starting));
-        return;
-    }
     managed_terminals.set(terminal, entry.program);
     if (entry.sessionId) terminal_to_session_id.set(terminal, entry.sessionId);
     if (entry.consoleSocket) register_console_terminal(terminal, entry.consoleSocket);
@@ -671,16 +547,6 @@ export function _handle_terminal_opened_for_test(terminal: vscode.Terminal): voi
     handle_terminal_opened(terminal);
 }
 
-/** Test-only: run the `onDidCloseTerminal` handler. */
-export function _handle_terminal_closed_for_test(terminal: vscode.Terminal): void {
-    handle_terminal_closed(terminal);
-}
-
-/** Test-only: where Raven's server binary is (activation sets it). */
-export function _set_server_path_for_test(get: (() => string) | null): void {
-    server_binaries_getter = get ? () => ({ configured: undefined, bundled: get() }) : null;
-}
-
 /** Test-only: the configured and bundled server binaries (activation sets them). */
 export function _set_server_binaries_for_test(get: (() => ServerBinaries) | null): void {
     server_binaries_getter = get;
@@ -688,75 +554,13 @@ export function _set_server_binaries_for_test(get: (() => ServerBinaries) | null
 }
 
 function handle_terminal_closed(terminal: vscode.Terminal): void {
-    // Closing a Perch terminal only detaches it: R keeps running, so its plot
-    // session stays open until `perch_session_ended`.
-    const detached = perch_session_of(terminal) !== undefined;
-    untrack_perch_terminal(terminal);
     managed_terminals.delete(terminal);
     forget_console_terminal(terminal);
     const sid = terminal_to_session_id.get(terminal);
-    if (sid && plot_services && !detached) {
+    if (sid && plot_services) {
         plot_services.server.markSessionEnded(sid);
     }
     terminal_to_session_id.delete(terminal);
-}
-
-/**
- * Manages a Perch terminal of this window attached to one of Raven's
- * sessions: one Raven started, one Perch reopened after a reload, or one
- * the user reattached. Runs again for the same terminal harmlessly.
- */
-function adopt_perch_terminal(session: SessionInfo, terminal: vscode.Terminal, api: PerchApiV1): void {
-    if (managed_terminals.has(terminal) || is_ended(session) || session.owner !== RAVEN_CALLER_ID) return;
-    const launched = launched_here.get(session.id);
-    track_perch_terminal(terminal, session.id, api);
-    managed_terminals.set(terminal, launched?.program ?? session_program(session));
-    const socket = session_console_socket(session);
-    if (socket) register_console_terminal(terminal, socket, { owns_dir: false });
-    if (launched?.plot_session_id) terminal_to_session_id.set(terminal, launched.plot_session_id);
-    if (!launched) show_stale_plots_notice();
-}
-
-/**
- * A console started by an earlier activation posts plots and `View()` data
- * to that activation's server, which is gone. Say so once rather than let
- * them vanish.
- */
-function show_stale_plots_notice(): void {
-    if (stale_plots_notice_shown) return;
-    stale_plots_notice_shown = true;
-    void vscode.window.showInformationMessage(
-        'Raven: reconnected to an R console that kept running in Perch. Its plots and data viewer ' +
-        "won't show in this window until you restart that console (quit R, then send code again).",
-    );
-}
-
-function perch_session_ended(session: SessionInfo): void {
-    for (const terminal of [...managed_terminals.keys()]) {
-        if (perch_session_of(terminal) === session.id) {
-            untrack_perch_terminal(terminal);
-            managed_terminals.delete(terminal);
-            forget_console_terminal(terminal);
-            terminal_to_session_id.delete(terminal);
-        }
-    }
-    const launched = launched_here.get(session.id);
-    launched_here.delete(session.id);
-    if (launched?.plot_session_id && plot_services) {
-        plot_services.server.markSessionEnded(launched.plot_session_id);
-    }
-}
-
-const perch_handlers: PerchHandlers = { attached: adopt_perch_terminal, ended: perch_session_ended };
-
-/** Test-only: look Perch up with fake dependencies, as activation does. */
-export function _connect_perch_for_r_terminals_for_test(deps: PerchDeps): Promise<void> {
-    return _connect_perch_for_test(deps, perch_handlers);
-}
-
-function report_perch_start_failure(err: unknown): void {
-    const message = err instanceof Error ? err.message : String(err);
-    void vscode.window.showErrorMessage(`Raven: the R console didn't start in a Perch session (${message}).`);
 }
 
 /** The **R** terminal profile: Raven's console, or the chosen program. */
@@ -772,8 +576,6 @@ async function provide_r_terminal_profile(token: vscode.CancellationToken): Prom
     if (token.isCancellationRequested) {
         throw new vscode.CancellationError();
     }
-    const perch_profile = await profile_in_perch(program, plot_env);
-    if (perch_profile) return perch_profile;
     const launch = await build_r_terminal_launch(program);
     // VS Code opens this terminal itself; the id in its environment is
     // how `handle_terminal_opened` recognizes it.
@@ -794,11 +596,6 @@ async function provide_r_terminal_profile(token: vscode.CancellationToken): Prom
     return profile;
 }
 
-/** Test-only: what the **R** terminal profile would open now. */
-export function _provide_r_terminal_profile_for_test(): Promise<vscode.TerminalProfile> {
-    return provide_r_terminal_profile(new vscode.CancellationTokenSource().token);
-}
-
 export function register_r_terminal(
     context: vscode.ExtensionContext,
     services: PlotServices,
@@ -809,7 +606,6 @@ export function register_r_terminal(
     server_binaries_getter = get_server_binaries;
     const provider: vscode.TerminalProfileProvider = { provideTerminalProfile: provide_r_terminal_profile };
 
-    start_perch(context, perch_handlers);
     context.subscriptions.push(
         vscode.window.registerTerminalProfileProvider(PROFILE_ID, provider),
         vscode.window.onDidOpenTerminal(handle_terminal_opened),
@@ -825,55 +621,15 @@ export function register_r_terminal(
     );
 }
 
-/**
- * A terminal profile running `program` in a Perch session, or null for an
- * ordinary terminal (no Perch, or Perch can't prepare one).
- */
-async function profile_in_perch(
-    program: TerminalProgram,
-    plot_env: { env: RavenPlotEnv; sessionId: string } | null,
-): Promise<vscode.TerminalProfile | null> {
-    const api = await perch_for_new_console();
-    if (!api) return null;
-    let launch: { id: string; options: vscode.TerminalOptions };
-    try {
-        launch = await prepare_perch_launch(api, program, plot_env);
-    } catch (err) {
-        console.warn('raven: Perch could not prepare a session; using an ordinary terminal:', err);
-        return null;
-    }
-    // The Perch session ID doubles as the pending-profile ID.
-    pending_profiles.set(launch.id, {
-        program,
-        sessionId: plot_env?.sessionId,
-        generatedAtMs: Date.now(),
-        perch: api,
-    });
-    return new vscode.TerminalProfile({
-        ...launch.options,
-        env: { ...launch.options.env, [TERMINAL_ID_ENV]: launch.id },
-    });
-}
-
-/**
- * The most recent managed terminal running `program`, else a new one. With
- * Perch, a running session of `program` with no terminal in this window
- * (closed, or left by an earlier window) is offered first.
- * Throws `CancellationError` when the user dismisses that offer.
- */
+/** The most recent managed terminal running `program`, else a new one. */
 export async function get_or_create_terminal_for(
     program: TerminalProgram,
 ): Promise<vscode.Terminal> {
-    let existing = most_recent((_, p) => p === program);
-    if (existing) return existing;
-    // Terminals Perch reopened or a profile launch started may still be
-    // joining; without Perch both settle at once.
-    await Promise.all([perch_lookup_settled(), ...perch_profiles_starting]);
-    existing = most_recent((_, p) => p === program);
+    const existing = most_recent((_, p) => p === program);
     if (existing) return existing;
     const in_flight = creation_in_flight.get(program);
     if (in_flight) return in_flight;
-    const creating = (async () => (await reattach_perch_session(program)) ?? create_r_terminal(program))().finally(() => {
+    const creating = create_r_terminal(program).finally(() => {
         creation_in_flight.delete(program);
     });
     creation_in_flight.set(program, creating);
@@ -903,143 +659,9 @@ export async function get_or_create_raven_console(): Promise<vscode.Terminal> {
     return get_or_create_terminal_for(RAVEN_CONSOLE_PROGRAM);
 }
 
-type ReattachItem = vscode.QuickPickItem & { session?: SessionInfo };
-
-async function default_reattach_picker(
-    candidates: SessionInfo[],
-    program: TerminalProgram,
-): Promise<SessionInfo | 'new' | undefined> {
-    const items: ReattachItem[] = candidates.map((session) => ({
-        label: session.name || terminal_name_for(program),
-        description: session.cwd,
-        detail: `Started ${new Date(session.createdAt).toLocaleString()} · ${
-            session.attached ? 'open in another window' : 'not open in any window'}`,
-        session,
-    }));
-    items.push({ label: `Start a new ${target_label(program)}` });
-    const picked = await vscode.window.showQuickPick(items, {
-        title: 'Reattach an R console?',
-        placeHolder: 'These R consoles are still running on this host',
-    });
-    if (!picked) return undefined;
-    return picked.session ?? 'new';
-}
-
-let reattach_picker = default_reattach_picker;
-
-export function _set_reattach_picker_for_test(fn: typeof default_reattach_picker | null): void {
-    reattach_picker = fn ?? default_reattach_picker;
-}
-
-/**
- * With Perch, offers the running sessions of `program` that have no terminal
- * in this window and reattaches the one picked. Returns undefined to start
- * a new console. Never targets a session without asking: it may belong to
- * another workspace.
- */
-async function reattach_perch_session(program: TerminalProgram): Promise<vscode.Terminal | undefined> {
-    const api = await perch_for_new_console();
-    if (!api) return undefined;
-    let listed: SessionInfo[];
-    try {
-        listed = await api.listSessions({ owner: RAVEN_CALLER_ID });
-    } catch (err) {
-        console.warn('raven: could not list Perch sessions:', err);
-        return undefined;
-    }
-    const candidates = reattach_candidates(listed, program, perch_sessions_open_here());
-    if (candidates.length === 0) return undefined;
-    const picked = await reattach_picker(candidates, program);
-    if (picked === undefined) throw new vscode.CancellationError();
-    if (picked === 'new') return undefined;
-    let terminal: vscode.Terminal;
-    try {
-        terminal = await api.attach(picked.id, { show: false });
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        void vscode.window.showWarningMessage(`Raven: didn't reattach the R console (${message}).`);
-        throw new vscode.CancellationError();
-    }
-    adopt_perch_terminal(picked, terminal, api);
-    return terminal;
-}
-
-/**
- * Starts `program` in a Perch session; resolves once Perch reports it
- * running. Undefined when Perch can't describe the launch (nothing was
- * started, so an ordinary terminal is safe).
- */
-async function create_perch_terminal(
-    api: PerchApiV1,
-    program: TerminalProgram,
-    plot_env: { env: RavenPlotEnv; sessionId: string } | null,
-): Promise<vscode.Terminal | undefined> {
-    let launch: { id: string; options: vscode.TerminalOptions };
-    try {
-        launch = await prepare_perch_launch(api, program, plot_env);
-    } catch (err) {
-        console.warn('raven: Perch could not prepare a session; using an ordinary terminal:', err);
-        return undefined;
-    }
-    try {
-        return await open_perch_terminal(api, launch);
-    } catch (err) {
-        report_perch_start_failure(err);
-        throw err;
-    }
-}
-
-/** Opens a prepared Perch launch; resolves once Perch reports it running. */
-async function open_perch_terminal(
-    api: PerchApiV1,
-    launch: { id: string; options: vscode.TerminalOptions },
-): Promise<vscode.Terminal> {
-    const terminal = vscode.window.createTerminal(launch.options);
-    perch_terminals_starting.add(terminal);
-    const session = await api.waitForSession(launch.id, terminal);
-    adopt_perch_terminal(session, terminal, api);
-    return terminal;
-}
-
-/** How long a console asked for from Perch's list waits for the Perch lookup. */
-const PERCH_LAUNCHER_LOOKUP_MS = 5000;
-
-/**
- * **New R console** in Perch's list of new terminals (Raven's
- * `perch.launchers` entry), in any window: starts the program the terminal
- * profile would (asking if no console is chosen) in a new Perch session, with
- * no reattach offer, then shows it. Being the newest console of its program,
- * it is where sends go. Resolves once the session runs; rejects with a
- * message for the user, or `CancellationError` when the user cancels.
- */
-export async function new_console_in_perch(lookup_ms = PERCH_LAUNCHER_LOOKUP_MS): Promise<void> {
-    const api = await usable_perch(lookup_ms);
-    if (!api) throw new Error('Perch is not available here.');
-    const program = await resolve_profile_program();
-    const plot_env = await get_plot_terminal_env();
-    let launch: { id: string; options: vscode.TerminalOptions };
-    try {
-        launch = await prepare_perch_launch(api, program, plot_env);
-    } catch (err) {
-        throw new Error(`Perch couldn't start the R console (${err instanceof Error ? err.message : String(err)}).`);
-    }
-    let terminal: vscode.Terminal;
-    try {
-        terminal = await open_perch_terminal(api, launch);
-    } catch (err) {
-        throw new Error(`The R console didn't start in a Perch session (${err instanceof Error ? err.message : String(err)}).`);
-    }
-    terminal.show();
-}
-
 async function create_r_terminal(target: TerminalProgram): Promise<vscode.Terminal> {
     const program = await launch_program_for(target);
     const plot_env = await get_plot_terminal_env();
-    const api = await perch_for_new_console();
-    if (api) {
-        const terminal = await create_perch_terminal(api, program, plot_env);
-        if (terminal) return terminal;
-    }
     // Opt out of VS Code's terminal restoration. Without isTransient, a restart
     // replays scrollback and relaunches R in the same pane, but the R process
     // is fresh (no objects/history) and the baked-in port/token env vars point

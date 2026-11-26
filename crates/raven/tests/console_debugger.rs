@@ -2927,7 +2927,7 @@ fn subscribing_while_r_is_stopped_reports_the_stop() {
     let a = c.write_file("a.R", "x <- 1\ny <- 2\n");
     let arm = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {&a: [{"line": 2}]}});
     assert_eq!(ipc_request(&c, &arm), "ok");
-    // No editor is connected when R stops (a detached Perch console).
+    // No editor is connected when R stops.
     c.send(&format!("source({a:?})"), None);
     c.expect("Browse[");
     let mut sub = Subscriber::connect(&c);

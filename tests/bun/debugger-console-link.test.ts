@@ -330,7 +330,7 @@ function raw_request(sock: string, msg: object): Promise<void> {
 }
 const consoles: FakeConsole[] = [];
 
-/** A Perch-style terminal: closing it detaches; the console keeps running. */
+/** A terminal whose closing detaches it; the console keeps running. */
 const attached = new Set<object>();
 function attach(sock: string): object {
     const terminal = { name: 'R', show() {} };
@@ -746,8 +746,8 @@ describe("the bound on how long a new console's first send is held", () => {
         ipc.send_debug_program(sock, 'source("a.R")');
         await settle(300);
         expect(con.executes.length).toBe(0);
-        // A Perch terminal closing only detaches: the console lives on and
-        // takes the send.
+        // This terminal closing only detaches: the console lives on and takes
+        // the send.
         for (const l of close_listeners) l(terminal);
         await until(() => con.executes.length === 1, 2_000);
         detach(terminal);
@@ -1093,7 +1093,7 @@ describe("the host's launch sequence: a launch whose preLaunchTask outlasts its 
         expect(warning_messages.slice(warned).join()).toContain('"Slow build" was not started, and its program did not run');
     }));
 
-    test("closing the console's terminal while the task runs (a Perch console lives on) changes nothing", () => hosted(async () => {
+    test("closing the console's terminal while the task runs (the console lives on) changes nothing", () => hosted(async () => {
         const { con, sock, terminal } = await ready_console();
         const { task, finish } = slow_task();
         const launch = host_launch(explicit(sock, 'Slow build'), { task });

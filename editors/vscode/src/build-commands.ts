@@ -245,10 +245,9 @@ async function install_and_restart_in(
         restart_listener.dispose();
         // Recreate so the user's next Send-to-R / Build command lands in a
         // fresh R session loaded with the newly installed package.
-        // Dismissing a Perch reattach offer cancels the reopen.
         if (program) {
             get_or_create_terminal_for(program).catch((err) => {
-                if (!(err instanceof vscode.CancellationError)) console.warn('raven: could not reopen the R console:', err);
+                console.warn('raven: could not reopen the R console:', err);
             });
         }
     });
