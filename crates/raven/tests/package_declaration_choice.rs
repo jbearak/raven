@@ -11,6 +11,20 @@
 //!
 //! Stubs of targets and testthat export the few names the fixtures call.
 //!
+//! Five more stand in for issue #900's packages, in which two attached
+//! packages both declare the same name:
+//!
+//! - `aa884` exports `%pick884%`, which evaluates its right operand, and
+//!   declares the left one captured.
+//! - `zz884` exports `%pick884%`, which never evaluates its right operand,
+//!   and declares that one captured.
+//! - `zmask900` exports `%pick884%`, which evaluates its right operand in a
+//!   data mask. Its declaration is the same as zz884's.
+//! - `ap900` exports `pick900(d, v)`, which never evaluates `v`, and declares
+//!   `v` captured.
+//! - `zp900` exports `pick900(d, v)`, which evaluates `v`, and declares `d`
+//!   captured.
+//!
 //! Each fixture below was run in R 4.6.2 against real packages built that
 //! way: `Rscript --vanilla -e 'source("main.R")'` (or `"_targets.R"`), the
 //! package's exported `f(1)`, or `testthat::test_local()`, as the fixture
@@ -56,6 +70,15 @@ name = "pick"
 formals = ["data", "cond"]
 captured = ["cond"]
 "#;
+
+/// `name` declared with the formals `formals` and the one captured formal
+/// `captured`.
+fn one_capture_sidecar(name: &str, formals: [&str; 2], captured: &str) -> String {
+    format!(
+        "schema = 1\n\n[[function]]\nname = \"{name}\"\nformals = [\"{}\", \"{}\"]\ncaptured = [\"{captured}\"]\n",
+        formals[0], formals[1]
+    )
+}
 
 /// The name the harness appends to every R file.
 const LIVE_CONTROL: &str = "live_control";
@@ -118,6 +141,32 @@ fn install_fake_packages(lib: &Path, declaring: bool) {
         "Package: wrapplain\nVersion: 0.1.0\nDepends: pkgb\n",
     );
     write(lib, "wrapplain/NAMESPACE", "export(wrap_id)\n");
+    // Issue #900's packages: two declarations for one name.
+    for (package, name, formals, captured) in [
+        ("aa884", "%pick884%", ["x", "y"], "x"),
+        ("zz884", "%pick884%", ["x", "y"], "y"),
+        ("zmask900", "%pick884%", ["x", "y"], "y"),
+        ("ap900", "pick900", ["d", "v"], "v"),
+        ("zp900", "pick900", ["d", "v"], "d"),
+    ] {
+        write(
+            lib,
+            &format!("{package}/DESCRIPTION"),
+            &format!("Package: {package}\nVersion: 0.1.0\n"),
+        );
+        write(
+            lib,
+            &format!("{package}/NAMESPACE"),
+            &format!("export(\"{name}\")\n"),
+        );
+        if declaring {
+            write(
+                lib,
+                &format!("{package}/raven/nse.toml"),
+                &one_capture_sidecar(name, formals, captured),
+            );
+        }
+    }
     // The two real packages the fixtures call into.
     write(
         lib,
@@ -1242,6 +1291,155 @@ library(pkgb)
 library(pkga)
 "#,
             &["l3b_data"],
+        ),
+    ]);
+}
+
+/// Issue #900: when two attached packages both declare a name, Raven applies
+/// the declaration of the package whose name sorts first, not the one R
+/// finds (the one attached last). Pinned at today's results, which are R's
+/// in some rows and not in others. The comment on each case says what R
+/// does with real packages built like the fakes.
+///
+/// The data-mask pair is why this wasn't fixed by following the attach
+/// order. zmask900 and zz884 ship the same declaration (the right operand is
+/// captured), and Raven doesn't read package code, so it can't tell
+/// `two_declarers_function_body` from `data_mask_function_body` or
+/// `two_declarers_zz_last` from `data_mask_last`. R runs the zz884 programs
+/// and stops on the data-mask ones, where both v0.21.1 and today's Raven
+/// report the name. Any rule that picks the last-attached package's
+/// declaration loses those reports.
+///
+/// In a quiet case, the harness's second run (no sidecars) shows the
+/// declaration is what hides the name.
+#[test]
+fn two_declaring_packages_follow_package_names_not_attach_order() {
+    check(&[
+        // R prints 1: zz884 was attached last and never evaluates
+        // r1_operand. Raven applies aa884's declaration.
+        reports(
+            "two_declarers_zz_last",
+            r#"
+--- main.R
+library(aa884)
+suppressPackageStartupMessages(library(zz884))
+print(1 %pick884% r1_operand)
+"#,
+            &["r1_operand"],
+        ),
+        // R: object 'r2_operand' not found (aa884 attached last).
+        reports(
+            "two_declarers_aa_last",
+            r#"
+--- main.R
+library(zz884)
+suppressPackageStartupMessages(library(aa884))
+print(1 %pick884% r2_operand)
+"#,
+            &["r2_operand"],
+        ),
+        // R prints 1.
+        quiet(
+            "zz884_alone",
+            r#"
+--- main.R
+library(zz884)
+print(1 %pick884% r3_operand)
+"#,
+            &["r3_operand"],
+        ),
+        // R: object 'r4_operand' not found.
+        reports(
+            "aa884_alone",
+            r#"
+--- main.R
+library(aa884)
+print(1 %pick884% r4_operand)
+"#,
+            &["r4_operand"],
+        ),
+        // R prints 1, as in `two_declarers_zz_last`.
+        reports(
+            "two_declarers_function_body",
+            r#"
+--- main.R
+f <- function() { library(aa884); suppressPackageStartupMessages(library(zz884)); 1 %pick884% r5_operand }
+print(f())
+"#,
+            &["r5_operand"],
+        ),
+        // R prints 1. Raven doesn't carry aa884 past the `local()` block
+        // (issue #884), so it sees zz884 alone.
+        quiet(
+            "child_attaches_aa_in_local_block",
+            r#"
+--- main.R
+f <- function() { local({ source("child.R", local = TRUE) }); suppressPackageStartupMessages(library(zz884)); 1 %pick884% r6_operand }
+print(f())
+--- child.R
+library(aa884)
+"#,
+            &["r6_operand"],
+        ),
+        // R: object 'vaule' not found. zmask900, attached last, evaluates
+        // the right operand in a data mask that holds only `value`.
+        reports(
+            "data_mask_last",
+            r#"
+--- main.R
+library(aa884)
+suppressPackageStartupMessages(library(zmask900))
+print(1 %pick884% vaule)
+"#,
+            &["vaule"],
+        ),
+        // R: object 'vaule2' not found.
+        reports(
+            "data_mask_function_body",
+            r#"
+--- main.R
+f <- function() { library(aa884); suppressPackageStartupMessages(library(zmask900)); 1 %pick884% vaule2 }
+print(f())
+"#,
+            &["vaule2"],
+        ),
+        // R: object 'vaule3' not found. Today's Raven sees zmask900 alone
+        // here (issue #884) and applies its declaration; v0.21.1 reports
+        // the name.
+        quiet(
+            "data_mask_child_in_local_block",
+            r#"
+--- main.R
+f <- function() { local({ source("child.R", local = TRUE) }); suppressPackageStartupMessages(library(zmask900)); 1 %pick884% vaule3 }
+print(f())
+--- child.R
+library(aa884)
+"#,
+            &["vaule3"],
+        ),
+        // An ordinary function has the same order. R: object 'fn1_value'
+        // not found (zp900 attached last); Raven applies ap900's
+        // declaration.
+        quiet(
+            "two_declaring_functions_zp_last",
+            r#"
+--- main.R
+library(ap900)
+suppressPackageStartupMessages(library(zp900))
+print(pick900(1, fn1_value))
+"#,
+            &["fn1_value"],
+        ),
+        // R prints 1.
+        quiet(
+            "two_declaring_functions_ap_last",
+            r#"
+--- main.R
+library(zp900)
+suppressPackageStartupMessages(library(ap900))
+print(pick900(1, fn2_value))
+"#,
+            &["fn2_value"],
         ),
     ]);
 }
