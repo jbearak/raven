@@ -67,7 +67,6 @@ afterAll(() => {
 /** Waits for queued microtasks and timers to run. */
 const settle = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
-
 // ---------------------------------------------------------------------------
 
 describe('vscode-R sends never reach Raven\'s terminal', () => {

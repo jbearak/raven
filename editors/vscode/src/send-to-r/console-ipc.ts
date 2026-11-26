@@ -126,8 +126,8 @@ export function make_console_socket_path(): string {
 
 /**
  * `owns_dir: false` leaves the socket's directory in place when the terminal
- * is forgotten, for a console that outlives its terminal (the debugger tests
- * detach a console and reattach it).
+ * is forgotten, for a console that outlives the terminal it was registered
+ * with.
  */
 export function register_console_terminal(
     terminal: vscode.Terminal,

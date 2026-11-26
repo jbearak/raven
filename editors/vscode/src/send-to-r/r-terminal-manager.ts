@@ -547,11 +547,6 @@ export function _handle_terminal_opened_for_test(terminal: vscode.Terminal): voi
     handle_terminal_opened(terminal);
 }
 
-/** Test-only: where Raven's server binary is (activation sets it). */
-export function _set_server_path_for_test(get: (() => string) | null): void {
-    server_binaries_getter = get ? () => ({ configured: undefined, bundled: get() }) : null;
-}
-
 /** Test-only: the configured and bundled server binaries (activation sets them). */
 export function _set_server_binaries_for_test(get: (() => ServerBinaries) | null): void {
     server_binaries_getter = get;
