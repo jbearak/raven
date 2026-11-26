@@ -112,6 +112,84 @@ pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
     exports
 }
 
+/// The names a NAMESPACE exports by name, when a static reader can vouch for
+/// them: `None` unless every line of the file is a directive this parser
+/// knows and none of them is a pattern export.
+///
+/// R evaluates a NAMESPACE, and the file may hold `if` statements. An
+/// `export()` inside a branch R doesn't take exports nothing, and whether a
+/// pattern export covers a name takes R (or `INDEX`) to say. The package
+/// loader asks R in the pattern case; a caller that can't must not treat such
+/// a file as evidence of anything. A missing or unreadable file is `None`
+/// too.
+pub(crate) fn parse_namespace_authoritative_exports(namespace_path: &Path) -> Option<Vec<String>> {
+    const OTHER_DIRECTIVES: [&str; 6] = [
+        "S3method",
+        "import",
+        "importFrom",
+        "importClassesFrom",
+        "importMethodsFrom",
+        "useDynLib",
+    ];
+    let content = fs::read_to_string(namespace_path).ok()?;
+    let normalized = normalize_multiline_directives(&content);
+    let mut exports = Vec::new();
+    for line in normalized.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        // `export(x); if (FALSE)` starts with a known directive and still
+        // makes the next line conditional.
+        if !directive_is_whole_line(line) {
+            return None;
+        }
+        // An escaped quote can hide a comma or a parenthesis inside a name
+        // (`export("a\",pick,\"b")` exports one name); the argument splitter
+        // doesn't read escapes.
+        if line.contains('\\') {
+            return None;
+        }
+        let exported = extract_directive_args(line, "export")
+            .or_else(|| extract_directive_args(line, "exportClasses"))
+            .or_else(|| extract_directive_args(line, "exportMethods"));
+        match exported {
+            Some(args) => exports.extend(
+                parse_comma_separated_args(&args)
+                    .into_iter()
+                    .filter(|name| !name.is_empty()),
+            ),
+            // A pattern export, a conditional, a brace, or anything else.
+            None if !OTHER_DIRECTIVES
+                .iter()
+                .any(|directive| extract_directive_args(line, directive).is_some()) =>
+            {
+                return None;
+            }
+            None => {}
+        }
+    }
+    // The loader spells a pattern export as a name with this prefix, so a
+    // name that really starts with it can't be told from one.
+    if exports.iter().any(|name| name.starts_with("__PATTERN__:")) {
+        return None;
+    }
+    Some(exports)
+}
+
+/// Whether `line` is one call and nothing else: the parenthesis that closes
+/// its first `(` is followed only by whitespace or a comment.
+fn directive_is_whole_line(line: &str) -> bool {
+    let Some(open) = line.find('(') else {
+        return false;
+    };
+    let after_open = &line[open + 1..];
+    let Some(close) = find_matching_paren(after_open) else {
+        return false;
+    };
+    let rest = after_open[close + 1..].trim_start();
+    rest.is_empty() || rest.starts_with('#')
+}
+
 /// Parse NAMESPACE file content to extract exported symbols and pattern markers.
 ///
 /// This function scans normalized NAMESPACE directives and collects:
@@ -857,6 +935,90 @@ fn is_valid_r_identifier(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`parse_namespace_authoritative_exports`] for a NAMESPACE with this
+    /// text.
+    fn authoritative_exports(namespace: &str) -> Option<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NAMESPACE");
+        fs::write(&path, namespace).unwrap();
+        parse_namespace_authoritative_exports(&path)
+    }
+
+    #[test]
+    fn authoritative_exports_of_a_plain_namespace() {
+        let namespace = "# comment\nexport(pick,\n       \"%where%\")\nexportMethods(show)\n\
+                         S3method(print, widget)\nimportFrom(stats, sd)\nuseDynLib(pkg)\n";
+        assert_eq!(
+            authoritative_exports(namespace),
+            Some(vec![
+                "pick".to_string(),
+                "%where%".to_string(),
+                "show".to_string()
+            ])
+        );
+    }
+
+    /// An `export()` in a branch R doesn't take exports nothing, and a static
+    /// reader can't tell which branch R takes.
+    #[test]
+    fn a_conditional_namespace_is_not_authoritative() {
+        for namespace in [
+            "export(keep)\nif (getRversion() < \"2.0.0\") {\n    export(pick)\n}\n",
+            "if (FALSE) export(pick)\n",
+            "export(keep)\nif (FALSE)\nexport(pick)\n",
+            "export(keep); if (FALSE)\nexport(pick)\n",
+            "export(keep) if (FALSE)\nexport(pick)\n",
+        ] {
+            assert_eq!(authoritative_exports(namespace), None, "{namespace}");
+        }
+    }
+
+    /// Whether a pattern covers a name takes R or `INDEX` to say, which is
+    /// what the package loader consults for such a package.
+    #[test]
+    fn a_pattern_namespace_is_not_authoritative() {
+        assert_eq!(
+            authoritative_exports("exportPattern(\"^p\")\nexport(pick)\n"),
+            None
+        );
+        assert_eq!(
+            authoritative_exports("export(pick)\nexportClassPattern(\"^C\")\n"),
+            None
+        );
+    }
+
+    /// R reads `export("a\",pick,\"b")` as one name; splitting on commas
+    /// would find `pick`.
+    #[test]
+    fn an_escaped_quote_in_a_namespace_is_not_authoritative() {
+        assert_eq!(
+            authoritative_exports("export(\"a\\\",pick,\\\"b\")\n"),
+            None
+        );
+    }
+
+    /// The loader's own marker for a pattern export, written as a name.
+    #[test]
+    fn an_export_spelled_like_the_pattern_marker_is_not_authoritative() {
+        assert_eq!(
+            authoritative_exports("export(\"__PATTERN__:pick\")\nexport(keep)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unrecognized_namespace_is_not_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            parse_namespace_authoritative_exports(&dir.path().join("NAMESPACE")),
+            None
+        );
+        assert_eq!(
+            authoritative_exports("export(pick)\nsomething_else()\n"),
+            None
+        );
+    }
 
     // Tests for parse_namespace_content
 
