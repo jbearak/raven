@@ -9,6 +9,7 @@
  * - `execute` is queued and recorded.
  */
 import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -160,6 +161,39 @@ mock.module('vscode', () => ({
     },
 }));
 
+/**
+ * Every client connection the extension opens to a `watched` socket path,
+ * with when it started, what it first wrote and how it ended up (`connect`,
+ * or the error code it failed with first). Installed before the debugger
+ * module is imported: a spy installed later doesn't see its calls. The
+ * mock outlives this file in a shared Bun run, so any other connection
+ * passes through untouched.
+ */
+type Attempt = { path: string; at: number; outcome?: string; wrote: string; sock: net.Socket };
+const attempts: Attempt[] = [];
+const watched = new Set<string>();
+const real_create_connection = net.createConnection as (...a: unknown[]) => net.Socket;
+mock.module('net', () => ({
+    ...net,
+    createConnection: (...args: unknown[]) => {
+        const target = args[0];
+        const where = typeof target === 'string' ? target : String((target as { path?: string })?.path);
+        if (!watched.has(where)) return real_create_connection(...args);
+        const at = performance.now();
+        const sock = real_create_connection(...args);
+        const a: Attempt = { path: where, at, wrote: '', sock };
+        attempts.push(a);
+        sock.once('connect', () => { a.outcome ??= 'connect'; });
+        sock.once('error', (e: NodeJS.ErrnoException) => { a.outcome ??= e.code ?? e.message; });
+        const write = sock.write.bind(sock) as (...w: unknown[]) => boolean;
+        sock.write = ((...w: unknown[]) => {
+            if (!a.wrote) a.wrote = String(w[0]);
+            return write(...w);
+        }) as typeof sock.write;
+        return sock;
+    },
+}));
+
 const {
     register_debugger,
     register_debugger_unavailable,
@@ -192,6 +226,9 @@ class FakeConsole {
     apply_delay_ms = 0;
     /** Never acknowledge `subscribe` (a console that has hung). */
     silent_subscribe = false;
+    /** `subscribe` requests acknowledged, and those connections closed since. */
+    subscribes = 0;
+    subscriber_closes = 0;
     private subscribers: net.Socket[] = [];
     private server: net.Server;
     constructor(readonly socket: string) {
@@ -213,9 +250,24 @@ class FakeConsole {
     listen(): Promise<void> {
         return new Promise((resolve) => this.server.listen(this.socket, resolve));
     }
+    /**
+     * Start accepting on a path that already holds a socket nobody accepts
+     * on: listen beside it, then rename over it, so the path never goes
+     * missing (a client sees refusals, then a listener; never ENOENT).
+     */
+    async listen_over_refusing(): Promise<void> {
+        const beside = `${this.socket}.new`;
+        await new Promise<void>((resolve) => this.server.listen(beside, resolve));
+        fs.renameSync(beside, this.socket);
+    }
     close(): void {
         for (const s of this.subscribers) s.destroy();
         this.server.close();
+    }
+    /** Close every subscriber's connection cleanly. */
+    drop_subscribers(): void {
+        for (const s of this.subscribers) s.end();
+        this.subscribers = [];
     }
     /** Push an event to every subscriber. */
     push(event: object): void {
@@ -230,6 +282,8 @@ class FakeConsole {
                 if (this.silent_subscribe) return;
                 this.reply(sock, msg.id, 'ok');
                 this.subscribers.push(sock);
+                this.subscribes++;
+                sock.on('close', () => { this.subscriber_closes++; });
                 return;
             case 'breakpoints': {
                 const n = ++this.mirrors;
@@ -1267,4 +1321,160 @@ describe('with the R console turned off', () => {
         expect(error_messages.at(-1)).toContain('raven.rConsole.activation');
         for (const d of ctx.subscriptions) d.dispose();
     });
+});
+
+// A console's socket file exists from its bind() and accepts from its
+// listen(), a moment later; a connect in between is refused (#912).
+describe.skipIf(process.platform === 'win32')("a console's first control connection", () => {
+    /**
+     * Leave a socket file at `sock` that refuses connections, as a console's
+     * does between bind() and listen(): a process that listens there and is
+     * killed leaves the file and no listener.
+     */
+    function refusing_socket(sock: string): void {
+        const listen_and_die = `require('net').createServer().listen(${JSON.stringify(sock)}, () => process.kill(process.pid, 'SIGKILL'))`;
+        const r = spawnSync(process.execPath, ['-e', listen_and_die]);
+        if (r.signal !== 'SIGKILL' || !fs.statSync(sock).isSocket()) throw new Error(`no refusing socket at ${sock}`);
+    }
+    /** A console of these tests, its connections observed. */
+    async function watched_console(listen = true): Promise<{ con: FakeConsole; sock: string }> {
+        const c = await console_at(listen);
+        watched.add(c.sock);
+        return c;
+    }
+    const tried = (sock: string) => attempts.filter((a) => a.path === sock);
+    const refusals = (sock: string) => tried(sock).filter((a) => a.outcome === 'ECONNREFUSED').length;
+    const refused = (sock: string) => refusals(sock) > 0;
+    const subscriptions = (sock: string) => tried(sock).filter((a) => a.wrote.includes('"subscribe"'));
+    function capture_warnings(): { about(sock: string): string[]; first_at(sock: string): number; restore(): void } {
+        const warn = console.warn;
+        const warned: Array<{ at: number; text: string }> = [];
+        console.warn = (...args: unknown[]) => { warned.push({ at: performance.now(), text: args.map(String).join(' ') }); };
+        return {
+            about: (sock) => warned.filter((m) => m.text.includes(sock)).map((m) => m.text),
+            first_at: (sock) => warned.find((m) => m.text.includes(sock))?.at ?? NaN,
+            restore: () => { console.warn = warn; },
+        };
+    }
+
+    test('refused while the console is not listening yet, then linked once it listens', async () => {
+        const w = capture_warnings();
+        try {
+            const { con, sock } = await watched_console(false);
+            refusing_socket(sock);
+            set_breakpoints([line_bp(a_r, 1)]);
+            const t = attach(sock);
+            // Linked by a retry after a retry, not only the first one.
+            await until(() => refusals(sock) >= 2);
+            await con.listen_over_refusing();
+            await until(() => con.files.size === 1);
+            expect([...con.files]).toEqual([[real(a_r), [1]]]);
+            expect(con.subscribes).toBe(1);
+            expect(w.about(sock)).toEqual([]);
+            // The link's connection is the one closed when it goes.
+            detach(t);
+            await until(() => con.subscriber_closes === 1);
+        } finally {
+            w.restore();
+        }
+    }, 15_000);
+
+    test('a path that keeps refusing is given up at the bound, once, and logged', async () => {
+        const w = capture_warnings();
+        _set_launch_timeouts_for_test(10_000, 800);
+        try {
+            const { con, sock } = await watched_console(false);
+            const before = performance.now();
+            attach(sock);
+            // The link's deadline is between these.
+            const bound = performance.now() + 800;
+            // The link has looked for the file once already, so part of the
+            // budget goes to waiting for it.
+            refusing_socket(sock);
+            await until(() => w.about(sock).length > 0);
+            expect(w.about(sock)[0]).toContain('ECONNREFUSED');
+            // Not given up before the deadline.
+            expect(w.first_at(sock)).toBeGreaterThanOrEqual(before + 800);
+            const n = tried(sock).length;
+            await con.listen_over_refusing();
+            await settle(400);
+            expect(tried(sock).length).toBe(n);
+            expect(con.subscribes).toBe(0);
+            expect(w.about(sock).length).toBe(1);
+            // Only the first attempt may start after the bound (the file can
+            // be seen late, as on main).
+            expect(tried(sock).slice(1).filter((a) => a.at >= bound)).toEqual([]);
+        } finally {
+            _set_launch_timeouts_for_test(10_000, 10_000);
+            w.restore();
+        }
+    }, 15_000);
+
+    test('no connection once the terminal is closed during the retries', async () => {
+        const w = capture_warnings();
+        try {
+            const { con, sock } = await watched_console(false);
+            refusing_socket(sock);
+            const t = attach(sock);
+            await until(() => refused(sock));
+            detach(t);
+            const n = tried(sock).length;
+            await con.listen_over_refusing();
+            await settle(400);
+            expect(tried(sock).length).toBe(n);
+            expect(con.subscribes).toBe(0);
+            expect(w.about(sock)).toEqual([]);
+        } finally {
+            w.restore();
+        }
+    }, 15_000);
+
+    test('a socket file removed during the retries is not retried, and is logged', async () => {
+        const w = capture_warnings();
+        try {
+            const { con, sock } = await watched_console(false);
+            refusing_socket(sock);
+            attach(sock);
+            await until(() => refused(sock));
+            fs.rmSync(sock);
+            await until(() => w.about(sock).length > 0);
+            expect(w.about(sock)[0]).toContain('ENOENT');
+            const n = tried(sock).length;
+            await con.listen();
+            await settle(400);
+            expect(tried(sock).length).toBe(n);
+            expect(con.subscribes).toBe(0);
+            expect(w.about(sock).length).toBe(1);
+        } finally {
+            w.restore();
+        }
+    }, 15_000);
+
+    test('a console already listening is linked on the first attempt, and not reconnected after', async () => {
+        const w = capture_warnings();
+        try {
+            // The console closes the connection.
+            const first = await watched_console();
+            attach(first.sock);
+            await until(() => first.con.subscribes === 1);
+            expect(tried(first.sock)[0].outcome).toBe('connect');
+            expect(tried(first.sock)[0].wrote).toContain('"subscribe"');
+            first.con.drop_subscribers();
+            await until(() => first.con.subscriber_closes === 1);
+            // The connection fails on the client's side.
+            const second = await watched_console();
+            attach(second.sock);
+            await until(() => second.con.subscribes === 1);
+            subscriptions(second.sock)[0].sock.destroy(new Error('connection lost'));
+            await until(() => second.con.subscriber_closes === 1);
+            await settle(400);
+            for (const { con, sock } of [first, second]) {
+                expect(subscriptions(sock).length).toBe(1);
+                expect(con.subscribes).toBe(1);
+                expect(w.about(sock)).toEqual([]);
+            }
+        } finally {
+            w.restore();
+        }
+    }, 15_000);
 });
