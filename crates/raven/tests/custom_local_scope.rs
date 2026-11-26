@@ -2,8 +2,9 @@
 //! file (issue #907, item 1). They record today's results so the next attempt
 //! starts from them.
 //!
-//! Raven takes a bare `local({ ... })` for base R's `local()` unless the same
-//! file rebinds `local`, and scopes the block's assignments to the block. When
+//! Raven takes a bare `local({ ... })` for base R's `local()` unless it sees
+//! the same file assign `local` (`local <- ...`), and scopes the block's
+//! assignments to the block. When
 //! another file supplies a `local` that evaluates its argument in the caller,
 //! such as `local <- function(expr) eval.parent(substitute(expr))`, R runs the
 //! block in the calling frame, so a later read works in R and is reported by
@@ -14,7 +15,8 @@
 //! warning when the whole program was provably inert, and shrank to nothing.
 //! The other treated the block as an ordinary call once a graph proof showed
 //! a caller-evaluating wrapper; it never stopped finding ordinary programs
-//! that break the proof. The issue comment records both designs. Every input
+//! that break the proof. The record of both designs, and of why each was
+//! dropped, is the comment on #907 that accompanies these pins. Every input
 //! below was run in R 4.6.2 (`Rscript --vanilla`, from the file the comment
 //! names, or `main.R`).
 
@@ -95,7 +97,8 @@ fn custom_local_from_another_file_keeps_todays_results() {
             &[("main.R", 2)],
         ),
         // R prints 1 run as `Rscript driver.R`, and stops on `xx` run as
-        // `Rscript main.R`; Raven judges `main.R` through its caller.
+        // `Rscript main.R`. Raven warns in `main.R` whether or not the
+        // workspace includes `driver.R`.
         (
             "the wrapper comes from the file that sources this one",
             &[
@@ -168,6 +171,7 @@ fn custom_local_from_another_file_keeps_todays_results() {
             "xx",
             &[],
         ),
+        // Run as `Rscript driver.R`.
         (
             "a declaration after the block, wrapper from the caller",
             &[
@@ -181,8 +185,9 @@ fn custom_local_from_another_file_keeps_todays_results() {
             &[],
         ),
         // Warnings that are right today, and that any design making the
-        // block's bindings visible would lose. With the block removed, R gives
-        // the same result and Raven reports nothing, because it admits
+        // block's bindings visible would lose. With the `local(` call removed
+        // and its braced body kept in place, R gives the same result and
+        // Raven's current analysis reports nothing, because it admits
         // conditional definitions, doesn't apply a sourced child's or a
         // computed `rm()`, and doesn't model a caught error or an empty loop.
         // R stops on `xx` in each.
