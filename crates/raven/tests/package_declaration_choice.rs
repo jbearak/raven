@@ -91,12 +91,12 @@ struct Case {
     files: &'static str,
     /// The undefined names Raven reports, [`LIVE_CONTROL`] aside.
     reported: &'static [&'static str],
-    /// For a case that reports nothing: the names Raven reports once pkga
-    /// declares nothing, which are the ones the declaration hides.
+    /// For a case that reports nothing: the names Raven reports once no
+    /// package ships a declaration, which are the ones the declarations hide.
     hidden: &'static [&'static str],
 }
 
-/// A case Raven reports nothing for, because pkga's declaration hides
+/// A case Raven reports nothing for, because a package's declaration hides
 /// `hidden`.
 const fn quiet(name: &'static str, files: &'static str, hidden: &'static [&'static str]) -> Case {
     Case {
@@ -126,7 +126,8 @@ fn write(root: &Path, relative: &str, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// `declaring` is whether pkga ships its `raven/nse.toml`.
+/// `declaring` is whether the packages that declare anything ship their
+/// `raven/nse.toml`.
 fn install_fake_packages(lib: &Path, declaring: bool) {
     let exports = "export(\"%where%\")\nexport(pick)\n";
     write(lib, "pkga/DESCRIPTION", "Package: pkga\nVersion: 0.1.0\n");
@@ -289,8 +290,8 @@ fn undefined_names(case: &Case, lib: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Compare what Raven reports for the case with the expectation. A case
-/// that expects no report must report exactly its hidden names once pkga
-/// declares nothing.
+/// that expects no report must report exactly its hidden names once no
+/// package ships a declaration.
 fn run(case: &Case, declaring: &Path, undeclaring: &Path) -> Result<(), String> {
     let sorted = |names: &[&'static str]| {
         let mut names = names.to_vec();
@@ -1296,9 +1297,10 @@ library(pkga)
     ]);
 }
 
-/// Issue #900: when two packages Raven counts at the call both declare a
-/// name, Raven applies the declaration of the package whose name sorts
-/// first, not the one R finds (the one attached last). Pinned at today's
+/// Issue #900: when two packages Raven counts at a bare call both declare
+/// the name, Raven picks one by its own order (in these programs, the one
+/// whose name sorts first), not by attach order, so it can pick a different
+/// package than the one R finds (the one attached last). Pinned at today's
 /// results, which are R's in some cases and not in others. The comment on
 /// each case says what R does with real packages built like the fakes. A
 /// change that makes a case agree with R should update its pin.
