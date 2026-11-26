@@ -77,6 +77,22 @@ wired into `pretest`), excluded from the VSIX. Set
 `RAVEN_SKIP_LAYOUT_TESTS=1` to skip the suite in sandboxes that can't
 render a webview.
 
+The live-R suites need more than the editor. The debugger suites
+(`debugger.test.ts`, `debugger_prelaunch.test.ts`) need a `raven` binary
+(`target/debug/raven` if present, else the bundled `bin/raven`) and R with a
+shared libR. The data viewer suite (`data-viewer.test.ts`) and the real-R Bun
+tests (`data-viewer-bootstrap-r-integration`, `data-viewer-writer-r`, and the
+R path of `data-viewer-arrow-projected-spike`) need the `arrow` R package.
+Locally each skips without them. The `VS Code Mocha Suite` CI job sets
+`RAVEN_TEST_REQUIRE_LIVE_SUITES=1`, which turns a missing prerequisite into a
+failing test that names it. It installs `arrow` as a Posit Package Manager
+binary into R's user library, with the snapshot date set by the job's
+`P3M_SNAPSHOT` (part of the cache key; bump it on purpose). The job then
+checks that no test of the three Electron files is pending, and CI forbids
+`.only` (`forbidOnly` in `.vscode-test.mjs`). `.vscode-test.mjs` lists
+`debugger.test.js` first, because its first test must run before any debug
+session and the test CLI keeps glob order, which is not alphabetical.
+
 ### Benchmarks
 
 Run these benchmarks with `--features test-support`. The `startup` benchmark
