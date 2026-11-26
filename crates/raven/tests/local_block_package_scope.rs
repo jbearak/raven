@@ -248,8 +248,10 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
         ),
         // Right today only because the package is forgotten. A sourced
         // `observe` that forces its argument masks Shiny's, so R prints 1 in
-        // both of the next two inputs. Raven scopes the braces as a deferred
-        // Shiny body wherever it sees shiny attached, and reports `made884`.
+        // both of the next two inputs. When Raven sees the child's shiny
+        // attached at the `observe()` call, it takes the call for Shiny's,
+        // because `observe` is defined in another file, scopes the braces
+        // as a deferred body, and reports `made884`.
         // A fix that lets the remembered package reach that rule would turn
         // the first input into the second.
         (
@@ -281,9 +283,9 @@ fn package_attached_by_a_child_sourced_in_a_block_keeps_todays_results() {
         // The same for an infix operator. The child attaches `aa884`, whose
         // `%pick884%` checks its right operand; the function then attaches
         // `zz884`, whose operator doesn't, and R finds `zz884`'s first, so R
-        // prints 1 in both inputs. Raven doesn't follow attach order and
-        // takes `aa884`'s policy wherever it sees `aa884` attached, so it
-        // reports `missing884` there.
+        // prints 1 in both inputs. When Raven sees both packages attached
+        // here, it takes `aa884`'s policy, not the last-attached `zz884`'s,
+        // and reports `missing884`.
         (
             "a child attaches aa884 in a block; zz884's operator is the one found",
             &[
