@@ -20,6 +20,9 @@ export const ADD_KEYBINDINGS_COMMAND = 'raven.useRavenKeybindingsOverVscodeR';
 const OFFER_SHOWN_KEY = 'raven.vscodeRKeybindingsOfferShown';
 const COEXISTENCE_URL = 'https://github.com/jbearak/raven/blob/main/docs/coexistence.md#cmdenter-next-to-vscode-r';
 
+/** keybindings.json that holds Raven's entries but failed to save, to save on the next run. */
+let unsaved_write: string | undefined;
+
 /** How long the keybindings editor has to become the active editor. */
 const OPEN_TIMEOUT_MS = 2000;
 
@@ -76,20 +79,30 @@ export async function add_raven_keybindings(extension: vscode.Extension<unknown>
         return undefined;
     }
     if (updated.added === 0) {
-        // An earlier run's save may have failed, leaving the entries unsaved.
-        if (doc.isDirty && !(await doc.save())) {
-            void vscode.window.showErrorMessage("Raven couldn't save your keybindings.json.");
-            return undefined;
+        // An earlier run's save failed, leaving its entries unsaved. Other
+        // unsaved edits are the user's, and stay unsaved.
+        if (doc.isDirty && unsaved_write === doc.uri.toString()) {
+            if (!(await doc.save())) {
+                void vscode.window.showErrorMessage("Raven couldn't save your keybindings.json.");
+                return undefined;
+            }
+            unsaved_write = undefined;
         }
         void vscode.window.showInformationMessage("Raven's keyboard shortcuts are already in your keybindings.json.");
         return 0;
     }
     const edit = new vscode.WorkspaceEdit();
     edit.replace(doc.uri, new vscode.Range(doc.positionAt(0), doc.positionAt(text.length)), updated.text);
-    if (!(await vscode.workspace.applyEdit(edit)) || !(await doc.save())) {
+    if (!(await vscode.workspace.applyEdit(edit))) {
+        void vscode.window.showErrorMessage("Raven couldn't edit your keybindings.json.");
+        return undefined;
+    }
+    if (!(await doc.save())) {
+        unsaved_write = doc.uri.toString();
         void vscode.window.showErrorMessage("Raven couldn't save your keybindings.json.");
         return undefined;
     }
+    unsaved_write = undefined;
     void vscode.window.showInformationMessage(
         "Added Raven's keyboard shortcuts to your keybindings.json. Cmd+Enter (Ctrl+Enter) in R and R Markdown files now runs Raven's command.",
     );
