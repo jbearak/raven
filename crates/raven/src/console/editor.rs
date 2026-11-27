@@ -787,7 +787,6 @@ mod tests {
         );
     }
 
-    /// A hinter whose folder `/a` holds `entries`, oldest first.
     /// A hinter whose folder `a` holds `entries`, oldest first.
     fn hinter_with(entries: &[&str]) -> (LineHinter, Dirs) {
         let d = dirs();
