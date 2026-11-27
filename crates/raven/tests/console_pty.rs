@@ -899,3 +899,134 @@ fn program_arguments_reach_r_unchanged() {
     let out = c.expect("|END");
     assert!(out.contains("--help|x|END"), "{out}");
 }
+
+/// The SGR parameters in effect where `text` is last drawn in everything
+/// since the last `send`: every SGR between the last reset before it and its
+/// first character. `text` is matched against the visible text, so escapes
+/// inside it do not stop a match. Each style is checked where its text is on
+/// screen, because reedline repaints emit colors (an empty indicator's, say)
+/// in other places too.
+fn style_of(c: &Console, text: &str) -> Vec<String> {
+    let raw = String::from_utf8_lossy(&c.out[c.mark..]).into_owned();
+    let mut visible = String::new();
+    // SGR parameters in effect at each byte of `visible`.
+    let mut active: Vec<String> = Vec::new();
+    let mut at = Vec::new();
+    let mut it = raw.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch != '\x1b' {
+            visible.push(ch);
+            at.extend(std::iter::repeat_n(active.clone(), ch.len_utf8()));
+            continue;
+        }
+        match it.next() {
+            Some('[') => {
+                let mut params = String::new();
+                for n in it.by_ref() {
+                    if n.is_ascii_alphabetic() || n == '~' {
+                        if n == 'm' {
+                            if params.is_empty() || params == "0" {
+                                active.clear();
+                            } else {
+                                active.push(params.clone());
+                            }
+                        }
+                        break;
+                    }
+                    params.push(n);
+                }
+            }
+            Some(']') => {
+                for n in it.by_ref() {
+                    if n == '\x07' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(found) = visible.rfind(text) else {
+        panic!("{text:?} not drawn; output since last input:\n{visible}");
+    };
+    at[found].clone()
+}
+
+#[test]
+fn readline_answer_is_unstyled() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    // The prompt is built at run time, so `Name? ` appears only once R asks.
+    c.line("x <- readline(paste0('Name', '? '))");
+    c.expect("Name? ");
+    c.send("bobby 42");
+    c.expect("bobby 42");
+    c.settle();
+    // Was white (`37`), invisible on a light background.
+    assert_eq!(style_of(&c, "bobby 42"), Vec::<String>::new());
+    c.write(b"\r");
+    c.line("cat(toupper(x), '\\n')");
+    c.expect("BOBBY 42");
+}
+
+#[test]
+fn vi_selection_is_reverse_video() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&["--edit-mode", "vi"]);
+    c.expect("> ");
+    c.send("abc <- 123  # sel");
+    c.expect("# sel");
+    // Separate events, so Esc is not read as Alt with the next key.
+    c.send("\x1b");
+    c.send("v");
+    c.send("bbb");
+    c.settle();
+    // Was a bright-white background (`107`) under unchanged text.
+    assert_eq!(style_of(&c, "123  # sel"), ["7"]);
+}
+
+#[test]
+fn selected_completion_prefix_is_not_green() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    c.line("zqxab1 <- 1; zqxab2 <- 2");
+    c.send("zqx");
+    c.expect("zqx");
+    c.send("\t");
+    c.expect("zqxab2");
+    c.settle();
+    // The selected row's matching prefix: bold, underlined and reversed,
+    // after the row's own reverse. Was `1;4;7;32`.
+    let style = style_of(&c, "zqxab1");
+    assert_eq!(style.last().map(String::as_str), Some("1;4;7"), "{style:?}");
+    assert!(
+        !style.iter().any(|p| p.split(';').any(|n| n == "32")),
+        "{style:?}"
+    );
+}
+
+#[test]
+fn history_search_prompt_is_in_the_text_color() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    c.line("searched_for <- 1");
+    c.send("\x12");
+    c.send("searched");
+    c.expect("(search: searched)");
+    c.settle();
+    // Was bright cyan (`96`), invisible on a light background.
+    // The indicator's color is the last one set before its text.
+    let style = style_of(&c, "(search: searched)");
+    assert_eq!(style.last().map(String::as_str), Some("39"), "{style:?}");
+}

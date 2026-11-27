@@ -14,9 +14,9 @@ use reedline::{
     ColumnarMenu, Completer, CompletionResult, DefaultHinter, EditCommand, Editor, Emacs,
     FileBackedHistory, Highlighter, IdeMenu, KeyCode, KeyModifiers, Keybindings, Menu, MenuBuilder,
     MenuEvent, MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Span, StyledText, Suggestion,
-    ValidationResult, Validator, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
-    default_vi_normal_keybindings, default_vi_visual_keybindings,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, SimpleMatchHighlighter, Span,
+    StyledText, Suggestion, ValidationResult, Validator, Vi, default_emacs_keybindings,
+    default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings,
 };
 
 use super::lexer::{self, Scan};
@@ -66,7 +66,9 @@ pub fn build(cfg: EditorConfig) -> Reedline {
         .with_max_completion_height(10)
         .with_text_style(Style::new())
         .with_selected_text_style(Style::new().reverse())
-        .with_match_text_style(Style::new().bold());
+        .with_match_text_style(Style::new().bold())
+        // reedline's default adds green, which reversed is a green background.
+        .with_selected_match_text_style(Style::new().bold().underline().reverse());
     let history_menu = ColumnarMenu::default().with_name("history_menu");
 
     let edit: Box<dyn reedline::EditMode> = match cfg.mode {
@@ -117,6 +119,7 @@ pub fn build(cfg: EditorConfig) -> Reedline {
         ))))
         .with_menu(ReedlineMenu::HistoryMenu(Box::new(history_menu)))
         .with_edit_mode(edit)
+        .with_visual_selection_style(selection_style())
         .with_break_signal(cfg.break_flag)
         .with_external_printer(cfg.printer)
         .with_poll_interval(std::time::Duration::from_millis(33))
@@ -128,13 +131,26 @@ pub fn build(cfg: EditorConfig) -> Reedline {
 /// highlighting or pairing — read in raw mode, so it has no line-length cap
 /// (a cooked terminal's line discipline truncates at ~1 KB on macOS).
 ///
+/// The text is drawn unstyled: reedline's default highlighter paints it white,
+/// which is invisible on a light background. A `SimpleMatchHighlighter` with
+/// no query adds no style at all.
+///
 /// `abort` breaks the read (the debugger's Stop ending a program waiting here).
 pub fn build_plain(idle: Box<dyn FnMut() + Send>, abort: Arc<AtomicBool>) -> Reedline {
     Reedline::create()
+        .with_highlighter(Box::new(SimpleMatchHighlighter::default()))
+        .with_visual_selection_style(selection_style())
         .use_bracketed_paste(true)
         .with_poll_interval(std::time::Duration::from_millis(33))
         .with_idle_callback(idle)
         .with_break_signal(abort)
+}
+
+/// Selected text in reverse video: the terminal's own text and background
+/// colors swapped. reedline's default, a bright-white background under
+/// unchanged text, is unreadable on a dark background.
+fn selection_style() -> Style {
+    Style::new().reverse()
 }
 
 fn add_common_keybindings(kb: &mut Keybindings) {
@@ -565,6 +581,11 @@ impl Prompt for RPrompt {
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
         Cow::Borrowed("+ ")
     }
+    /// The color of the Ctrl+R search prompt (reedline's default, bright
+    /// cyan, is invisible on a light background).
+    fn get_indicator_color(&self) -> Color {
+        Color::Default
+    }
     fn render_prompt_history_search_indicator(&self, search: PromptHistorySearch) -> Cow<'_, str> {
         let prefix = match search.status {
             PromptHistorySearchStatus::Passing => "",
@@ -680,5 +701,21 @@ mod tests {
             "sum".into(),
         ];
         assert_eq!(rank("sum", &c), vec!["sum", "summary", "Sum"]);
+    }
+
+    #[test]
+    fn search_prompt_uses_the_terminal_text_color() {
+        for kind in [
+            PromptKind::TopLevel,
+            PromptKind::Continuation,
+            PromptKind::Browser,
+            PromptKind::Other,
+        ] {
+            let prompt = RPrompt {
+                text: String::new(),
+                kind,
+            };
+            assert_eq!(prompt.get_indicator_color(), Color::Default, "{kind:?}");
+        }
     }
 }
