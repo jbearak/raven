@@ -209,9 +209,6 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         await api.pressDataViewerKey('mtcars', 'ArrowRight');
         await api.pressDataViewerKey('mtcars', 'ArrowDown');
         await expectFocusCell(api, 'mtcars', { row: 2, col: 1 });
-
-        await api.pressDataViewerKey('mtcars', 'Home');
-        await expectFocusCell(api, 'mtcars', { row: 0, col: 0 });
     });
 
     test('View(head(mtcars, 5)) opens a second panel without replacing "mtcars"', async function () {

@@ -410,3 +410,52 @@ function gridProps(): any {
     while (fiber && !fiber.memoizedProps?.onGridSelectionChange) fiber = fiber.return;
     return fiber.memoizedProps;
 }
+
+/**
+ * The integration suite drives the grid with `testKey` messages, which can
+ * arrive faster than React renders. Inside one `act`, nothing renders
+ * between the dispatches.
+ */
+describe('test keys', () => {
+    const testKey = (k: string) => ({ type: 'testKey', panelGeneration: 1, key: k });
+    const dispatch = (data: unknown) => window.dispatchEvent(new MessageEvent('message', { data }));
+    const lastLifecycle = (posted: any[]) => [...posted].reverse().find(m => m.type === 'lifecycle');
+
+    test('keys handled before a render each start from the cell the last one selected', async () => {
+        const { posted } = await renderApp();
+        await send(init());
+        await send(testKey('Home'));
+        expect(lastLifecycle(posted).focusCell).toEqual({ row: 0, col: 0 });
+        await act(async () => {
+            for (const k of ['ArrowDown', 'ArrowRight', 'ArrowDown']) dispatch(testKey(k));
+        });
+        expect(lastLifecycle(posted).focusCell).toEqual({ row: 2, col: 1 });
+    });
+
+    test('a key handled before Home has rendered keeps its move', async () => {
+        const { posted } = await renderApp();
+        await send(init());
+        // Nothing is selected yet, as when the panel has just opened.
+        await act(async () => {
+            dispatch(testKey('Home'));
+            dispatch(testKey('ArrowDown'));
+        });
+        expect(lastLifecycle(posted).focusCell).toEqual({ row: 1, col: 0 });
+        // After React commits, the grid still has the key's cell.
+        await send(rowsReply(posted));
+        expect(lastLifecycle(posted)).toMatchObject({ event: 'rows', focusCell: { row: 1, col: 0 } });
+        await send(testKey('ArrowRight'));
+        expect(lastLifecycle(posted).focusCell).toEqual({ row: 1, col: 1 });
+    });
+
+    test('a message handled before the next render reports the cell a key just selected', async () => {
+        const { posted } = await renderApp();
+        await send(init());
+        await send(testKey('Home'));
+        await act(async () => {
+            dispatch(testKey('ArrowDown'));
+            dispatch(rowsReply(posted));
+        });
+        expect(lastLifecycle(posted)).toMatchObject({ event: 'rows', focusCell: { row: 1, col: 0 } });
+    });
+});
