@@ -152,6 +152,23 @@ suite('Raven R debugger (end to end)', function () {
         await ended;
     });
 
+    test('running a fixed line while stopped on its error ends the stop and runs the fix', async () => {
+        const file = path.join(dir, 't.R');
+        const out = path.join(dir, 't.out');
+        fs.writeFileSync(file, `prit(1)\nwriteLines("ran", ${JSON.stringify(out)})\n`);
+        const mark = sent.length;
+        await open_at(file, 0);
+        await vscode.commands.executeCommand('raven.runLineOrSelection');
+        const stop = await stopped_after(mark);
+        assert.strictEqual(stop.body?.reason, 'exception');
+        await until('a session', () => vscode.debug.activeDebugSession);
+        const ended = session_ended();
+        await open_at(file, 1);
+        await vscode.commands.executeCommand('raven.runLineOrSelection');
+        await ended;
+        await until('the fixed line ran', () => fs.existsSync(out) || undefined);
+    });
+
     test('Inspect Last Error reopens an error after it reached the prompt', async () => {
         const file = path.join(dir, 'p.R');
         fs.writeFileSync(file, 'p <- function(x) {\n  q <- x * 3\n  stop("late")\n}\np(2)\n');

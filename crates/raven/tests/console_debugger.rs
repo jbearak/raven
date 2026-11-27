@@ -3540,9 +3540,10 @@ fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
     let mut c = Console::spawn();
     let a = c.write_file(
         "a.R",
-        "prit(1)\nprint(1)\nh <- function(x) {\n  stop(\"boom \", x)\n}\n",
+        "prit(1)\nprint(1)\nh <- function(x) {\n  stop(\"boom \", x)\n}\nw <- function() {\n  warning(\"ww\")\n  1\n}\n",
     );
     c.send_at("h <- function(x) {\n  stop(\"boom \", x)\n}", &a, 3);
+    c.send_at("w <- function() {\n  warning(\"ww\")\n  1\n}", &a, 6);
     c.send("cat('defined', 'h\\n')", None);
     c.expect("defined h");
     let mut d = Dap::connect(&c);
@@ -3580,4 +3581,46 @@ fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
         traceback < echoed,
         "the traceback came after the next send:\n{t}"
     );
+
+    // Inspect Last Error is a stop on an error too: a send ends it.
+    let m = d.mark();
+    assert_eq!(c.ipc_status("inspect"), "ok");
+    d.event("stopped", m);
+    let m = d.mark();
+    c.send("cat(sys.nframe(), 'after inspect\\n')", None);
+    c.expect("0 after inspect");
+    d.event("terminated", m);
+    d.session_ended();
+
+    // A send queued while the failing code still ran is not a reply to the
+    // stop: it waits, and the stop stays until the user acts on it.
+    let m = d.mark();
+    c.send_at("{ Sys.sleep(0.5); prit(2) }", &a, 1);
+    c.send("cat('queued', 'behind\\n')", None);
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(!c.text().contains("queued behind"), "{}", c.text());
+    assert_eq!(d.count("continued", m), 0);
+    let m = d.mark();
+    c.send("cat('sent', 'after\\n')", None);
+    c.expect("sent after");
+    d.event("terminated", m);
+    d.session_ended();
+    let t = c.text();
+    assert!(t.find("queued behind").unwrap() < t.find("sent after").unwrap());
+
+    // Other stops are left alone: a send waits behind a warning stop.
+    d.req(
+        "setExceptionBreakpoints",
+        json!({"filters": ["error", "warning"]}),
+    );
+    let m = d.mark();
+    c.send_at("w()", &a, 6);
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    c.send("cat('after', 'warning\\n')", None);
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(!c.text().contains("after warning"), "{}", c.text());
+    assert_eq!(d.count("continued", m), 0);
+    d.req("continue", json!({"threadId": 1}));
+    c.expect("after warning");
 }

@@ -1226,15 +1226,14 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
     // Every REPL prompt takes queued requests, including `+ ` (a request may
     // finish an expression an earlier one started, as typed lines would) —
     // but only one request at a time: one paused in a `browser()` it opened
-    // keeps the next waiting.
+    // keeps the next waiting, unless it stopped on an error (below).
     let accepts_queue =
         kind != PromptKind::Other && with_state(|s| s.request.is_none()).unwrap_or(false);
     // Stopped on an error with code sent: leave the stop first, so the code
     // runs at the top level rather than waiting behind the stop (or, if the
     // stop came from typed code, running in the failed frame).
     if kind == PromptKind::Browser
-        && ipc_pending()
-        && dap::yield_error_stop()
+        && dap::yield_error_stop(ipc_pending_since)
         && let Some(cmd) = dap::take_resume()
     {
         echo_line(prompt, kind, &cmd);
@@ -1293,8 +1292,8 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
             Ok(Signal::ExternalBreak(buf)) => {
                 // Code sent while stopped on an error ends the stop (see
                 // above); the resume below feeds the Continue.
-                if kind == PromptKind::Browser && ipc_pending() {
-                    dap::yield_error_stop();
+                if kind == PromptKind::Browser {
+                    dap::yield_error_stop(ipc_pending_since);
                 }
                 // The debugger resumes R (Continue, Step…): feed its browser
                 // command, keeping whatever the user had typed for later.
@@ -1347,6 +1346,11 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
 /// Code sent from the editor is waiting in the console's queue.
 fn ipc_pending() -> bool {
     with_state(|s| s.ipc.as_ref().is_some_and(ipc::Server::has_pending)).unwrap_or(false)
+}
+
+/// Code sent from the editor after `t` is waiting in the console's queue.
+fn ipc_pending_since(t: std::time::Instant) -> bool {
+    with_state(|s| s.ipc.as_ref().is_some_and(|q| q.has_pending_since(t))).unwrap_or(false)
 }
 
 /// Pop a socket request (if any) and return its first line for R.

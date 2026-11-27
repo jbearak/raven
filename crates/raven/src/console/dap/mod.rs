@@ -160,9 +160,10 @@ struct Stop {
     hit_ids: Vec<u64>,
     frames: Vec<Frame>,
     exception: Option<(String, String, String)>,
-    /// Stopped on an uncaught error (not a warning, interrupt or pause):
-    /// code sent now ends the stop ([`yield_error_stop`]).
-    on_error: bool,
+    /// When the stop was published, if it is on an uncaught error (not a
+    /// warning, interrupt or pause): code sent since ends the stop
+    /// ([`yield_error_stop`]).
+    error_at: Option<std::time::Instant>,
 }
 
 enum Job {
@@ -2032,7 +2033,10 @@ fn on_captured() -> Option<String> {
     // or the frame browser of an exception or pause stop) is noise; one for
     // the user's browser() is kept, as R shows it.
     let own_browser = hit.is_some() || step_probe || exception.is_some();
-    let on_error = exception.as_ref().is_some_and(|(kind, _)| kind == "error");
+    let error_at = exception
+        .as_ref()
+        .is_some_and(|(kind, _)| kind == "error")
+        .then(std::time::Instant::now);
     let (reason, description, exc) = if let Some((kind, detail)) = exception {
         let mut parts = detail.split(US);
         let class = parts.next().unwrap_or("condition").to_string();
@@ -2070,7 +2074,7 @@ fn on_captured() -> Option<String> {
         hit_ids,
         frames,
         exception: exc,
-        on_error,
+        error_at,
     };
     let configured = {
         let mut s = lock(h);
@@ -2126,14 +2130,30 @@ fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
 /// so the error finishes as it would have without the debugger (R prints
 /// it, drops the rest of its submission, and returns to the top level) and
 /// the sent code runs there, not in the frame that failed. Re-running a
-/// fixed typo then just works. Returns whether a Continue was requested; the
-/// console takes it with [`take_resume`]. Other stops (breakpoints, steps,
-/// warnings) are left alone: there, sent code may be meant for the stopped
-/// frame.
-pub fn yield_error_stop() -> bool {
+/// fixed typo then just works. `sent_since` says whether code was queued
+/// after a given time: only code sent once the stop was shown ends it, so a
+/// quick run of sends whose first line fails still stops there. Returns
+/// whether a Continue was requested; the console takes it with
+/// [`take_resume`]. Other stops (breakpoints, steps, warnings) are left
+/// alone: there, sent code may be meant for the stopped frame.
+pub fn yield_error_stop(sent_since: impl FnOnce(std::time::Instant) -> bool) -> bool {
     let Some(h) = handle() else { return false };
+    let at = {
+        let s = lock(h);
+        if s.resume.is_some() {
+            return false;
+        }
+        match s.stop.as_ref().and_then(|st| st.error_at) {
+            Some(at) => at,
+            None => return false,
+        }
+    };
+    // The queue's lock is not taken under ours.
+    if !sent_since(at) {
+        return false;
+    }
     let mut s = lock(h);
-    if s.resume.is_some() || !s.stop.as_ref().is_some_and(|st| st.on_error) {
+    if s.resume.is_some() || s.stop.as_ref().and_then(|st| st.error_at) != Some(at) {
         return false;
     }
     s.resume = Some("c".into());
