@@ -3529,9 +3529,9 @@ fn a_finished_stop_lets_go_of_its_frames() {
 
 /// Code sent while R is stopped on an error ends that stop: the error
 /// finishes as Continue finishes it (printed, rest of its submission
-/// dropped), the session ends, and the new code runs at the top level. A
-/// fixed typo sent again with Cmd+Enter runs instead of waiting behind the
-/// stop.
+/// dropped), the new code runs at the top level, and the session ends once
+/// it has run. A fixed typo sent again with Cmd+Enter runs instead of
+/// waiting behind the stop.
 #[test]
 fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
     if !r_available() {
