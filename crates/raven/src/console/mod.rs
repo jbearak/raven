@@ -38,6 +38,7 @@
 mod dap;
 mod discovery;
 mod editor;
+mod folder_history;
 mod ipc;
 mod lexer;
 mod libr;
@@ -85,7 +86,8 @@ Options:
   --r-home DIR          Use the R installation at DIR (default: $R_HOME, else `R RHOME`)
   --edit-mode MODE      emacs (default) or vi
   --color-output MODE   streams (default), values, or off
-  --history-file PATH   Where to keep input history
+  --history-file PATH   Where to keep input history (and, in PATH.folders, the folder
+                        of each entry, for suggestions as you type)
   --no-history          Keep history in memory only
   --ipc PATH            Listen for code from an editor on this local socket
   --dap PATH            Serve the R debugger (Debug Adapter Protocol) on this local socket

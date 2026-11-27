@@ -817,8 +817,8 @@ raven console --no-save -q     # R's options pass through unchanged
 | `--r-home DIR` | Use the R installation at `DIR` instead of `$R_HOME` or `R RHOME` |
 | `--edit-mode emacs\|vi` | Key bindings (default `emacs`) |
 | `--color-output streams\|values\|off` | Output colors (default `streams`; `NO_COLOR` turns them off) |
-| `--history-file PATH` | Where to keep input history |
-| `--no-history` | Keep history in memory only |
+| `--history-file PATH` | Where to keep input history. The folder each entry was typed in, which decides what is suggested as you type, is kept beside it in `PATH.folders` |
+| `--no-history` | Keep history in memory only, so suggestions come from this session's entries |
 | `--ipc PATH` | Also accept code from an editor on this local socket |
 | `--dap PATH` | Serve the R [debugger](debugger.md) (Debug Adapter Protocol) on this local socket |
 
