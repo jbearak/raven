@@ -14,9 +14,9 @@ use reedline::{
     ColumnarMenu, Completer, CompletionResult, DefaultHinter, EditCommand, Editor, Emacs,
     FileBackedHistory, Highlighter, IdeMenu, KeyCode, KeyModifiers, Keybindings, Menu, MenuBuilder,
     MenuEvent, MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Span, StyledText, Suggestion,
-    ValidationResult, Validator, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
-    default_vi_normal_keybindings, default_vi_visual_keybindings,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, SimpleMatchHighlighter, Span,
+    StyledText, Suggestion, ValidationResult, Validator, Vi, default_emacs_keybindings,
+    default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings,
 };
 
 use super::lexer::{self, Scan};
@@ -66,7 +66,9 @@ pub fn build(cfg: EditorConfig) -> Reedline {
         .with_max_completion_height(10)
         .with_text_style(Style::new())
         .with_selected_text_style(Style::new().reverse())
-        .with_match_text_style(Style::new().bold());
+        .with_match_text_style(Style::new().bold())
+        // reedline's default adds green, which reversed is a green background.
+        .with_selected_match_text_style(Style::new().bold().underline().reverse());
     let history_menu = ColumnarMenu::default().with_name("history_menu");
 
     let edit: Box<dyn reedline::EditMode> = match cfg.mode {
@@ -96,8 +98,11 @@ pub fn build(cfg: EditorConfig) -> Reedline {
 
     Reedline::create()
         .with_history(history)
+        // Underlined in the terminal's own text color: a grey can equal the
+        // background (bright black is the background in Solarized), and dim is
+        // not fainter on a light background in xterm or VTE.
         .with_hinter(Box::new(
-            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+            DefaultHinter::default().with_style(Style::new().underline()),
         ))
         .with_highlighter(Box::new(RHighlighter::new()))
         .with_validator(Box::new(RValidator {
@@ -114,6 +119,7 @@ pub fn build(cfg: EditorConfig) -> Reedline {
         ))))
         .with_menu(ReedlineMenu::HistoryMenu(Box::new(history_menu)))
         .with_edit_mode(edit)
+        .with_visual_selection_style(selection_style())
         .with_break_signal(cfg.break_flag)
         .with_external_printer(cfg.printer)
         .with_poll_interval(std::time::Duration::from_millis(33))
@@ -125,13 +131,26 @@ pub fn build(cfg: EditorConfig) -> Reedline {
 /// highlighting or pairing — read in raw mode, so it has no line-length cap
 /// (a cooked terminal's line discipline truncates at ~1 KB on macOS).
 ///
+/// The text is drawn unstyled: reedline's default highlighter paints it white,
+/// which is invisible on a light background. A `SimpleMatchHighlighter` with
+/// no query adds no style at all.
+///
 /// `abort` breaks the read (the debugger's Stop ending a program waiting here).
 pub fn build_plain(idle: Box<dyn FnMut() + Send>, abort: Arc<AtomicBool>) -> Reedline {
     Reedline::create()
+        .with_highlighter(Box::new(SimpleMatchHighlighter::default()))
+        .with_visual_selection_style(selection_style())
         .use_bracketed_paste(true)
         .with_poll_interval(std::time::Duration::from_millis(33))
         .with_idle_callback(idle)
         .with_break_signal(abort)
+}
+
+/// Selected text in reverse video: the terminal's own text and background
+/// colors swapped. reedline's default, a bright-white background under
+/// unchanged text, is unreadable on a dark background.
+fn selection_style() -> Style {
+    Style::new().reverse()
 }
 
 fn add_common_keybindings(kb: &mut Keybindings) {
@@ -167,11 +186,10 @@ fn st_constant() -> Style {
 fn st_string() -> Style {
     Style::new().fg(Color::Green)
 }
-fn st_number() -> Style {
-    Style::new().fg(Color::Blue)
-}
+/// Italic in the terminal's own text color: bright black, the usual comment
+/// grey, is the background color in Solarized.
 fn st_comment() -> Style {
-    Style::new().fg(Color::DarkGray).italic()
+    Style::new().italic()
 }
 
 struct RHighlighter {
@@ -206,12 +224,14 @@ impl RHighlighter {
                 match node.kind() {
                     "comment" => Some(st_comment()),
                     "string" => Some(st_string()),
-                    "integer" | "float" | "complex" => Some(st_number()),
                     "true" | "false" | "null" | "na" | "inf" | "nan" | "dots" | "dot_dot_i" => {
                         Some(st_constant())
                     }
                     "function" | "if" | "else" | "for" | "while" | "repeat" | "in" | "break"
                     | "next" | "\\" => Some(st_keyword()),
+                    // Numbers (`integer`, `float`, `complex`) stay in the
+                    // terminal's text color: blue is below 3:1 on several
+                    // stock dark palettes.
                     _ => None,
                 }
             } else {
@@ -533,6 +553,16 @@ pub enum PromptKind {
     Other,
 }
 
+/// The color of a prompt of this kind, as the editor draws it and as an
+/// echoed line repeats it: the terminal's own text color, except yellow for
+/// `Browse[n]> ` so the debugger's prompt stands out.
+pub fn prompt_color(kind: PromptKind) -> Color {
+    match kind {
+        PromptKind::Browser => Color::Yellow,
+        PromptKind::TopLevel | PromptKind::Continuation | PromptKind::Other => Color::Default,
+    }
+}
+
 pub struct RPrompt {
     pub text: String,
     pub kind: PromptKind,
@@ -551,6 +581,11 @@ impl Prompt for RPrompt {
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
         Cow::Borrowed("+ ")
     }
+    /// The color of the Ctrl+R search prompt (reedline's default, bright
+    /// cyan, is invisible on a light background).
+    fn get_indicator_color(&self) -> Color {
+        Color::Default
+    }
     fn render_prompt_history_search_indicator(&self, search: PromptHistorySearch) -> Cow<'_, str> {
         let prefix = match search.status {
             PromptHistorySearchStatus::Passing => "",
@@ -558,15 +593,11 @@ impl Prompt for RPrompt {
         };
         Cow::Owned(format!("({prefix}search: {}) ", search.term))
     }
-    fn get_prompt_color(&self) -> reedline::Color {
-        match self.kind {
-            PromptKind::Browser => reedline::Color::Yellow,
-            PromptKind::Other => reedline::Color::Default,
-            _ => reedline::Color::Blue,
-        }
+    fn get_prompt_color(&self) -> Color {
+        prompt_color(self.kind)
     }
-    fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
-        nu_ansi_term::Color::DarkGray
+    fn get_prompt_multiline_color(&self) -> Color {
+        Color::Default
     }
 }
 
@@ -632,6 +663,36 @@ mod tests {
     }
 
     #[test]
+    fn numbers_are_unstyled_and_comments_italic() {
+        assert_eq!(highlight_ansi("x <- 1 # c"), "x <- 1 \x1b[3m# c\x1b[0m");
+        assert_eq!(highlight_ansi("2.5e3 + 1L + 3i"), "2.5e3 + 1L + 3i");
+    }
+
+    #[test]
+    fn prompts_use_the_terminal_text_color_except_the_browser() {
+        let prompt = |kind| RPrompt {
+            text: String::new(),
+            kind,
+        };
+        for kind in [
+            PromptKind::TopLevel,
+            PromptKind::Continuation,
+            PromptKind::Other,
+        ] {
+            assert_eq!(prompt(kind).get_prompt_color(), Color::Default, "{kind:?}");
+            assert_eq!(prompt(kind).get_prompt_multiline_color(), Color::Default);
+        }
+        assert_eq!(
+            prompt(PromptKind::Browser).get_prompt_color(),
+            Color::Yellow
+        );
+        assert_eq!(
+            prompt(PromptKind::Browser).get_prompt_multiline_color(),
+            Color::Default
+        );
+    }
+
+    #[test]
     fn rank_prefers_exact_prefix_and_dedups() {
         let c = vec![
             "Sum".to_string(),
@@ -640,5 +701,21 @@ mod tests {
             "sum".into(),
         ];
         assert_eq!(rank("sum", &c), vec!["sum", "summary", "Sum"]);
+    }
+
+    #[test]
+    fn search_prompt_uses_the_terminal_text_color() {
+        for kind in [
+            PromptKind::TopLevel,
+            PromptKind::Continuation,
+            PromptKind::Browser,
+            PromptKind::Other,
+        ] {
+            let prompt = RPrompt {
+                text: String::new(),
+                kind,
+            };
+            assert_eq!(prompt.get_indicator_color(), Color::Default, "{kind:?}");
+        }
     }
 }

@@ -74,7 +74,7 @@ Raven's console runs the same R you get by typing `R` in a terminal: the one on 
 
 - Syntax highlighting as you type, using the same R grammar as Raven's language server. The bracket at the cursor and its match are underlined.
 - Multi-line editing. Enter runs your input when R's own parser says it is complete, and starts a new, indented line when it isn't, for example after `function(x) {`, `data.frame(a = 1,` or a trailing `|>`, just as in plain R. R reports a syntax error rather than leaving you stuck in continuation lines. `Alt+Enter` always inserts a newline. Arrow keys move between lines.
-- History is kept across sessions (`~/Library/Application Support/raven/console_history` on macOS, `~/.local/share/raven/console_history` on Linux, `%APPDATA%\raven\console_history` on Windows). Up and Down step through earlier entries, and a multi-line entry comes back whole. `Ctrl+R` searches history for text you type, and a dimmed suggestion from history appears as you type; press → to accept it.
+- History is kept across sessions (`~/Library/Application Support/raven/console_history` on macOS, `~/.local/share/raven/console_history` on Linux, `%APPDATA%\raven\console_history` on Windows). Up and Down step through earlier entries, and a multi-line entry comes back whole. `Ctrl+R` searches history for text you type, and a suggestion from history appears underlined as you type; press → to accept it.
 - Emacs-style key bindings by default; set `raven.console.editMode` to `vi` for vi-style bindings. [Console key bindings](console-key-bindings.md) explains the two styles and lists their keys.
 - `Ctrl+C` clears the line you're editing, or interrupts R while it runs. At a `+` continuation line it abandons the unfinished expression, and at a `readline()` or `menu()` prompt it interrupts the code that asked, as in plain R. `Ctrl+D` on an empty line quits.
 - `options(width)` follows the terminal width as you resize it, unless you set `width` yourself.
@@ -92,12 +92,12 @@ The console colors output with your terminal theme's own palette, so it suits li
 | Value | Effect |
 |-------|--------|
 | `streams` (default) | Errors in red, warnings in yellow, and other messages in cyan. Ordinary output is unchanged. |
-| `values` | Also colors printed values, like the [colorout](https://github.com/jalvesaq/colorout) package: numbers, quoted strings, `NA`/`NULL`/`TRUE`/`FALSE`/`Inf`, and `[1]`-style indices. Numbers inside words, such as hashes, hostnames, versions and `x86_64`, are left alone. |
+| `values` | Also colors quoted strings and `NA`/`NULL`/`TRUE`/`FALSE`/`Inf` in printed values. Numbers and `[1]`-style indices keep your terminal's text color. |
 | `off` | No colors added. |
 
 Output that already has colors, such as from the cli package or crayon, always keeps them. R gives the console text, not condition objects, so the colors come from recognising R's own error and warning headers (in your session's language). The rare message that happens to start like an R warning is colored as one.
 
-Raven's console replaces colorout. If your `.Rprofile` loads colorout, the console turns it off for that session and says so in one dimmed line, because colorout writes to the terminal directly and would bypass the console's handling of output. Set `raven.console.colorOutput` to `values` for colorout-style colors.
+Raven's console replaces the [colorout](https://github.com/jalvesaq/colorout) package. If your `.Rprofile` loads colorout, the console turns it off for that session and says so in one dimmed line, because colorout writes to the terminal directly and would bypass the console's handling of output. Set `raven.console.colorOutput` to `values` to color strings and constants in printed values, as colorout does.
 
 ### Running code from the editor
 

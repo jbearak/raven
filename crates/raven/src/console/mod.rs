@@ -970,16 +970,19 @@ fn split_submission(text: &str) -> VecDeque<String> {
 }
 
 fn echo_line(prompt: &str, kind: PromptKind, line: &str) {
-    let color = if kind == PromptKind::Browser {
-        "\x1b[33m"
-    } else {
-        "\x1b[34m"
-    };
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(echo_text(prompt, kind, line).as_bytes());
+    let _ = out.flush();
+}
+
+/// What [`echo_line`] writes: `line` after its prompt, as the editor would
+/// have drawn them (the prompt in [`editor::prompt_color`], the code
+/// highlighted), replacing the current terminal line.
+fn echo_text(prompt: &str, kind: PromptKind, line: &str) -> String {
+    let color = editor::prompt_color(kind).prefix();
     let body = line.trim_end_matches('\n');
     let styled = editor::highlight_ansi(body);
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "\r\x1b[2K{color}{prompt}\x1b[0m{styled}\n");
-    let _ = out.flush();
+    format!("\r\x1b[2K{color}{prompt}\x1b[0m{styled}\n")
 }
 
 fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
@@ -1514,6 +1517,24 @@ mod tests {
         assert_eq!(
             o.r_args,
             args(&["-e", "1", "--args", "--help", "--no-history"])
+        );
+    }
+
+    #[test]
+    fn echoed_prompts_use_the_terminal_text_color_except_the_browser() {
+        // The code itself is highlighted as the editor would: `1` unstyled,
+        // the keyword bold magenta.
+        assert_eq!(
+            echo_text("> ", PromptKind::TopLevel, "if (x) 1\n"),
+            "\r\x1b[2K\x1b[39m> \x1b[0m\x1b[1;35mif\x1b[0m (x) 1\n"
+        );
+        assert_eq!(
+            echo_text("+ ", PromptKind::Continuation, "1"),
+            "\r\x1b[2K\x1b[39m+ \x1b[0m1\n"
+        );
+        assert_eq!(
+            echo_text("Browse[1]> ", PromptKind::Browser, "n\n"),
+            "\r\x1b[2K\x1b[33mBrowse[1]> \x1b[0mn\n"
         );
     }
 
