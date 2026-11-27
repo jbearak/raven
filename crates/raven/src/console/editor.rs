@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use nu_ansi_term::{Color, Style};
 use reedline::{
     ColumnarMenu, Completer, CompletionResult, DefaultHinter, EditCommand, Editor, Emacs,
-    FileBackedHistory, Highlighter, IdeMenu, KeyCode, KeyModifiers, Keybindings, Menu, MenuBuilder,
-    MenuEvent, MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, SimpleMatchHighlighter, Span,
-    StyledText, Suggestion, ValidationResult, Validator, Vi, default_emacs_keybindings,
-    default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings,
+    FileBackedHistory, Highlighter, Hinter, History, IdeMenu, KeyCode, KeyModifiers, Keybindings,
+    Menu, MenuBuilder, MenuEvent, MenuSettings, Painter, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu,
+    SimpleMatchHighlighter, Span, StyledText, Suggestion, ValidationResult, Validator, Vi,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    default_vi_visual_keybindings,
 };
 
 use super::lexer::{self, Scan};
@@ -98,12 +99,7 @@ pub fn build(cfg: EditorConfig) -> Reedline {
 
     Reedline::create()
         .with_history(history)
-        // Underlined in the terminal's own text color: a grey can equal the
-        // background (bright black is the background in Solarized), and dim is
-        // not fainter on a light background in xterm or VTE.
-        .with_hinter(Box::new(
-            DefaultHinter::default().with_style(Style::new().underline()),
-        ))
+        .with_hinter(Box::new(LineHinter::new()))
         .with_highlighter(Box::new(RHighlighter::new()))
         .with_validator(Box::new(RValidator {
             indent: cfg.indent,
@@ -173,6 +169,73 @@ fn add_common_keybindings(kb: &mut Keybindings) {
         KeyCode::Enter,
         ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
     );
+}
+
+// ---- history suggestion -----------------------------------------------------
+
+/// Dim and underlined, in the terminal's own text color. Dim is what makes it
+/// read as a suggestion: underlined at full strength, it was taken for text
+/// the console had typed. The underline keeps it apart from typed text where
+/// dim is not fainter (a light background in xterm or VTE). A grey is not
+/// used because it can equal the background: bright black is the background
+/// in Solarized.
+fn st_suggestion() -> Style {
+    Style::new().dimmed().underline()
+}
+
+/// The history suggestion, one line at a time.
+///
+/// reedline's [`DefaultHinter`] suggests the rest of the newest history entry
+/// that starts with the input. For a multi-line entry reedline draws the later
+/// lines from column 0, without the `+ ` prompt, where they read as text the
+/// console inserted. This hinter shows and accepts only the rest of the
+/// current line. After Enter the entry's next line is suggested in turn, as
+/// long as the input, with the indentation Enter added, still begins the entry.
+struct LineHinter {
+    inner: DefaultHinter,
+    /// The suggestion on screen, unstyled: what accepting it inserts.
+    shown: String,
+}
+
+impl LineHinter {
+    fn new() -> Self {
+        Self {
+            inner: DefaultHinter::default(),
+            shown: String::new(),
+        }
+    }
+}
+
+impl Hinter for LineHinter {
+    fn handle(
+        &mut self,
+        line: &str,
+        pos: usize,
+        history: &dyn History,
+        use_ansi_coloring: bool,
+        cwd: &str,
+    ) -> String {
+        let rest = self.inner.handle(line, pos, history, false, cwd);
+        self.shown = first_line(&rest).to_string();
+        if use_ansi_coloring && !self.shown.is_empty() {
+            st_suggestion().paint(&self.shown).to_string()
+        } else {
+            self.shown.clone()
+        }
+    }
+
+    fn complete_hint(&self) -> String {
+        self.shown.clone()
+    }
+
+    fn next_hint_token(&self) -> String {
+        first_line(&self.inner.next_hint_token()).to_string()
+    }
+}
+
+/// `text` up to its first line break.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
 }
 
 // ---- highlighting -----------------------------------------------------------
@@ -690,6 +753,53 @@ mod tests {
             prompt(PromptKind::Browser).get_prompt_multiline_color(),
             Color::Default
         );
+    }
+
+    /// What the hinter shows and what accepting it inserts, for `input`
+    /// typed against a history holding `entry`.
+    fn suggest(entry: &str, input: &str) -> (String, String, String) {
+        let mut history = FileBackedHistory::new(10).expect("in-memory history");
+        history
+            .save(reedline::HistoryItem::from_command_line(entry))
+            .expect("save");
+        let mut hinter = LineHinter::new();
+        let drawn = hinter.handle(input, input.len(), &history, false, "");
+        (drawn, hinter.complete_hint(), hinter.next_hint_token())
+    }
+
+    #[test]
+    fn suggestion_stops_at_the_end_of_the_line() {
+        let entry = "print(a(\n    ))";
+        let rest = |s: &str| (s.to_string(), s.to_string());
+        let (drawn, accepted, _) = suggest(entry, "p");
+        assert_eq!((drawn, accepted), rest("rint(a("));
+        // At the end of the entry's first line there is nothing to suggest.
+        let (drawn, accepted, word) = suggest(entry, "print(a(");
+        assert_eq!((drawn, accepted, word.as_str()), ("".into(), "".into(), ""));
+        // On the next line, the entry's next line is suggested.
+        let (drawn, accepted, _) = suggest(entry, "print(a(\n  ");
+        assert_eq!((drawn, accepted), rest("  ))"));
+        // A one-line entry is suggested whole, and word by word.
+        let (drawn, accepted, word) = suggest("summary(x)  # note", "summ");
+        assert_eq!((drawn, accepted), rest("ary(x)  # note"));
+        assert_eq!(word, "ary");
+        // Accepting a word never takes text from the next line.
+        assert_eq!(suggest("x <- c(1,\n  2)", "x <- c(1").2, ",");
+        assert_eq!(first_line("a\r\nb"), "a");
+    }
+
+    #[test]
+    fn suggestion_is_styled_only_when_colors_are_on() {
+        let mut history = FileBackedHistory::new(10).expect("in-memory history");
+        history
+            .save(reedline::HistoryItem::from_command_line("summary(x)"))
+            .expect("save");
+        let mut hinter = LineHinter::new();
+        assert_eq!(
+            hinter.handle("summ", 4, &history, true, ""),
+            st_suggestion().paint("ary(x)").to_string()
+        );
+        assert_eq!(hinter.complete_hint(), "ary(x)");
     }
 
     #[test]
