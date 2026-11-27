@@ -189,6 +189,11 @@ struct Shared {
     /// stalled reading a file from restoring older ones.
     filters_ticket: u64,
     functions_ticket: u64,
+    /// Uncaught errors stop even with no debug session connected
+    /// (`raven.debugger.stopOnError: always`, sent with the mirror). By
+    /// default the `error` filter applies only inside a session
+    /// ([`active_filters`]).
+    errors_outside_session: bool,
     configured: bool,
     connected: bool,
     stop: Option<Stop>,
@@ -595,7 +600,7 @@ fn capabilities() -> Value {
         "supportsClipboardContext": true,
         "exceptionBreakpointFilters": [
             {"filter": "error", "label": "Uncaught errors", "default": true,
-             "description": "Stop where an error is signalled in code from a file, if no tryCatch()/try() handles it. Errors in code typed at the prompt don't stop."},
+             "description": "Stop where an error is signalled in code from a file, if no tryCatch()/try() handles it. Errors in code typed at the prompt don't stop. Applies while a debug session is running; to stop with no session too, set raven.debugger.stopOnError to always."},
             {"filter": "warning", "label": "Warnings (not muffled)", "default": false,
              "description": "Stop where a warning is signalled in code from a file, unless a local handler muffles it."},
             {"filter": "interrupt", "label": "Interrupts", "default": false,
@@ -1095,6 +1100,22 @@ pub fn set_file_breakpoints(
     result
 }
 
+/// The exception filters that apply now, comma-separated. Uncaught errors
+/// stop only while a debug session is connected and not ended, unless the
+/// extension asked for them everywhere (`errors_outside_session`): code run
+/// with no session prints its error and returns to the prompt, and the
+/// editor offers the debugger afterwards (Inspect Last Error). Warnings and
+/// interrupts, off by default, apply whenever they are on.
+fn active_filters(s: &Shared) -> String {
+    let in_session = s.connected && !s.ended;
+    s.filters
+        .iter()
+        .filter(|f| f.as_str() != "error" || in_session || s.errors_outside_session)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Function breakpoints and exception filters mirrored by the extension
 /// while no session exists. `ticket` is the request's
 /// [`breakpoint_ticket`]: like a file's breakpoints, each is left alone when
@@ -1102,9 +1123,20 @@ pub fn set_file_breakpoints(
 /// `setFunctionBreakpoints` / `setExceptionBreakpoints`) has set it since.
 /// The check and the queueing share one lock, so the R thread applies
 /// function breakpoints in ticket order.
-pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>, ticket: u64) {
+///
+/// `errors_outside_session` is the mirror's `stopOnError` (see
+/// [`active_filters`]); it carries no ticket, as only the extension sets it.
+pub fn set_mirrored(
+    functions: Option<Vec<String>>,
+    filters: Option<Vec<String>>,
+    errors_outside_session: Option<bool>,
+    ticket: u64,
+) {
     let Some(h) = handle() else { return };
     let mut s = lock(h);
+    if let Some(always) = errors_outside_session {
+        s.errors_outside_session = always;
+    }
     if let Some(f) = filters
         && s.filters_ticket < ticket
     {
@@ -1296,7 +1328,7 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
         // At a browser prompt (stopped, not resumed) the condition comes from
         // what the user typed there; R is already stopped, so don't nest.
         "filters" if with_r(|r| r.stopped && !r.resumed).unwrap_or(false) => String::new(),
-        "filters" => lock(h).filters.join(","),
+        "filters" => active_filters(&lock(h)),
         "plan_file" => plan_file(a, b),
         "has_bps" => {
             if bp_requests(&canonical(a)).is_empty() {
@@ -1810,9 +1842,15 @@ pub fn take_inspect() -> Option<String> {
 }
 
 /// Print the traceback `at_prompt` returned (`{"lines": [...], "inspect":
-/// bool}`, each line `call at /abs/file.R:12`, innermost first), dim, after
-/// R's error message. VS Code's terminal links the `path:line` itself. The
-/// Inspect hint is shown only when an editor is connected to run it.
+/// bool, "message", "path", "line"}`, each line `call at /abs/file.R:12`,
+/// innermost first; `path:line` is the innermost), dim, after R's error
+/// message. VS Code's terminal links the `path:line` itself. The Inspect
+/// hint is shown only when an editor is connected to run it; the extension
+/// makes it a link.
+///
+/// Subscribers also get `{"event":"error"}` with the message, the innermost
+/// location and whether Inspect Last Error can open it, so the editor can
+/// mark the line and offer the debugger there.
 fn print_traceback(json: &str) {
     let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
     let lines: Vec<String> = v["lines"]
@@ -1843,6 +1881,18 @@ fn print_traceback(json: &str) {
         text.push_str("Inspect it: run Raven: Inspect Last Error\n");
     }
     super::output::get().write(format!("\x1b[2m{text}\x1b[0m").as_bytes(), 1);
+    if let (Some(path), Some(line)) = (v["path"].as_str(), v["line"].as_u64())
+        && !path.is_empty()
+        && line > 0
+    {
+        push_control(json!({
+            "event": "error",
+            "message": v["message"].as_str().unwrap_or(""),
+            "path": path,
+            "line": line,
+            "inspect": v["inspect"] == true,
+        }));
+    }
 }
 
 fn on_top_level(more: bool) -> Option<String> {

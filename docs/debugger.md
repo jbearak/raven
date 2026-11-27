@@ -18,7 +18,7 @@ The debugger always runs in Raven's console, whichever console you chose for sen
 2. Run the code that defines it with Run Line or Selection, Run Chunk, or Source File (`Cmd+Enter`, `Shift+Cmd+Enter`).
 3. Call the code. When R reaches the breakpoint, VS Code switches to the debugger, showing the stopped line, the call stack and the variables.
 
-You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error in your code, and detaches when R gets back to the `>` prompt. When you run several expressions at once (a selection, Run All Chunks, a sourced file), the session lasts until all of them have run, so stopping again in a later one doesn't restart the debugger.
+You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, or in a function you `debug()`ed, and detaches when R gets back to the `>` prompt. When you run several expressions at once (a selection, Run All Chunks, a sourced file), the session lasts until all of them have run, so stopping again in a later one doesn't restart the debugger.
 
 To attach before anything stops, run Raven: Start R Debugging. You need this to change an exception filter (for example, to stop on warnings) for the first time, because the filters live in the Breakpoints view of a running session (Raven remembers them per workspace after that).
 
@@ -92,17 +92,27 @@ Steps behave as R defines them, with four conveniences:
 
 ## Errors, warnings and interrupts
 
+When code you run from the editor fails, R prints the error and a [traceback](#tracebacks) and returns to the `>` prompt, as it does without a debugger. Raven underlines the line where the error happened and shows the message at the end of it:
+
+```
+  2 │   log(x)    Error: non-numeric argument to mathematical function
+```
+
+Hover over the line and click Debug this error, or use the lightbulb (Cmd+. or Ctrl+.), to open the debugger on that error, with its frames as they were when it failed (see [Inspect the last error](#inspect-the-last-error)). The underline goes away when you run code again or edit that line. An error at the top level of a file, outside any function, is underlined without the action, because it has no frames to open.
+
 The Breakpoints view lists three exception filters. Uncaught errors is on by default, as in Python's and Julia's debuggers; the other two are off:
 
 | Filter | Default | Stops |
 |---|---|---|
-| Uncaught errors | On | Where an error is signalled, in your code, with the frames still alive |
+| Uncaught errors | On | Where an error is signalled, in your code, with the frames still alive, while a debug session is running |
 | Warnings (not muffled) | Off | Where a warning is signalled |
 | Interrupts | Off | When you press Ctrl+C, instead of returning to the prompt |
 
+Like Python's debugger, Uncaught errors applies only while a debug session is running: one you started with F5 or Raven: Start R Debugging, or one that started when R stopped at a breakpoint. Code you run with no session open never stops on an error. To have errors stop there too and start a session, as they did before, set `raven.debugger.stopOnError` to `always`.
+
 Errors and warnings stop only when code from a file is running: code you ran from the editor, a file you `source()`d, or a function such code defined. An error in something you type at the `>` prompt, such as `log("a")`, prints as usual, and so does one you type at `Browse[1]>` while already stopped. Code run from an unsaved editor has no file, so its errors don't stop either, and neither do errors in a file sourced with `source(keep.source = FALSE)`, unless that file has a breakpoint.
 
-Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handler, never reach these filters; no R debugger can break on them without tracing `stop()` itself. After a stop on an error, Step Over lets the error continue. So does running more code from the editor: if you fix a typo and press Cmd+Enter (Ctrl+Enter) again, the error finishes and prints, the debug session ends, and the new code runs at the `>` prompt.
+Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handler, never reach these filters; no R debugger can break on them without tracing `stop()` itself. After a stop on an error, Step Over lets the error continue. So does running more code from the editor: if you fix a typo and press Cmd+Enter (Ctrl+Enter) again, the error finishes and prints, and the new code runs at the `>` prompt.
 
 ### Tracebacks
 
@@ -120,7 +130,7 @@ Ctrl+click (Cmd+click on macOS) a location to open it. Frames without a file loc
 
 ### Inspect the last error
 
-You don't have to rerun anything to look inside an error that has already happened. Run Raven: Inspect Last Error, and the debugger opens on the last error that printed a traceback, with its call stack, the variables of each function as they were when it failed, and the Debug Console running in any frame you select. When an editor is connected, the traceback ends with a reminder:
+You don't have to rerun anything to look inside an error that has already happened. Click Debug this error on the underlined line, or run Raven: Inspect Last Error, and the debugger opens on the last error that printed a traceback, with its call stack, the variables of each function as they were when it failed, and the Debug Console running in any frame you select. When an editor is connected, the traceback ends with a reminder, and Ctrl+click (Cmd+click on macOS) on the command name opens the error:
 
 ```
 Traceback:
@@ -160,6 +170,7 @@ The Debug Console and Watch run R code, as you'd expect. Watch expressions stop 
 |---|---|---|
 | `raven.debugger.enabled` | `true` | Run the debugger in new R consoles |
 | `raven.debugger.attach` | `onStop` | `onStop`: start a debug session when R stops. `never`: only when you start one |
+| `raven.debugger.stopOnError` | `inSession` | `inSession`: uncaught errors stop only while a debug session is running. `always`: also in code run with no session, which starts one |
 | `raven.debugger.justMyCode` | `true` | Step Into skips functions without source |
 
 See the [settings reference](settings-reference.md) for all settings.

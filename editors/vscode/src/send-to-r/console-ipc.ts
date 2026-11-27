@@ -57,6 +57,18 @@ export function on_console_registered(
     return new vscode.Disposable(() => console_listeners.delete(listener));
 }
 
+const send_listeners = new Set<(socket: string) => void>();
+
+/**
+ * Be told when code is about to be sent to a console over its socket (any
+ * send, including a debug session's program). The debugger clears its
+ * error marker then: the next run may change or fix what failed.
+ */
+export function on_console_send(listener: (socket: string) => void): vscode.Disposable {
+    send_listeners.add(listener);
+    return new vscode.Disposable(() => send_listeners.delete(listener));
+}
+
 /** The IPC socket of a Raven console terminal, if `terminal` is one. */
 export function console_socket_of(terminal: vscode.Terminal): string | undefined {
     return live_consoles.get(terminal);
@@ -256,6 +268,7 @@ function deliver(
         socket.setEncoding('utf8');
         socket.on('connect', () => {
             connected = true;
+            for (const l of send_listeners) l(socket_path);
             socket.write(JSON.stringify({ v: 1, id, op: 'execute', code, ...(location ? { location } : {}), ...extra }) + '\n');
         });
         let buffered = '';

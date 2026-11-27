@@ -2720,6 +2720,17 @@ impl Subscriber {
     /// nothing arrives for `wait`. A closed or broken subscription fails
     /// the test rather than passing for a quiet one.
     fn event(&mut self, name: &str, wait: Duration) -> Option<Value> {
+        loop {
+            let v = self.event_any(wait)?;
+            if v["event"] == name {
+                return Some(v);
+            }
+        }
+    }
+
+    /// The next pushed event, whatever it is; `None` once nothing arrives
+    /// for `wait`.
+    fn event_any(&mut self, wait: Duration) -> Option<Value> {
         self.reader.get_ref().set_read_timeout(Some(wait)).unwrap();
         let mut line = String::new();
         loop {
@@ -2738,11 +2749,95 @@ impl Subscriber {
                 Err(e) => panic!("reading the subscription: {e}"),
             }
             let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-            if v["event"] == name {
+            if v["event"].is_string() {
                 return Some(v);
             }
         }
     }
+}
+
+/// The mirror an editor sends with no session: Uncaught errors on, and the
+/// `stopOnError` setting.
+fn mirror_errors(c: &Console, stop_on_error: &str) {
+    let msg = json!({"v": 1, "id": 1, "op": "breakpoints", "files": {},
+        "functions": [], "exceptionFilters": ["error"], "stopOnError": stop_on_error});
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = ipc_request(c, &msg);
+        if status == "ok" {
+            return;
+        }
+        assert!(Instant::now() < deadline, "mirror: {status}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn with_no_session_an_error_prints_and_the_editor_hears_where() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let mut sub = Subscriber::connect(&c);
+    mirror_errors(&c, "inSession");
+    let a = c.write_file(
+        "a.R",
+        "inner <- function(x) {\n  log(x)\n}\nouter <- function(y) {\n  inner(y)\n}\n",
+    );
+    let b = c.write_file("b.R", "outer('a')\nprit(1)\n");
+    c.send(&std::fs::read_to_string(&a).unwrap(), Some(&a));
+
+    // Uncaught errors is on, but no session is connected: R prints the
+    // error and returns to the prompt.
+    c.send_at("outer('a')", &b, 1);
+    c.expect("Inspect it: run Raven: Inspect Last Error");
+    c.send("cat(toupper('back at the prompt'), '\\n')", None);
+    c.expect("BACK AT THE PROMPT");
+    assert!(!c.text().contains("Browse["), "{}", c.text());
+
+    // The editor hears the error (and no stop) with its innermost line,
+    // and that Inspect Last Error can open it.
+    let mut sub_events = Vec::new();
+    while let Some(ev) = sub.event_any(Duration::from_millis(500)) {
+        sub_events.push(ev);
+    }
+    assert!(
+        !sub_events.iter().any(|e| e["event"] == "stopped"),
+        "{sub_events:?}"
+    );
+    let ev = sub_events
+        .into_iter()
+        .find(|e| e["event"] == "error")
+        .expect("an error event");
+    assert_eq!(ev["path"], a.as_str(), "{ev}");
+    assert_eq!(ev["line"], 2, "{ev}");
+    assert_eq!(ev["inspect"], true, "{ev}");
+    assert!(
+        ev["message"]
+            .as_str()
+            .unwrap()
+            .contains("non-numeric argument"),
+        "{ev}"
+    );
+    // ... and it can.
+    assert_eq!(c.ipc_status("inspect"), "ok");
+    c.expect("Browse[");
+    c.type_line("Q");
+    c.send("cat(toupper('quit inspection'), '\\n')", None);
+    c.expect("QUIT INSPECTION");
+
+    // A top-level error has no frames to open, but still has a line.
+    c.send_at("prit(1)", &b, 2);
+    let ev = sub.event("error", TIMEOUT).expect("an error event");
+    assert_eq!(ev["path"], b.as_str(), "{ev}");
+    assert_eq!(ev["line"], 2, "{ev}");
+    assert_eq!(ev["inspect"], false, "{ev}");
+
+    // `always` brings the stop back with no session.
+    mirror_errors(&c, "always");
+    c.send_at("outer('a')", &b, 1);
+    let ev = sub.event("stopped", TIMEOUT).expect("a stop");
+    assert_eq!(ev["reason"], "exception", "{ev}");
 }
 
 #[test]
@@ -2842,7 +2937,8 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
     let stalled = {
         let msg = json!({"v": 1, "id": 2, "op": "breakpoints",
             "files": {&fifo: [{"line": 1}]},
-            "functions": ["fb_target"], "exceptionFilters": ["error"]});
+            "functions": ["fb_target"], "exceptionFilters": ["error"],
+            "stopOnError": "always"});
         let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
         s.set_read_timeout(Some(TIMEOUT)).unwrap();
         let mut w = s.try_clone().unwrap();
@@ -2868,7 +2964,7 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
     };
     // ... a newer one (the user removed the breakpoint) is applied ...
     let newer = json!({"v": 1, "id": 3, "op": "breakpoints", "files": {},
-        "functions": [], "exceptionFilters": []});
+        "functions": [], "exceptionFilters": [], "stopOnError": "always"});
     assert_eq!(ipc_request(&c, &newer), "ok");
     // ... and then the older one finishes.
     writer.write_all(b"z <- 1\n").unwrap();

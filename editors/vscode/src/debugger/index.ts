@@ -7,10 +7,12 @@ import {
     gate_sends,
     live_console_sockets,
     on_console_registered,
+    on_console_send,
     send_debug_program,
 } from '../send-to-r/console-ipc';
 import { socket_endpoint } from '../send-to-r/console-endpoint';
 import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
+import { clear_error, clear_error_for, register_error_marker, show_error, type ErrorEvent } from './error-marker';
 
 /**
  * VS Code side of Raven's R debugger. The debug adapter itself runs inside
@@ -23,6 +25,13 @@ import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
  *   pushes `stopped` over its control connection, and a session is started
  *   then. The console ends the session (`terminated`) when R returns to the
  *   top-level prompt; that end is not a user detach.
+ * - An uncaught error doesn't start a session by itself: the console applies
+ *   the Uncaught errors filter only while a session is connected, unless
+ *   `raven.debugger.stopOnError` is `always` (sent with every mirror). With
+ *   no session, the error prints and the editor offers the debugger
+ *   afterwards: the console's `error` event marks the line
+ *   (`error-marker.ts`), and the traceback's "Inspect it" line is a terminal
+ *   link. Both open the error with Inspect Last Error.
  * - Breakpoints are mirrored to every console while no session exists, so
  *   code run before the first stop is already instrumented. VS Code's own
  *   `setBreakpoints` takes over inside a session; both carry the same set.
@@ -73,6 +82,12 @@ export function debugger_enabled(): boolean {
 
 function attach_policy(): 'onStop' | 'never' {
     return vscode.workspace.getConfiguration('raven.debugger').get<'onStop' | 'never'>('attach', 'onStop');
+}
+
+/** `raven.debugger.stopOnError`, as the console's mirror field takes it. */
+function stop_on_error(): 'inSession' | 'always' {
+    const v = vscode.workspace.getConfiguration('raven.debugger').get<string>('stopOnError', 'inSession');
+    return v === 'always' ? 'always' : 'inSession';
 }
 
 function just_my_code(): boolean {
@@ -265,7 +280,15 @@ function mirror_payload(previous: Set<string>): { msg: object; files: Set<string
     }
     const filters = exception_filters(context_ref?.workspaceState.get<string[]>(FILTERS_KEY));
     return {
-        msg: { v: 1, id: 0, op: 'breakpoints', files, functions, exceptionFilters: filters },
+        msg: {
+            v: 1,
+            id: 0,
+            op: 'breakpoints',
+            files,
+            functions,
+            exceptionFilters: filters,
+            stopOnError: stop_on_error(),
+        },
         files: now,
     };
 }
@@ -444,13 +467,14 @@ class ConsoleLink {
             while ((nl = buf.indexOf('\n')) >= 0) {
                 const line = buf.slice(0, nl);
                 buf = buf.slice(nl + 1);
-                let msg: { event?: string; status?: string; breakpoints?: BreakpointState[] };
+                let msg: { event?: string; status?: string; breakpoints?: BreakpointState[] } & ErrorEvent;
                 try { msg = JSON.parse(line); } catch { continue; }
                 if (!this.subscribed && msg.status !== undefined) {
                     this.subscribed = true;
                     this.mirror();
                 }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
+                if (msg.event === 'error') show_error(this.ipc, msg);
                 // R left the stop (resumed, or back at the prompt): one
                 // held for a launch or for a session's teardown is over.
                 if (msg.event === 'running') {
@@ -732,6 +756,11 @@ async function inspect_last_error(): Promise<void> {
         void vscode.window.showInformationMessage("Raven: no R console is open.");
         return;
     }
+    await inspect_console(ipc);
+}
+
+/** Inspect Last Error in console `ipc` (the error marker and terminal link name theirs). */
+async function inspect_console(ipc: string): Promise<void> {
     const status = await console_request(ipc, 'inspect');
     const why: Record<string, string> = {
         none: 'Raven: there is no error to inspect. Inspect Last Error opens an error that printed a traceback.',
@@ -947,12 +976,43 @@ export function register_debugger_unavailable(context: vscode.ExtensionContext):
     );
 }
 
+/** The traceback's hint, as the console prints it (`print_traceback` in dap/mod.rs). */
+const INSPECT_HINT = 'Inspect it: run Raven: Inspect Last Error';
+
+interface InspectLink extends vscode.TerminalLink {
+    ipc: string;
+}
+
+/**
+ * Makes the command name in a Raven console's "Inspect it" hint a link that
+ * opens that console's last error. A hint above a newer error opens the
+ * newer one: the console keeps only its last error.
+ */
+const inspect_link_provider: vscode.TerminalLinkProvider<InspectLink> = {
+    provideTerminalLinks(context) {
+        const ipc = console_socket_of(context.terminal);
+        const at = context.line.indexOf(INSPECT_HINT);
+        if (!ipc || at < 0) return [];
+        const name = 'Raven: Inspect Last Error';
+        return [{
+            startIndex: at + INSPECT_HINT.length - name.length,
+            length: name.length,
+            tooltip: 'Debug this error',
+            ipc,
+        }];
+    },
+    handleTerminalLink(link) {
+        void inspect_console(link.ipc);
+    },
+};
+
 function mirror_all(): void {
     for (const link of links.values()) link.mirror();
 }
 
 export function register_debugger(context: vscode.ExtensionContext): void {
     context_ref = context;
+    register_error_marker(context, inspect_console);
     status_item = vscode.window.createStatusBarItem('raven.debugger.breakpoints', vscode.StatusBarAlignment.Left, 50);
     status_item.name = 'R breakpoints';
     status_item.command = 'workbench.debug.action.focusBreakpointsView';
@@ -992,6 +1052,11 @@ export function register_debugger(context: vscode.ExtensionContext): void {
             });
         }),
         vscode.commands.registerCommand('raven.debugger.inspectLastError', inspect_last_error),
+        on_console_send(() => clear_error()),
+        vscode.workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration('raven.debugger.stopOnError')) mirror_all();
+        }),
+        vscode.window.registerTerminalLinkProvider(inspect_link_provider),
         vscode.commands.registerCommand(
             'raven.debugger.viewData',
             async (arg?: { variable?: { evaluateName?: string; name?: string } }) => {
@@ -1024,6 +1089,7 @@ export function register_debugger(context: vscode.ExtensionContext): void {
                 if (link.terminal === t) {
                     link.dispose();
                     links.delete(ipc);
+                    clear_error_for(ipc);
                 }
             }
         }),

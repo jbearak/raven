@@ -69,6 +69,27 @@ async function top_frame(session: vscode.DebugSession): Promise<{ id: number; na
     return st.stackFrames[0];
 }
 
+/** Poll an async check until it yields a value. */
+async function until_async<T>(what: string, check: () => Promise<T | undefined>, ms = 30_000): Promise<T> {
+    const start = Date.now();
+    for (;;) {
+        const v = await check();
+        if (v !== undefined) return v;
+        if (Date.now() - start > ms) throw new Error(`timed out waiting for ${what}`);
+        await sleep(100);
+    }
+}
+
+/** The "Debug this error" quick fix on `line` (0-based) of `file`, if offered. */
+async function debug_action(file: string, line: number): Promise<vscode.Command | undefined> {
+    const actions = await vscode.commands.executeCommand<vscode.CodeAction[]>(
+        'vscode.executeCodeActionProvider',
+        vscode.Uri.file(file),
+        new vscode.Range(line, 0, line, 0),
+    );
+    return actions?.find((a) => a.title === 'Debug this error')?.command;
+}
+
 /** Open `file` and select line `line` (0-based), or the whole file for -1. */
 async function open_at(file: string, line: number): Promise<vscode.TextEditor> {
     const doc = await vscode.workspace.openTextDocument(file);
@@ -129,9 +150,9 @@ suite('Raven R debugger (end to end)', function () {
         }
     });
 
-    // First, so no session has run yet: the default filters must already
-    // reach the console.
-    test('an uncaught error in code run from the editor attaches with no setup', async () => {
+    // First, so no session has run yet: with the default filters (Uncaught
+    // errors on) and `stopOnError: inSession`, nothing stops on its own.
+    test('an uncaught error in code run from the editor prints, and its line offers the debugger', async () => {
         const file = path.join(dir, 'e.R');
         fs.writeFileSync(file, 'e <- function(x) {\n  y <- x * 2\n  stop("boom")\n}\ne(1)\n');
         const editor = await open_at(file, 0);
@@ -141,6 +162,15 @@ suite('Raven R debugger (end to end)', function () {
         const mark = sent.length;
         await open_at(file, 4);
         await vscode.commands.executeCommand('raven.runLineOrSelection');
+        // The error's line (`stop("boom")`, inside e) offers the debugger.
+        const action = await until_async('a Debug this error action', () => debug_action(file, 2));
+        assert.strictEqual(
+            sent.slice(mark).find((m) => m.type === 'event' && m.event === 'stopped'),
+            undefined,
+            'the error stopped with no session',
+        );
+        assert.strictEqual(vscode.debug.activeDebugSession, undefined);
+        await vscode.commands.executeCommand(action.command, ...(action.arguments ?? []));
         const stop = await stopped_after(mark);
         assert.strictEqual(stop.body?.reason, 'exception');
         const session = await until('a session', () => vscode.debug.activeDebugSession);
@@ -150,23 +180,36 @@ suite('Raven R debugger (end to end)', function () {
         const ended = session_ended();
         await vscode.commands.executeCommand('workbench.action.debug.continue');
         await ended;
-    });
-
-    test('running a fixed line while stopped on its error ends the stop and runs the fix', async () => {
-        const file = path.join(dir, 't.R');
-        const out = path.join(dir, 't.out');
-        fs.writeFileSync(file, `prit(1)\nwriteLines("ran", ${JSON.stringify(out)})\n`);
-        const mark = sent.length;
+        // The next send clears the marker.
         await open_at(file, 0);
         await vscode.commands.executeCommand('raven.runLineOrSelection');
-        const stop = await stopped_after(mark);
-        assert.strictEqual(stop.body?.reason, 'exception');
-        await until('a session', () => vscode.debug.activeDebugSession);
-        const ended = session_ended();
-        await open_at(file, 1);
-        await vscode.commands.executeCommand('raven.runLineOrSelection');
-        await ended;
-        await until('the fixed line ran', () => fs.existsSync(out) || undefined);
+        await until_async('the marker to clear', async () => ((await debug_action(file, 2)) ? undefined : true));
+    });
+
+    test('with stopOnError: always, running a fixed line while stopped on its error ends the stop and runs the fix', async () => {
+        const config = vscode.workspace.getConfiguration('raven.debugger');
+        await config.update('stopOnError', 'always', vscode.ConfigurationTarget.Global);
+        try {
+            // The setting reaches the console with the next mirror.
+            await sleep(1000);
+            const file = path.join(dir, 't.R');
+            const out = path.join(dir, 't.out');
+            fs.writeFileSync(file, `prit(1)\nwriteLines("ran", ${JSON.stringify(out)})\n`);
+            const mark = sent.length;
+            await open_at(file, 0);
+            await vscode.commands.executeCommand('raven.runLineOrSelection');
+            const stop = await stopped_after(mark);
+            assert.strictEqual(stop.body?.reason, 'exception');
+            await until('a session', () => vscode.debug.activeDebugSession);
+            const ended = session_ended();
+            await open_at(file, 1);
+            await vscode.commands.executeCommand('raven.runLineOrSelection');
+            await ended;
+            await until('the fixed line ran', () => fs.existsSync(out) || undefined);
+        } finally {
+            await config.update('stopOnError', undefined, vscode.ConfigurationTarget.Global);
+            await sleep(1000);
+        }
     });
 
     test('Inspect Last Error reopens an error after it reached the prompt', async () => {
@@ -176,16 +219,11 @@ suite('Raven R debugger (end to end)', function () {
         editor.selection = new vscode.Selection(0, 0, 3, 1);
         await vscode.commands.executeCommand('raven.runLineOrSelection');
         await sleep(3000);
-        // It stops on the error; Continue lets it reach the prompt.
-        let mark = sent.length;
+        // With no session, the error prints and R returns to the prompt.
         await open_at(file, 4);
         await vscode.commands.executeCommand('raven.runLineOrSelection');
-        await stopped_after(mark);
-        let ended = session_ended();
-        await vscode.commands.executeCommand('workbench.action.debug.continue');
-        await ended;
-        await sleep(1000);
-        mark = sent.length;
+        await until_async('the error to reach the prompt', () => debug_action(file, 2));
+        const mark = sent.length;
         await vscode.commands.executeCommand('raven.debugger.inspectLastError');
         const stop = await stopped_after(mark);
         assert.strictEqual(stop.body?.reason, 'exception');
@@ -195,7 +233,7 @@ suite('Raven R debugger (end to end)', function () {
         assert.strictEqual(frame.line, 3);
         const ev = await session.customRequest('evaluate', { expression: 'q', frameId: frame.id, context: 'repl' });
         assert.match(ev.result, /6/);
-        ended = session_ended();
+        const ended = session_ended();
         await vscode.commands.executeCommand('workbench.action.debug.continue');
         await ended;
     });
