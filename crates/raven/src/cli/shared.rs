@@ -339,13 +339,13 @@ pub fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     }
 }
 
-/// Wrap a severity word in a minimal ANSI color span when `use_color` is set,
+/// Wrap a severity word in a minimal ANSI style span when `use_color` is set,
 /// returning it unchanged otherwise. Only the severity word is colorized (per
 /// the design); the path, location, message, and `[rule]` stay uncolored so the
 /// output remains easy to grep. `note` (severity-less / unrecognized) is left
 /// uncolored intentionally.
 ///
-/// The colored forms are a closed set of `&'static str` literals (color code +
+/// The colored forms are a closed set of `&'static str` literals (style code +
 /// word + `\x1b[0m` reset), so this allocates nothing and returns a borrow — the
 /// uncolored cases return the input `level` unchanged.
 fn colorize_level(level: &str, use_color: bool) -> &str {
