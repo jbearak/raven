@@ -3555,14 +3555,19 @@ fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
     c.send_at("prit(1)", &a, 1);
     assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
     c.expect("Browse[");
-    // The fix, sent from the same file, runs at the top level; the session
-    // ends as soon as the error is over, not when the fix finishes.
+    // Another typo stops again, in the same session (it stays open while
+    // the sent code runs, so the next stop can't race its teardown).
     let m = d.mark();
-    c.send_at("{ Sys.sleep(1.5); cat(sys.nframe(), 'fixed\\n') }", &a, 2);
-    d.event("terminated", m);
-    assert!(!c.text().contains("0 fixed"), "{}", c.text());
+    c.send_at("prit(3)", &a, 1);
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    assert_eq!(d.count("terminated", m), 0);
+    // The fix, sent from the same file, runs at the top level, and the
+    // session ends.
+    let m = d.mark();
+    c.send_at("cat(sys.nframe(), 'fixed\\n')", &a, 2);
     c.expect("0 fixed");
     c.expect("could not find function \"prit\"");
+    d.event("terminated", m);
     d.session_ended();
 
     // A stop from code typed at the prompt yields to a send too, instead of

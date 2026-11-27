@@ -222,9 +222,6 @@ struct Shared {
     /// `terminated` was sent to the current client: its `disconnect` is
     /// VS Code's teardown, not a user detach, and must not resume R.
     ended: bool,
-    /// An error stop was left for code sent during it
-    /// ([`yield_error_stop`]); taken at the next top-level prompt.
-    yielded: bool,
 }
 
 impl Shared {
@@ -1716,10 +1713,7 @@ fn end_session_at_prompt(more: bool) {
     let end = {
         let mut s = lock(h);
         let ran = s.runs_program && s.program_done;
-        // An error stop that sent code ended: the session it showed is
-        // over, though that code is still to run.
-        let yielded = std::mem::take(&mut s.yielded);
-        if (more && !yielded) || !(s.session_open || ran) {
+        if more || !(s.session_open || ran) {
             return;
         }
         s.session_open = false;
@@ -2162,9 +2156,6 @@ pub fn yield_error_stop(sent_since: impl FnOnce(std::time::Instant) -> bool) -> 
         return false;
     }
     s.resume = Some("c".into());
-    // The stop's session ends when R is back at the prompt, though the sent
-    // code is still to run (see `end_session_at_prompt`).
-    s.yielded = true;
     true
 }
 
