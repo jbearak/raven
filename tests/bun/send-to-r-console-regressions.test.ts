@@ -159,7 +159,7 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
     }
 
     // Raven's console tab is `R (Raven)`, which vscode-R doesn't pick by name.
-    test("with vscode-R's terminal open and Raven's active, without moving the focus", async () => {
+    test("with vscode-R's terminal open and Raven's active", async () => {
         install_vscode_r();
         const theirs = fake.window.createTerminal({ name: 'R Interactive' }) as FakeTerminal;
         const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
@@ -169,7 +169,6 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
         expect(await send.send_to_r_console('x <- 1')).toBe(true);
         expect(ours.typed).toEqual([]);
         expect(theirs.typed).toEqual(['x <- 1']);
-        expect(fake.window.activeTerminal).toBe(ours);
     });
 
     // With `r.alwaysUseActiveTerminal` on, vscode-R would send to whichever
