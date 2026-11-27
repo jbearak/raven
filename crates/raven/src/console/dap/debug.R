@@ -921,7 +921,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         # The printed error is the one Inspect Last Error opens (or none).
         state$last_dump <- cand$dump
         rpc("last_error", if (is.null(cand$dump)) "0" else "1")
-        jobj(lines = jarr(jstr(cand$lines)), inspect = if (is.null(cand$dump)) "false" else "true")
+        jobj(lines = jarr(jstr(cand$lines)), inspect = if (is.null(cand$dump)) "false" else "true",
+             message = jstr(cand$msg), path = jstr(cand$at[[1L]]), line = jnum(cand$at[[2L]]))
     }
     # Inspect Last Error (`.raven_dbg_inspect()`, fed as hidden input at a
     # top-level prompt): a browser in the innermost saved frame, with the
@@ -1291,28 +1292,32 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     # The stack as the traceback shows it, innermost first: each frame with
     # the line in it that called the next one (as the debugger's call stack
-    # does), keeping only lines in files. NULL when no line is in a file.
+    # does), keeping only lines in files, and the innermost of those lines
+    # (`at`: path, line), where the editor marks the error. NULL when no
+    # line is in a file.
     error_traceback <- function() {
         out <- character()
+        at <- NULL
         for (j in rev(seq_len(sys.nframe()))) {
             if (identical(environment(sys.function(j)), here)) next
             if (j > 1L && identical(environment(sys.function(j - 1L)), here)) next
             loc <- abs_loc(attr(sys.call(j), "srcref"))
             if (is.null(loc)) next
+            if (is.null(at)) at <- loc
             who <- if (j == 1L) "<top level>"
                    else trunc_str(paste(deparse(sys.call(j - 1L), nlines = 1L), collapse = ""), 60L)
             out <- c(out, paste0(who, " at ", loc[[1L]], ":", loc[[2L]]))
         }
-        if (length(out)) out else NULL
+        if (length(out)) list(lines = out, at = at) else NULL
     }
     # The candidate traceback for the error being signalled, or NULL. It is
     # printed only if the error really ends at the prompt; see at_prompt.
     error_candidate <- function(cnd) internal(tryCatch({
         if (identical(rpc("at_browser"), "1") || !from_file()) return(NULL)
-        lines <- error_traceback()
-        if (is.null(lines)) return(NULL)
+        tb <- error_traceback()
+        if (is.null(tb)) return(NULL)
         msg <- tryCatch(conditionMessage(cnd), error = function(e) "")
-        list(lines = lines, msg = msg, dump = error_dump(cnd, msg))
+        list(lines = tb$lines, at = tb$at, msg = msg, dump = error_dump(cnd, msg))
     }, error = function(e) NULL))
     # The frames of the error, for Inspect Last Error: everything below the
     # handler, up to the innermost frame with source (as an exception stop

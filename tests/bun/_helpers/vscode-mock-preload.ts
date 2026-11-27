@@ -40,6 +40,12 @@ mock.module('vscode', () => ({
     MarkdownString: class {},
     DebugAdapterNamedPipeServer: class {},
     StatusBarAlignment: { Left: 1, Right: 2 },
+    // The debugger's error marker (editors/vscode/src/debugger/error-marker.ts).
+    ThemeColor: class {},
+    OverviewRulerLane: { Left: 1, Center: 2, Right: 4, Full: 7 },
+    CodeActionKind: { QuickFix: {} },
+    CodeAction: class {},
+    languages: {},
     debug: {},
     commands: {
         registerCommand: () => ({ dispose: () => {} }),

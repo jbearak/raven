@@ -44,6 +44,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.debugger.attach` | `"onStop"` | `"onStop"` \| `"never"` | — | — | When VS Code attaches its debugger to Raven's R console. |
 | `raven.debugger.enabled` | `true` | boolean | — | — | Run the R debugger in Raven's R console: breakpoints, stepping, variables and the Debug Console for R, R Markdown and Quarto files. |
 | `raven.debugger.justMyCode` | `true` | boolean | — | — | Step Into skips functions that have no source (base R and installed packages) and steps back out instead. |
+| `raven.debugger.stopOnError` | `"inSession"` | `"inSession"` \| `"always"` | — | — | When an uncaught error in code from a file stops in the R debugger. |
 | `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | `"error"` \| `"warning"` \| `"information"` \| `"info"` \| `"hint"` \| `"off"` | `diagnostics.conditionAssignmentSeverity` | [diagnostics](diagnostics.md) | Severity for the condition-assignment diagnostic. |
 | `raven.diagnostics.enabled` | `true` | boolean | `diagnostics.enabled` | [diagnostics](diagnostics.md) | Enable or disable all diagnostics. |
 | `raven.diagnostics.jags` | `"off"` | `"off"` \| `"on"` | `diagnostics.jags` | [diagnostics](diagnostics.md) | Enable Raven diagnostics for standalone JAGS/BUGS files. |

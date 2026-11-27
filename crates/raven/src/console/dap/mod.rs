@@ -189,6 +189,13 @@ struct Shared {
     /// stalled reading a file from restoring older ones.
     filters_ticket: u64,
     functions_ticket: u64,
+    /// Uncaught errors stop even with no debug session connected
+    /// (`raven.debugger.stopOnError: always`, sent with the mirror). By
+    /// default the `error` filter applies only inside a session
+    /// ([`active_filters`]).
+    errors_outside_session: bool,
+    /// The newest mirror applied to `errors_outside_session`.
+    errors_outside_session_ticket: u64,
     configured: bool,
     connected: bool,
     stop: Option<Stop>,
@@ -595,7 +602,7 @@ fn capabilities() -> Value {
         "supportsClipboardContext": true,
         "exceptionBreakpointFilters": [
             {"filter": "error", "label": "Uncaught errors", "default": true,
-             "description": "Stop where an error is signalled in code from a file, if no tryCatch()/try() handles it. Errors in code typed at the prompt don't stop."},
+             "description": "Stop where an error is signalled in code from a file, if no tryCatch()/try() handles it. Errors in code typed at the prompt don't stop. Applies while a debug session is running; to stop with no session too, set raven.debugger.stopOnError to always."},
             {"filter": "warning", "label": "Warnings (not muffled)", "default": false,
              "description": "Stop where a warning is signalled in code from a file, unless a local handler muffles it."},
             {"filter": "interrupt", "label": "Interrupts", "default": false,
@@ -1095,6 +1102,22 @@ pub fn set_file_breakpoints(
     result
 }
 
+/// The exception filters that apply now, comma-separated. Uncaught errors
+/// stop only while a debug session is connected and not ended, unless the
+/// extension asked for them everywhere (`errors_outside_session`): code run
+/// with no session prints its error and returns to the prompt, and the
+/// editor offers the debugger afterwards (Inspect Last Error). Warnings and
+/// interrupts, off by default, apply whenever they are on.
+fn active_filters(s: &Shared) -> String {
+    let in_session = s.connected && !s.ended;
+    s.filters
+        .iter()
+        .filter(|f| f.as_str() != "error" || in_session || s.errors_outside_session)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Function breakpoints and exception filters mirrored by the extension
 /// while no session exists. `ticket` is the request's
 /// [`breakpoint_ticket`]: like a file's breakpoints, each is left alone when
@@ -1102,9 +1125,23 @@ pub fn set_file_breakpoints(
 /// `setFunctionBreakpoints` / `setExceptionBreakpoints`) has set it since.
 /// The check and the queueing share one lock, so the R thread applies
 /// function breakpoints in ticket order.
-pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>, ticket: u64) {
+///
+/// `errors_outside_session` is the mirror's `stopOnError` (see
+/// [`active_filters`]), applied in the same ticket order.
+pub fn set_mirrored(
+    functions: Option<Vec<String>>,
+    filters: Option<Vec<String>>,
+    errors_outside_session: Option<bool>,
+    ticket: u64,
+) {
     let Some(h) = handle() else { return };
     let mut s = lock(h);
+    if let Some(always) = errors_outside_session
+        && s.errors_outside_session_ticket < ticket
+    {
+        s.errors_outside_session_ticket = ticket;
+        s.errors_outside_session = always;
+    }
     if let Some(f) = filters
         && s.filters_ticket < ticket
     {
@@ -1296,7 +1333,7 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
         // At a browser prompt (stopped, not resumed) the condition comes from
         // what the user typed there; R is already stopped, so don't nest.
         "filters" if with_r(|r| r.stopped && !r.resumed).unwrap_or(false) => String::new(),
-        "filters" => lock(h).filters.join(","),
+        "filters" => active_filters(&lock(h)),
         "plan_file" => plan_file(a, b),
         "has_bps" => {
             if bp_requests(&canonical(a)).is_empty() {
@@ -1775,6 +1812,13 @@ fn print_warning_locations(top: bool) {
 /// Most traceback lines printed; the rest are counted.
 const TRACEBACK_LINES: usize = 8;
 
+/// The debugger stopped on an uncaught error since the last top-level
+/// prompt. The user has seen that error in the debugger, so its traceback
+/// sends no `error` event: a marker offering the debugger would come after
+/// the fact, often on the line they just fixed (the send that ended the
+/// stop).
+static STOPPED_ON_ERROR_SINCE_PROMPT: AtomicBool = AtomicBool::new(false);
+
 /// The last printed error kept its frames: Inspect Last Error has
 /// something to open. Read by the socket thread.
 static HAS_LAST_ERROR: AtomicBool = AtomicBool::new(false);
@@ -1810,10 +1854,17 @@ pub fn take_inspect() -> Option<String> {
 }
 
 /// Print the traceback `at_prompt` returned (`{"lines": [...], "inspect":
-/// bool}`, each line `call at /abs/file.R:12`, innermost first), dim, after
-/// R's error message. VS Code's terminal links the `path:line` itself. The
-/// Inspect hint is shown only when an editor is connected to run it.
-fn print_traceback(json: &str) {
+/// bool, "message", "path", "line"}`, each line `call at /abs/file.R:12`,
+/// innermost first; `path:line` is the innermost), dim, after R's error
+/// message. VS Code's terminal links the `path:line` itself. The Inspect
+/// hint is shown only when an editor is connected to run it; the extension
+/// makes it a link.
+///
+/// Subscribers also get `{"event":"error"}` with the message, the innermost
+/// location and whether Inspect Last Error can open it, so the editor can
+/// mark the line and offer the debugger there; not when `stopped_on_error`
+/// (see [`STOPPED_ON_ERROR_SINCE_PROMPT`]).
+fn print_traceback(json: &str, stopped_on_error: bool) {
     let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
     let lines: Vec<String> = v["lines"]
         .as_array()
@@ -1843,6 +1894,19 @@ fn print_traceback(json: &str) {
         text.push_str("Inspect it: run Raven: Inspect Last Error\n");
     }
     super::output::get().write(format!("\x1b[2m{text}\x1b[0m").as_bytes(), 1);
+    if let (Some(path), Some(line)) = (v["path"].as_str(), v["line"].as_u64())
+        && !stopped_on_error
+        && !path.is_empty()
+        && line > 0
+    {
+        push_control(json!({
+            "event": "error",
+            "message": v["message"].as_str().unwrap_or(""),
+            "path": path,
+            "line": line,
+            "inspect": v["inspect"] == true,
+        }));
+    }
 }
 
 fn on_top_level(more: bool) -> Option<String> {
@@ -1863,7 +1927,8 @@ fn on_top_level(more: bool) -> Option<String> {
     let mut fields = reply.splitn(3, '\x1e');
     let masked = fields.next().unwrap_or("").to_string();
     let bound = fields.next().unwrap_or("").to_string();
-    print_traceback(fields.next().unwrap_or("{}"));
+    let stopped_on_error = STOPPED_ON_ERROR_SINCE_PROMPT.swap(false, Ordering::SeqCst);
+    print_traceback(fields.next().unwrap_or("{}"), stopped_on_error);
     report_function_breakpoints(&bound);
     let changed = with_r(|r| {
         r.jit_off = false;
@@ -2085,6 +2150,9 @@ fn on_captured() -> Option<String> {
         }
         // Taken as the stop is published: a send queued after this answers it.
         stop.error_at = on_error.then(std::time::Instant::now);
+        if on_error {
+            STOPPED_ON_ERROR_SINCE_PROMPT.store(true, Ordering::SeqCst);
+        }
         s.stop = Some(stop.clone());
         s.rewrite_next = rewrite;
         s.resume = None;

@@ -28,9 +28,16 @@
 //!                                                      // states (DAP shape)
 //! ← {"event":"ready"}                                  // the debugger started
 //! → {"v":1,"id":11,"op":"breakpoints","files":{"/w/a.R":[{"line":3}]},
-//!    "functions":["f"],"exceptionFilters":["error"]}   // mirror while no
-//! ← {"id":11,"status":"ok"}                            // session exists
+//!    "functions":["f"],"exceptionFilters":["error"],   // mirror while no
+//!    "stopOnError":"inSession"}                        // session exists
+//! ← {"id":11,"status":"ok"}
+//! ← {"event":"error","message":"boom","path":"/w/a.R",  // an error from a
+//!    "line":3,"inspect":true}                          // file reached the
+//!                                                      // prompt (subscribers)
 //! ```
+//!
+//! `stopOnError` is `inSession` (the default when absent: the `error`
+//! filter applies only while a debug session is connected) or `always`.
 //!
 //! A `subscribe` made while R is stopped in the debugger, with no debug
 //! session showing the stop, is followed by that stop's `stopped` event, so
@@ -330,6 +337,15 @@ fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
                 .collect::<Vec<_>>()
         })
     };
-    super::dap::set_mirrored(strings("functions"), strings("exceptionFilters"), ticket);
+    let errors_outside_session = msg
+        .get("stopOnError")
+        .and_then(|v| v.as_str())
+        .map(|v| v == "always");
+    super::dap::set_mirrored(
+        strings("functions"),
+        strings("exceptionFilters"),
+        errors_outside_session,
+        ticket,
+    );
     true
 }

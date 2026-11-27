@@ -1139,6 +1139,19 @@
           "default": "onStop",
           "description": "When VS Code attaches its debugger to Raven's R console."
         },
+        "raven.debugger.stopOnError": {
+          "type": "string",
+          "enum": [
+            "inSession",
+            "always"
+          ],
+          "enumDescriptions": [
+            "Stop on an uncaught error only while a debug session is running. With no session, the error prints, R returns to the prompt, and the editor marks the line with a 'Debug this error' action.",
+            "Also stop on an uncaught error in code run with no debug session. The debugger opens where the error happened."
+          ],
+          "default": "inSession",
+          "description": "When an uncaught error in code from a file stops in the R debugger. Applies only while the Uncaught errors filter is on in the Breakpoints view."
+        },
         "raven.debugger.justMyCode": {
           "type": "boolean",
           "default": true,
