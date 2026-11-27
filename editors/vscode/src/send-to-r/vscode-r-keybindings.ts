@@ -1,6 +1,5 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { REDITORSUPPORT_EXTENSION_ID } from './console-picker';
 import {
     raven_user_keybindings,
     with_user_keybindings,
@@ -8,17 +7,17 @@ import {
 } from './raven-keybinding-entries';
 
 /**
- * **Raven: Use Raven's Keyboard Shortcuts Instead of vscode-R's**, and a
- * one-time offer to run it. With vscode-R installed, its `Cmd+Enter` (and
- * three other shortcuts) run instead of Raven's, so code skips the console
- * the user chose and vscode-R may show its own "Run R code" menu. The
- * command adds user keybindings, which rank above both extensions; see
- * `raven-keybinding-entries.ts` for why and for what is written.
+ * **Raven: Use Raven's Keyboard Shortcuts Instead of vscode-R's**. With
+ * vscode-R installed, its `Cmd+Enter` (and three other shortcuts) run
+ * instead of Raven's, so code skips the console the user chose and vscode-R
+ * may show its own "Run R code" menu. The command adds user keybindings,
+ * which rank above both extensions; see `raven-keybinding-entries.ts` for
+ * why and for what is written. Raven never offers to run it: rewriting a
+ * vscode-R user's shortcuts unasked is intrusive, so it runs only from the
+ * Command Palette.
  */
 
 export const ADD_KEYBINDINGS_COMMAND = 'raven.useRavenKeybindingsOverVscodeR';
-const OFFER_SHOWN_KEY = 'raven.vscodeRKeybindingsOfferShown';
-const COEXISTENCE_URL = 'https://github.com/jbearak/raven/blob/main/docs/coexistence.md#cmdenter-next-to-vscode-r';
 
 /**
  * The keybindings.json version Raven's edit produced when its save failed,
@@ -113,36 +112,8 @@ export async function add_raven_keybindings(extension: vscode.Extension<unknown>
     return updated.added;
 }
 
-/**
- * Offers, once, to add the keybindings: when vscode-R is installed, Raven's
- * console is on (the caller checks), and sends don't go to vscode-R anyway
- * (`raven.rTerminal.program` isn't `vscode-R`). Not in development or test
- * runs, where VS Code registers Raven's bindings last so they already win.
- */
-export async function offer_raven_keybindings(context: vscode.ExtensionContext): Promise<void> {
-    if (context.extensionMode !== vscode.ExtensionMode.Production) return;
-    if (!vscode.extensions.getExtension(REDITORSUPPORT_EXTENSION_ID)) return;
-    if (vscode.workspace.getConfiguration('raven.rTerminal').get<string>('program') === 'vscode-R') return;
-    if (context.globalState.get<boolean>(OFFER_SHOWN_KEY)) return;
-    await context.globalState.update(OFFER_SHOWN_KEY, true);
-
-    const ADD = 'Add Shortcuts';
-    const LEARN_MORE = 'Learn More';
-    const choice = await vscode.window.showInformationMessage(
-        "vscode-R's Cmd+Enter (Ctrl+Enter) runs instead of Raven's, so code skips the console you chose in Raven. Add keyboard shortcuts so Raven's run first in R and R Markdown files?",
-        ADD,
-        LEARN_MORE,
-    );
-    if (choice === ADD) {
-        await vscode.commands.executeCommand(ADD_KEYBINDINGS_COMMAND);
-    } else if (choice === LEARN_MORE) {
-        await vscode.env.openExternal(vscode.Uri.parse(COEXISTENCE_URL));
-    }
-}
-
 export function register_vscode_r_keybindings(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand(ADD_KEYBINDINGS_COMMAND, () => add_raven_keybindings(context.extension)),
     );
-    void offer_raven_keybindings(context);
 }
