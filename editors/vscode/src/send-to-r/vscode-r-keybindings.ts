@@ -20,16 +20,35 @@ export const ADD_KEYBINDINGS_COMMAND = 'raven.useRavenKeybindingsOverVscodeR';
 const OFFER_SHOWN_KEY = 'raven.vscodeRKeybindingsOfferShown';
 const COEXISTENCE_URL = 'https://github.com/jbearak/raven/blob/main/docs/coexistence.md#cmdenter-next-to-vscode-r';
 
-/** The user's keybindings.json, opened in an editor. */
+/** How long the keybindings editor has to become the active editor. */
+const OPEN_TIMEOUT_MS = 2000;
+
+function is_keybindings(doc: vscode.TextDocument): boolean {
+    return doc.uri.scheme === 'vscode-userdata' && path.posix.basename(doc.uri.path) === 'keybindings.json';
+}
+
+/**
+ * The current profile's keybindings.json, from the editor that
+ * `workbench.action.openGlobalKeybindingsFile` shows. Only that editor is
+ * trusted: with profiles, other profiles' keybindings.json files can be open
+ * too. `undefined` if it doesn't become active in time.
+ */
 async function open_user_keybindings(): Promise<vscode.TextDocument | undefined> {
+    const shown = new Promise<vscode.TextDocument | undefined>((resolve) => {
+        const done = (doc: vscode.TextDocument | undefined) => {
+            listener.dispose();
+            clearTimeout(timer);
+            resolve(doc);
+        };
+        const listener = vscode.window.onDidChangeActiveTextEditor((editor) => {
+            if (editor && is_keybindings(editor.document)) done(editor.document);
+        });
+        const timer = setTimeout(() => done(undefined), OPEN_TIMEOUT_MS);
+    });
     await vscode.commands.executeCommand('workbench.action.openGlobalKeybindingsFile');
-    const is_keybindings = (doc: vscode.TextDocument) =>
-        doc.uri.scheme === 'vscode-userdata' && path.posix.basename(doc.uri.path) === 'keybindings.json';
-    // Prefer the editor the command just showed; with profiles, other
-    // profiles' keybindings.json files can also be open.
     const active = vscode.window.activeTextEditor?.document;
-    if (active && is_keybindings(active)) return active;
-    return vscode.workspace.textDocuments.find(is_keybindings);
+    // Already active before the command ran: no change event comes.
+    return active && is_keybindings(active) ? active : shown;
 }
 
 /**
@@ -42,15 +61,26 @@ export async function add_raven_keybindings(extension: vscode.Extension<unknown>
         .contributes?.keybindings ?? [];
     const entries = raven_user_keybindings(contributed);
     const doc = await open_user_keybindings();
-    const text = doc?.getText();
-    const updated = text === undefined ? null : with_user_keybindings(text, entries);
-    if (!doc || text === undefined || updated === null) {
+    if (!doc) {
+        void vscode.window.showErrorMessage(
+            "Raven couldn't open your keybindings.json. Add its keyboard shortcuts by hand; see docs/coexistence.md.",
+        );
+        return undefined;
+    }
+    const text = doc.getText();
+    const updated = with_user_keybindings(text, entries);
+    if (updated === null) {
         void vscode.window.showErrorMessage(
             "Raven couldn't add its keyboard shortcuts: keybindings.json isn't a JSON array Raven can edit. Add them by hand; see docs/coexistence.md.",
         );
         return undefined;
     }
     if (updated.added === 0) {
+        // An earlier run's save may have failed, leaving the entries unsaved.
+        if (doc.isDirty && !(await doc.save())) {
+            void vscode.window.showErrorMessage("Raven couldn't save your keybindings.json.");
+            return undefined;
+        }
         void vscode.window.showInformationMessage("Raven's keyboard shortcuts are already in your keybindings.json.");
         return 0;
     }

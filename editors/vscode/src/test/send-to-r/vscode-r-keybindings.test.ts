@@ -29,16 +29,19 @@ suite('send-to-r: keyboard shortcuts over vscode-R', () => {
         if (doc && original !== undefined) {
             const edit = new vscode.WorkspaceEdit();
             edit.replace(doc.uri, new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)), original);
-            await vscode.workspace.applyEdit(edit);
-            await doc.save();
+            assert.ok(await vscode.workspace.applyEdit(edit), 'restore keybindings.json');
+            assert.ok(await doc.save(), 'save the restored keybindings.json');
+            await vscode.window.showTextDocument(doc);
+            await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
         }
-        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
     });
 
     test('adds the shortcuts to keybindings.json and saves it, once', async () => {
         await vscode.commands.executeCommand('workbench.action.openGlobalKeybindingsFile');
         original = keybindings_document()?.getText();
         assert.notStrictEqual(original, undefined, 'keybindings.json should open as a vscode-userdata document');
+        // Closed, so the command waits for the editor it opens, as it does for users.
+        await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
 
         const added = await vscode.commands.executeCommand<number | undefined>(COMMAND);
         assert.strictEqual(added, 8, 'two entries (Mac and not) for each of four commands');
