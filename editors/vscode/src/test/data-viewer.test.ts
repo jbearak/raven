@@ -56,6 +56,21 @@ async function pollFor<T>(
     return undefined;
 }
 
+/** Wait until panel `panelName` reports `want` as its focus cell. On a
+ *  timeout the assertion shows the cell the panel does report, which tells
+ *  a key that did nothing from one that moved the selection elsewhere. */
+async function expectFocusCell(
+    api: RavenExtensionApi,
+    panelName: string,
+    want: { row: number; col: number },
+): Promise<void> {
+    await pollFor(() => {
+        const cell = api.getDataViewerPanelFocusCell(panelName);
+        return cell && cell.row === want.row && cell.col === want.col ? cell : undefined;
+    }, 5000);
+    assert.deepStrictEqual(api.getDataViewerPanelFocusCell(panelName), want);
+}
+
 async function waitForViewerReady(
     api: RavenExtensionApi,
     panelName: string,
@@ -164,32 +179,36 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
 
         await api.pressDataViewerKey('mtcars', 'Home');
         await api.pressDataViewerKey('mtcars', 'ArrowDown');
-        const down = await pollFor(() => {
-            const cell = api.getDataViewerPanelFocusCell('mtcars');
-            return cell && cell.row === 1 && cell.col === 0 ? cell : undefined;
-        }, 5000);
-        assert.deepStrictEqual(down, { row: 1, col: 0 });
+        await expectFocusCell(api, 'mtcars', { row: 1, col: 0 });
 
         await api.pressDataViewerKey('mtcars', 'ArrowRight');
-        const right = await pollFor(() => {
-            const cell = api.getDataViewerPanelFocusCell('mtcars');
-            return cell && cell.row === 1 && cell.col === 1 ? cell : undefined;
-        }, 5000);
-        assert.deepStrictEqual(right, { row: 1, col: 1 });
+        await expectFocusCell(api, 'mtcars', { row: 1, col: 1 });
 
         await api.pressDataViewerKey('mtcars', 'ArrowUp');
-        const up = await pollFor(() => {
-            const cell = api.getDataViewerPanelFocusCell('mtcars');
-            return cell && cell.row === 0 && cell.col === 1 ? cell : undefined;
-        }, 5000);
-        assert.deepStrictEqual(up, { row: 0, col: 1 });
+        await expectFocusCell(api, 'mtcars', { row: 0, col: 1 });
 
         await api.pressDataViewerKey('mtcars', 'ArrowLeft');
-        const left = await pollFor(() => {
-            const cell = api.getDataViewerPanelFocusCell('mtcars');
-            return cell && cell.row === 0 && cell.col === 0 ? cell : undefined;
-        }, 5000);
-        assert.deepStrictEqual(left, { row: 0, col: 0 });
+        await expectFocusCell(api, 'mtcars', { row: 0, col: 0 });
+    });
+
+    test('Arrow keys sent back to back each move the selected cell', async function () {
+        if (!api.getDataViewerPanelNames().includes('mtcars')) {
+            await api.sendToRTerminal('View(mtcars)');
+            const appeared = await pollForPanel(api, 'mtcars');
+            assert.ok(appeared, 'data viewer panel "mtcars" did not appear');
+        }
+        const ready = await waitForViewerReady(api, 'mtcars');
+        assert.ok(ready, 'data viewer panel "mtcars" did not report an initial viewport');
+
+        await api.pressDataViewerKey('mtcars', 'Home');
+        await expectFocusCell(api, 'mtcars', { row: 0, col: 0 });
+
+        // No wait between the keys: each must start from the cell the one
+        // before it selected, not from the selection as last rendered.
+        await api.pressDataViewerKey('mtcars', 'ArrowDown');
+        await api.pressDataViewerKey('mtcars', 'ArrowRight');
+        await api.pressDataViewerKey('mtcars', 'ArrowDown');
+        await expectFocusCell(api, 'mtcars', { row: 2, col: 1 });
     });
 
     test('View(head(mtcars, 5)) opens a second panel without replacing "mtcars"', async function () {

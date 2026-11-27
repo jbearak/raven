@@ -450,6 +450,14 @@ export function App({
      *  or column set), never on scroll; re-runs the viewport request. */
     const [viewEpoch, setViewEpoch] = useState(0);
     const [gridSelection, setGridSelection] = useState<GridSelection>(createEmptySelection);
+    /** The selection as last rendered, or as a test key has just set it.
+     *  Messages can arrive faster than React renders, so the test-key
+     *  handler and the focus cell reported to the host read this, not the
+     *  `gridSelection` of the render their closure came from: otherwise a
+     *  second key starts from the cell before the first one's move, and a
+     *  lifecycle message sent before the next render reports the old cell. */
+    const latestSelectionRef = useRef(gridSelection);
+    latestSelectionRef.current = gridSelection;
     const [resolvedLabels, setResolvedLabels] = useState<Record<number, Record<number, string>>>({});
     /** The Columns sidebar (replaces the old Columns popover). */
     const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -793,7 +801,7 @@ export function App({
     const postLifecycle = useCallback((
         event: string,
         range: VisibleRange = visibleRangeRef.current,
-        selection = gridSelection,
+        selection = latestSelectionRef.current,
         generation = panelGeneration,
     ) => {
         vscode.postMessage({
@@ -810,7 +818,7 @@ export function App({
             focusCell: focusCell(selection),
             timestamp: Date.now(),
         });
-    }, [columns.length, focusCell, gridSelection, nrow, panelGeneration, vscode]);
+    }, [columns.length, focusCell, nrow, panelGeneration, vscode]);
     postLifecycleRef.current = postLifecycle;
 
     const persistLayout = useCallback((nextLayout: Layout) => {
@@ -1467,13 +1475,13 @@ export function App({
     const scrollToViewport = useCallback((
         viewport: VisibleRange,
         event: string,
-        selection: GridSelection = gridSelection,
+        selection: GridSelection = latestSelectionRef.current,
     ) => {
         setVisibleRange(viewport);
         requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
         requestMissingLabelsRef.current();
         postLifecycle(event, viewport, selection);
-    }, [effectiveNrow, gridSelection, postLifecycle, requestRows, setVisibleRange]);
+    }, [effectiveNrow, postLifecycle, requestRows, setVisibleRange]);
 
     // (Re)request the viewport after the rows were dropped (a new
     // transform, dataset or column set) or the frame changed shape —
@@ -1524,9 +1532,10 @@ export function App({
 
     const handleTestKey = useCallback((key: string) => {
         if (key === 'End') {
-            const displayCol = clampToData(display, gridSelection.current?.cell[0] ?? 1);
+            const displayCol = clampToData(display, latestSelectionRef.current.current?.cell[0] ?? 1);
             const row = Math.max(0, effectiveNrow - 1);
             const next = createCellSelection(displayCol, row);
+            latestSelectionRef.current = next;
             setGridSelection(next);
             scrollToFraction(1);
             postLifecycle('test-key', viewportForStart(Math.max(0, effectiveNrow - estimatedViewportRowCount())), next);
@@ -1534,6 +1543,7 @@ export function App({
         }
         if (key === 'Home') {
             const next = createCellSelection(clampToData(display, 1), 0);
+            latestSelectionRef.current = next;
             setGridSelection(next);
             scrollToFraction(0);
             postLifecycle('test-key', viewportForStart(0), next);
@@ -1541,7 +1551,7 @@ export function App({
         }
         if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         const visibleRange = visibleRangeRef.current;
-        const current = gridSelection.current?.cell ?? [1, Math.max(0, visibleRange.start)];
+        const current = latestSelectionRef.current.current?.cell ?? [1, Math.max(0, visibleRange.start)];
         let col = current[0];
         let row = current[1];
         if (key === 'ArrowDown') row += 1;
@@ -1552,8 +1562,11 @@ export function App({
         col = clampToData(display, col);
         row = Math.max(0, Math.min(effectiveNrow - 1, row));
         const next = createCellSelection(col, row);
+        latestSelectionRef.current = next;
         setGridSelection(next);
-        gridRef.current?.focus();
+        // No `focus()` here: a grid focused while the selection it was
+        // rendered with is empty selects its first cell, which would
+        // replace this move when the key arrives before a render.
         gridRef.current?.scrollTo(col, row, 'both');
         let viewport = visibleRange;
         if (row < visibleRange.start || row >= visibleRange.end) {
@@ -1566,7 +1579,6 @@ export function App({
         display,
         effectiveNrow,
         estimatedViewportRowCount,
-        gridSelection,
         postLifecycle,
         requestRows,
         scrollToFraction,
