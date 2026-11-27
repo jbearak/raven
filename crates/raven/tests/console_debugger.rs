@@ -2931,7 +2931,7 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
     // Errors stop only in code from a file.
     let e = c.write_file(
         "err.R",
-        "err_target <- function() stop(toupper('filter stayed off'))\n",
+        "err_target <- function() stop(toupper('filter stayed off'))\nwarn_target <- function() {\n  warning(toupper('warnings stayed off'))\n  1\n}\n",
     );
     c.send(&std::fs::read_to_string(&e).unwrap(), Some(&e));
     let fifo = c.dir.join("stall.R");
@@ -2948,7 +2948,7 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
     let stalled = {
         let msg = json!({"v": 1, "id": 2, "op": "breakpoints",
             "files": {&fifo: [{"line": 1}]},
-            "functions": ["fb_target"], "exceptionFilters": ["error"],
+            "functions": ["fb_target"], "exceptionFilters": ["error", "warning"],
             "stopOnError": "always"});
         let s = UnixStream::connect(c.dir.join("i")).expect("ipc connect");
         s.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -2975,7 +2975,7 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
     };
     // ... a newer one (the user removed the breakpoint) is applied ...
     let newer = json!({"v": 1, "id": 3, "op": "breakpoints", "files": {},
-        "functions": [], "exceptionFilters": [], "stopOnError": "always"});
+        "functions": [], "exceptionFilters": ["error"], "stopOnError": "inSession"});
     assert_eq!(ipc_request(&c, &newer), "ok");
     // ... and then the older one finishes.
     writer.write_all(b"z <- 1\n").unwrap();
@@ -3001,7 +3001,8 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
         assert!(Instant::now() < deadline, "{text}");
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Nor the exception filter it carried: the error returns to the prompt.
+    // Nor its `stopOnError: always`: with no session, the error returns to
+    // the prompt.
     c.send("err_target()", None);
     c.send("cat(toupper('back at the prompt'), '\\n')", None);
     let deadline = Instant::now() + TIMEOUT;
@@ -3013,6 +3014,22 @@ fn a_stalled_mirror_cannot_restore_function_breakpoints_removed_since() {
         );
         if text.contains("BACK AT THE PROMPT") {
             assert!(text.contains("FILTER STAYED OFF"), "{text}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Nor the warning filter it carried.
+    c.send("warn_target()", None);
+    c.send("cat(toupper('past the warning'), '\\n')", None);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let text = c.text();
+        assert!(
+            !text.contains("Browse["),
+            "the older mirror re-armed a removed exception filter:\n{text}"
+        );
+        if text.contains("PAST THE WARNING") {
             break;
         }
         assert!(Instant::now() < deadline, "{text}");

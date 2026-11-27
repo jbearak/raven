@@ -194,6 +194,8 @@ struct Shared {
     /// default the `error` filter applies only inside a session
     /// ([`active_filters`]).
     errors_outside_session: bool,
+    /// The newest mirror applied to `errors_outside_session`.
+    errors_outside_session_ticket: u64,
     configured: bool,
     connected: bool,
     stop: Option<Stop>,
@@ -1125,7 +1127,7 @@ fn active_filters(s: &Shared) -> String {
 /// function breakpoints in ticket order.
 ///
 /// `errors_outside_session` is the mirror's `stopOnError` (see
-/// [`active_filters`]); it carries no ticket, as only the extension sets it.
+/// [`active_filters`]), applied in the same ticket order.
 pub fn set_mirrored(
     functions: Option<Vec<String>>,
     filters: Option<Vec<String>>,
@@ -1134,7 +1136,10 @@ pub fn set_mirrored(
 ) {
     let Some(h) = handle() else { return };
     let mut s = lock(h);
-    if let Some(always) = errors_outside_session {
+    if let Some(always) = errors_outside_session
+        && s.errors_outside_session_ticket < ticket
+    {
+        s.errors_outside_session_ticket = ticket;
         s.errors_outside_session = always;
     }
     if let Some(f) = filters
