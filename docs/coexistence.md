@@ -99,7 +99,7 @@ To turn off vscode-R's language server, add this to your VS Code settings:
 
 ### Cmd+Enter next to vscode-R
 
-Raven and vscode-R both bind `Cmd+Enter` (`Ctrl+Enter` on Windows and Linux) in R files, and VS Code decides which extension's binding wins. Neither extension can change that. If vscode-R's wins, `Cmd+Enter` sends straight to vscode-R's terminal and Raven's menu never appears. Raven's `▶` menu, CodeLens buttons, and Command Palette commands still ask.
+Raven and vscode-R both bind `Cmd+Enter` (`Ctrl+Enter` on Windows and Linux) in R files, and VS Code decides which extension's binding wins. Neither extension can change that. If vscode-R's wins, `Cmd+Enter` runs vscode-R's command and Raven's menu never appears. vscode-R 3.2 and later then ask where to run the code, in a **Run R code** menu that offers **New R Interactive window** and **Create R terminal**; earlier versions send straight to vscode-R's terminal. Raven's `▶` menu, CodeLens buttons, and Command Palette commands still ask.
 
 To make `Cmd+Enter` run Raven's command, add a user keybinding. User keybindings win over extension ones. Open **Preferences: Open Keyboard Shortcuts (JSON)** and add:
 
