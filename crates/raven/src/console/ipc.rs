@@ -40,7 +40,8 @@
 //!
 //! `{"event":"running"}` says the last `stopped` is over: R was given a
 //! command that leaves the stop (Continue or a step, from the debug session
-//! or typed at `Browse>`), or is back at the top-level prompt with nothing
+//! or typed at `Browse>`, or the Continue that ends an error stop when an
+//! `execute` arrives during it), or is back at the top-level prompt with nothing
 //! more of the submission to run. It does not mean R is idle; after a step
 //! the next `stopped` follows.
 //!
@@ -66,6 +67,7 @@ use std::path::Path;
 use super::local_socket::{Listener, Stream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub struct Request {
     pub id: u64,
@@ -75,6 +77,8 @@ pub struct Request {
     /// The `program` of a debug session (`"debugProgram": true`): the
     /// session ends when this request finishes.
     pub debug_program: bool,
+    /// When the request was queued.
+    arrived: Instant,
     reply: Option<Stream>,
 }
 
@@ -128,6 +132,15 @@ impl Server {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop_front()
+    }
+
+    /// A request queued after `t` is waiting.
+    pub fn has_pending_since(&self, t: Instant) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|r| r.arrived > t)
     }
 
     pub fn has_pending(&self) -> bool {
@@ -199,6 +212,7 @@ fn serve(
                         location,
                         debug_program: msg.get("debugProgram").and_then(|v| v.as_bool())
                             == Some(true),
+                        arrived: Instant::now(),
                         reply,
                     });
                 }
