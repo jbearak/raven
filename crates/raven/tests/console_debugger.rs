@@ -3555,12 +3555,14 @@ fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
     c.send_at("prit(1)", &a, 1);
     assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
     c.expect("Browse[");
-    // The fix, sent from the same file, runs at the top level.
+    // The fix, sent from the same file, runs at the top level; the session
+    // ends as soon as the error is over, not when the fix finishes.
     let m = d.mark();
-    c.send_at("cat(sys.nframe(), 'fixed\\n')", &a, 2);
+    c.send_at("{ Sys.sleep(1.5); cat(sys.nframe(), 'fixed\\n') }", &a, 2);
+    d.event("terminated", m);
+    assert!(!c.text().contains("0 fixed"), "{}", c.text());
     c.expect("0 fixed");
     c.expect("could not find function \"prit\"");
-    d.event("terminated", m);
     d.session_ended();
 
     // A stop from code typed at the prompt yields to a send too, instead of
@@ -3608,6 +3610,22 @@ fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
     d.session_ended();
     let t = c.text();
     assert!(t.find("queued behind").unwrap() < t.find("sent after").unwrap());
+
+    // Same for a stop from typed code: a send queued before it waits for
+    // the top level instead of running in the failed frame.
+    let m = d.mark();
+    c.type_line("{ Sys.sleep(0.5); h(6) }");
+    std::thread::sleep(Duration::from_millis(150));
+    c.send("cat(sys.nframe(), 'early\\n')", None);
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    std::thread::sleep(Duration::from_millis(1000));
+    let ran_early = |t: String| t.lines().any(|l| l.trim_end().ends_with(" early"));
+    assert!(!ran_early(c.text()), "{}", c.text());
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    c.expect("0 early");
+    d.event("terminated", m);
+    d.session_ended();
 
     // Other stops are left alone: a send waits behind a warning stop.
     d.req(

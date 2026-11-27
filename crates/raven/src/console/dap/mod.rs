@@ -222,6 +222,9 @@ struct Shared {
     /// `terminated` was sent to the current client: its `disconnect` is
     /// VS Code's teardown, not a user detach, and must not resume R.
     ended: bool,
+    /// An error stop was left for code sent during it
+    /// ([`yield_error_stop`]); taken at the next top-level prompt.
+    yielded: bool,
 }
 
 impl Shared {
@@ -1713,7 +1716,10 @@ fn end_session_at_prompt(more: bool) {
     let end = {
         let mut s = lock(h);
         let ran = s.runs_program && s.program_done;
-        if more || !(s.session_open || ran) {
+        // An error stop that sent code ended: the session it showed is
+        // over, though that code is still to run.
+        let yielded = std::mem::take(&mut s.yielded);
+        if (more && !yielded) || !(s.session_open || ran) {
             return;
         }
         s.session_open = false;
@@ -2033,10 +2039,7 @@ fn on_captured() -> Option<String> {
     // or the frame browser of an exception or pause stop) is noise; one for
     // the user's browser() is kept, as R shows it.
     let own_browser = hit.is_some() || step_probe || exception.is_some();
-    let error_at = exception
-        .as_ref()
-        .is_some_and(|(kind, _)| kind == "error")
-        .then(std::time::Instant::now);
+    let on_error = exception.as_ref().is_some_and(|(kind, _)| kind == "error");
     let (reason, description, exc) = if let Some((kind, detail)) = exception {
         let mut parts = detail.split(US);
         let class = parts.next().unwrap_or("condition").to_string();
@@ -2074,7 +2077,7 @@ fn on_captured() -> Option<String> {
         hit_ids,
         frames,
         exception: exc,
-        error_at,
+        error_at: None,
     };
     let configured = {
         let mut s = lock(h);
@@ -2086,6 +2089,8 @@ fn on_captured() -> Option<String> {
                 frame.source_ref = Some(source_ref_for(&mut s, text));
             }
         }
+        // Taken as the stop is published: a send queued after this answers it.
+        stop.error_at = on_error.then(std::time::Instant::now);
         s.stop = Some(stop.clone());
         s.rewrite_next = rewrite;
         s.resume = None;
@@ -2157,7 +2162,21 @@ pub fn yield_error_stop(sent_since: impl FnOnce(std::time::Instant) -> bool) -> 
         return false;
     }
     s.resume = Some("c".into());
+    // The stop's session ends when R is back at the prompt, though the sent
+    // code is still to run (see `end_session_at_prompt`).
+    s.yielded = true;
     true
+}
+
+/// R is stopped on an error (code sent now runs at the top level, once R
+/// has left the stop: see [`yield_error_stop`]).
+pub fn at_error_stop() -> bool {
+    handle().is_some_and(|h| {
+        lock(h)
+            .stop
+            .as_ref()
+            .is_some_and(|st| st.error_at.is_some())
+    })
 }
 
 /// A resume command for the editor to return as input, if the debugger

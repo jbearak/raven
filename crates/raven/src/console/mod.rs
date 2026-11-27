@@ -1226,9 +1226,11 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
     // Every REPL prompt takes queued requests, including `+ ` (a request may
     // finish an expression an earlier one started, as typed lines would) —
     // but only one request at a time: one paused in a `browser()` it opened
-    // keeps the next waiting, unless it stopped on an error (below).
-    let accepts_queue =
-        kind != PromptKind::Other && with_state(|s| s.request.is_none()).unwrap_or(false);
+    // keeps the next waiting, unless it stopped on an error (below). Sent
+    // code never runs in the frame of an error: it waits for the top level.
+    let accepts_queue = kind != PromptKind::Other
+        && with_state(|s| s.request.is_none()).unwrap_or(false)
+        && !(kind == PromptKind::Browser && dap::at_error_stop());
     // Stopped on an error with code sent: leave the stop first, so the code
     // runs at the top level rather than waiting behind the stop (or, if the
     // stop came from typed code, running in the failed frame).
