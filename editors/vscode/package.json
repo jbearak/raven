@@ -94,6 +94,11 @@
         "category": "Raven"
       },
       {
+        "command": "raven.useRavenKeybindingsOverVscodeR",
+        "title": "Use Raven's Keyboard Shortcuts Instead of vscode-R's",
+        "category": "Raven"
+      },
+      {
         "command": "raven.terminal.runLineOrSelection",
         "title": "Terminal - Run Line or Selection",
         "category": "Raven"
@@ -456,6 +461,10 @@
       "commandPalette": [
         {
           "command": "raven.chooseRConsole",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
+          "command": "raven.useRavenKeybindingsOverVscodeR",
           "when": "raven.rConsoleEnabled"
         },
         {

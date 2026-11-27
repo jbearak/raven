@@ -42,6 +42,7 @@ import {
     get_or_create_r_terminal,
     _dispose_cached_r_terminal_for_test,
 } from './send-to-r';
+import { register_vscode_r_keybindings } from './send-to-r/vscode-r-keybindings';
 import {
     _set_picker_for_test,
     type ConsolePick,
@@ -452,6 +453,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         // Register R terminal and send-to-R commands
         register_r_terminal(context, plot_services, () => getServerBinaries(context));
         register_send_to_r_commands(context);
+        register_vscode_r_keybindings(context);
         register_debugger(context);
         register_inspection_commands(context);
         register_build_commands(context);
