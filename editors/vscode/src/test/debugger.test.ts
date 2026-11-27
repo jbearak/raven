@@ -180,8 +180,9 @@ suite('Raven R debugger (end to end)', function () {
         const ended = session_ended();
         await vscode.commands.executeCommand('workbench.action.debug.continue');
         await ended;
-        // The next send clears the marker.
-        await open_at(file, 0);
+        // The next send (the definition again) clears the marker.
+        const again = await open_at(file, 0);
+        again.selection = new vscode.Selection(0, 0, 3, 1);
         await vscode.commands.executeCommand('raven.runLineOrSelection');
         await until_async('the marker to clear', async () => ((await debug_action(file, 2)) ? undefined : true));
     });
@@ -206,6 +207,9 @@ suite('Raven R debugger (end to end)', function () {
             await vscode.commands.executeCommand('raven.runLineOrSelection');
             await ended;
             await until('the fixed line ran', () => fs.existsSync(out) || undefined);
+            // The error was seen in the debugger: no marker offers it again.
+            await sleep(1000);
+            assert.strictEqual(await debug_action(file, 0), undefined);
         } finally {
             await config.update('stopOnError', undefined, vscode.ConfigurationTarget.Global);
             await sleep(1000);

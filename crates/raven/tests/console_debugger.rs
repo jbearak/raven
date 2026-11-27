@@ -2838,6 +2838,17 @@ fn with_no_session_an_error_prints_and_the_editor_hears_where() {
     c.send_at("outer('a')", &b, 1);
     let ev = sub.event("stopped", TIMEOUT).expect("a stop");
     assert_eq!(ev["reason"], "exception", "{ev}");
+    // An error the debugger stopped on was seen there: ending the stop
+    // with a send prints its traceback but tells the editor nothing.
+    let tracebacks = c.text().matches("Traceback:").count();
+    c.send("cat(toupper('after the stop'), '\\n')", None);
+    c.expect("AFTER THE STOP");
+    assert_eq!(c.text().matches("Traceback:").count(), tracebacks + 1);
+    let mut after = Vec::new();
+    while let Some(ev) = sub.event_any(Duration::from_millis(500)) {
+        after.push(ev);
+    }
+    assert!(!after.iter().any(|e| e["event"] == "error"), "{after:?}");
 }
 
 #[test]

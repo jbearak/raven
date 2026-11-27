@@ -1807,6 +1807,13 @@ fn print_warning_locations(top: bool) {
 /// Most traceback lines printed; the rest are counted.
 const TRACEBACK_LINES: usize = 8;
 
+/// The debugger stopped on an uncaught error since the last top-level
+/// prompt. The user has seen that error in the debugger, so its traceback
+/// sends no `error` event: a marker offering the debugger would come after
+/// the fact, often on the line they just fixed (the send that ended the
+/// stop).
+static STOPPED_ON_ERROR_SINCE_PROMPT: AtomicBool = AtomicBool::new(false);
+
 /// The last printed error kept its frames: Inspect Last Error has
 /// something to open. Read by the socket thread.
 static HAS_LAST_ERROR: AtomicBool = AtomicBool::new(false);
@@ -1850,8 +1857,9 @@ pub fn take_inspect() -> Option<String> {
 ///
 /// Subscribers also get `{"event":"error"}` with the message, the innermost
 /// location and whether Inspect Last Error can open it, so the editor can
-/// mark the line and offer the debugger there.
-fn print_traceback(json: &str) {
+/// mark the line and offer the debugger there; not when `stopped_on_error`
+/// (see [`STOPPED_ON_ERROR_SINCE_PROMPT`]).
+fn print_traceback(json: &str, stopped_on_error: bool) {
     let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
     let lines: Vec<String> = v["lines"]
         .as_array()
@@ -1882,6 +1890,7 @@ fn print_traceback(json: &str) {
     }
     super::output::get().write(format!("\x1b[2m{text}\x1b[0m").as_bytes(), 1);
     if let (Some(path), Some(line)) = (v["path"].as_str(), v["line"].as_u64())
+        && !stopped_on_error
         && !path.is_empty()
         && line > 0
     {
@@ -1913,7 +1922,8 @@ fn on_top_level(more: bool) -> Option<String> {
     let mut fields = reply.splitn(3, '\x1e');
     let masked = fields.next().unwrap_or("").to_string();
     let bound = fields.next().unwrap_or("").to_string();
-    print_traceback(fields.next().unwrap_or("{}"));
+    let stopped_on_error = STOPPED_ON_ERROR_SINCE_PROMPT.swap(false, Ordering::SeqCst);
+    print_traceback(fields.next().unwrap_or("{}"), stopped_on_error);
     report_function_breakpoints(&bound);
     let changed = with_r(|r| {
         r.jit_off = false;
@@ -2135,6 +2145,9 @@ fn on_captured() -> Option<String> {
         }
         // Taken as the stop is published: a send queued after this answers it.
         stop.error_at = on_error.then(std::time::Instant::now);
+        if on_error {
+            STOPPED_ON_ERROR_SINCE_PROMPT.store(true, Ordering::SeqCst);
+        }
         s.stop = Some(stop.clone());
         s.rewrite_next = rewrite;
         s.resume = None;

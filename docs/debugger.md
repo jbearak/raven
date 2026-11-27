@@ -108,7 +108,7 @@ The Breakpoints view lists three exception filters. Uncaught errors is on by def
 | Warnings (not muffled) | Off | Where a warning is signalled |
 | Interrupts | Off | When you press Ctrl+C, instead of returning to the prompt |
 
-Like Python's debugger, Uncaught errors applies only while a debug session is running: one you started with F5 or Raven: Start R Debugging, or one that started when R stopped at a breakpoint. Code you run with no session open never stops on an error. To have errors stop there too and start a session, as they did before, set `raven.debugger.stopOnError` to `always`.
+Like Python's debugger, Raven applies Uncaught errors only while a debug session is running. That includes a session you started with F5 or Raven: Start R Debugging, and one that started because R stopped at a breakpoint. Code you run with no session open never stops on an error. To have errors stop there too and start a session, as they did before, set `raven.debugger.stopOnError` to `always`.
 
 Errors and warnings stop only when code from a file is running: code you ran from the editor, a file you `source()`d, or a function such code defined. An error in something you type at the `>` prompt, such as `log("a")`, prints as usual, and so does one you type at `Browse[1]>` while already stopped. Code run from an unsaved editor has no file, so its errors don't stop either, and neither do errors in a file sourced with `source(keep.source = FALSE)`, unless that file has a breakpoint.
 
