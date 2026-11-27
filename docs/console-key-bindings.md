@@ -26,7 +26,7 @@ These work in `emacs` style and in vi's insert mode:
 | `Alt+Enter` | Starts a new line, even if the input is complete |
 | `Tab` / `Shift+Tab` | Opens completions and moves through them; on a blank line, `Tab` indents |
 | `Up` / `Down`, `Ctrl+P` / `Ctrl+N` | Earlier and later history entries, or lines within multi-line input |
-| `→` or `End` at the end of the line | Accepts the underlined suggestion from history |
+| `→` or `End` at the end of the line | Accepts the suggestion from history |
 | `Ctrl+R` | Searches history |
 | `Home` / `End`, `Ctrl+A` / `Ctrl+E` | Start and end of the line |
 | `Ctrl+Left` / `Ctrl+Right` | Previous and next word |

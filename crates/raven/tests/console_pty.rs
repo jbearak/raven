@@ -727,7 +727,7 @@ fn history_survives_quit_and_restart() {
 }
 
 #[test]
-fn history_suggestion_is_underlined_in_the_text_color() {
+fn history_suggestion_is_dim_and_underlined_in_the_text_color() {
     if !r_available() {
         return;
     }
@@ -739,10 +739,10 @@ fn history_suggestion_is_underlined_in_the_text_color() {
     c.send("summ");
     c.expect("ary(x)  # seeded");
     c.settle();
-    // The suggestion is drawn underlined; it was bright black (`90`), the
-    // background color in Solarized.
+    // The suggestion is drawn dim and underlined; it was bright black (`90`),
+    // the background color in Solarized.
     let raw = String::from_utf8_lossy(&c.out[c.mark..]).into_owned();
-    assert!(raw.contains("\x1b[4mary(x)  # seeded"), "{raw:?}");
+    assert!(raw.contains("\x1b[2;4mary(x)  # seeded"), "{raw:?}");
     assert!(!raw.contains("\x1b[90m"), "{raw:?}");
 }
 
@@ -770,7 +770,7 @@ fn history_suggestion_stops_at_the_end_of_the_line() {
     // On the continuation line, the entry's next line is suggested.
     c.send("\r");
     c.expect("))");
-    assert_eq!(style_of(&c, "))"), ["4"]);
+    assert_eq!(style_of(&c, "))"), ["2;4"]);
 }
 
 #[test]

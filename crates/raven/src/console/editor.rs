@@ -173,11 +173,14 @@ fn add_common_keybindings(kb: &mut Keybindings) {
 
 // ---- history suggestion -----------------------------------------------------
 
-/// Underlined in the terminal's own text color: a grey can equal the
-/// background (bright black is the background in Solarized), and dim is not
-/// fainter on a light background in xterm or VTE.
+/// Dim and underlined, in the terminal's own text color. Dim is what makes it
+/// read as a suggestion: underlined at full strength, it was taken for text
+/// the console had typed. The underline keeps it apart from typed text where
+/// dim is not fainter (a light background in xterm or VTE). A grey is not
+/// used because it can equal the background: bright black is the background
+/// in Solarized.
 fn st_suggestion() -> Style {
-    Style::new().underline()
+    Style::new().dimmed().underline()
 }
 
 /// The history suggestion, one line at a time.
