@@ -102,7 +102,7 @@ The Breakpoints view lists three exception filters. Uncaught errors is on by def
 
 Errors and warnings stop only when code from a file is running: code you ran from the editor, a file you `source()`d, or a function such code defined. An error in something you type at the `>` prompt, such as `log("a")`, prints as usual, and so does one you type at `Browse[1]>` while already stopped. Code run from an unsaved editor has no file, so its errors don't stop either, and neither do errors in a file sourced with `source(keep.source = FALSE)`, unless that file has a breakpoint.
 
-Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handler, never reach these filters; no R debugger can break on them without tracing `stop()` itself. After a stop on an error, Step Over lets the error continue.
+Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handler, never reach these filters; no R debugger can break on them without tracing `stop()` itself. After a stop on an error, Step Over lets the error continue. So does running more code from the editor: if you fix a typo and press Cmd+Enter (Ctrl+Enter) again, the error finishes and prints, the debug session ends, and the new code runs at the `>` prompt.
 
 ### Tracebacks
 

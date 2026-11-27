@@ -3526,3 +3526,58 @@ fn a_finished_stop_lets_go_of_its_frames() {
         c.text()
     );
 }
+
+/// Code sent while R is stopped on an error ends that stop: the error
+/// finishes as Continue finishes it (printed, rest of its submission
+/// dropped), the session ends, and the new code runs at the top level. A
+/// fixed typo sent again with Cmd+Enter runs instead of waiting behind the
+/// stop.
+#[test]
+fn code_sent_at_an_error_stop_ends_it_and_runs_at_top_level() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let a = c.write_file(
+        "a.R",
+        "prit(1)\nprint(1)\nh <- function(x) {\n  stop(\"boom \", x)\n}\n",
+    );
+    c.send_at("h <- function(x) {\n  stop(\"boom \", x)\n}", &a, 3);
+    c.send("cat('defined', 'h\\n')", None);
+    c.expect("defined h");
+    let mut d = Dap::connect(&c);
+    d.req("setExceptionBreakpoints", json!({"filters": ["error"]}));
+    d.req("configurationDone", json!({}));
+
+    // The typo, sent from the file, stops on the error.
+    let m = d.mark();
+    c.send_at("prit(1)", &a, 1);
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    c.expect("Browse[");
+    // The fix, sent from the same file, runs at the top level.
+    let m = d.mark();
+    c.send_at("cat(sys.nframe(), 'fixed\\n')", &a, 2);
+    c.expect("0 fixed");
+    c.expect("could not find function \"prit\"");
+    d.event("terminated", m);
+    d.session_ended();
+
+    // A stop from code typed at the prompt yields to a send too, instead of
+    // the send running inside the stopped frame.
+    let m = d.mark();
+    c.type_line("h(5)");
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    let m = d.mark();
+    c.send("cat(sys.nframe(), 'after typed\\n')", None);
+    c.expect("0 after typed");
+    c.expect("boom 5");
+    d.event("terminated", m);
+    d.session_ended();
+    let t = c.text();
+    let traceback = t.rfind(&format!("h(5) at {a}:4")).unwrap();
+    let echoed = t.rfind("> cat(sys.nframe(), 'after typed").unwrap();
+    assert!(
+        traceback < echoed,
+        "the traceback came after the next send:\n{t}"
+    );
+}

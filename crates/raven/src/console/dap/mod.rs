@@ -160,6 +160,9 @@ struct Stop {
     hit_ids: Vec<u64>,
     frames: Vec<Frame>,
     exception: Option<(String, String, String)>,
+    /// Stopped on an uncaught error (not a warning, interrupt or pause):
+    /// code sent now ends the stop ([`yield_error_stop`]).
+    on_error: bool,
 }
 
 enum Job {
@@ -2029,6 +2032,7 @@ fn on_captured() -> Option<String> {
     // or the frame browser of an exception or pause stop) is noise; one for
     // the user's browser() is kept, as R shows it.
     let own_browser = hit.is_some() || step_probe || exception.is_some();
+    let on_error = exception.as_ref().is_some_and(|(kind, _)| kind == "error");
     let (reason, description, exc) = if let Some((kind, detail)) = exception {
         let mut parts = detail.split(US);
         let class = parts.next().unwrap_or("condition").to_string();
@@ -2066,6 +2070,7 @@ fn on_captured() -> Option<String> {
         hit_ids,
         frames,
         exception: exc,
+        on_error,
     };
     let configured = {
         let mut s = lock(h);
@@ -2115,6 +2120,24 @@ fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
         && a.iter()
             .zip(b)
             .all(|(x, y)| x.r_index == y.r_index && x.name == y.name && x.line == y.line)
+}
+
+/// Code was sent from the editor while R is stopped on an error: Continue,
+/// so the error finishes as it would have without the debugger (R prints
+/// it, drops the rest of its submission, and returns to the top level) and
+/// the sent code runs there, not in the frame that failed. Re-running a
+/// fixed typo then just works. Returns whether a Continue was requested; the
+/// console takes it with [`take_resume`]. Other stops (breakpoints, steps,
+/// warnings) are left alone: there, sent code may be meant for the stopped
+/// frame.
+pub fn yield_error_stop() -> bool {
+    let Some(h) = handle() else { return false };
+    let mut s = lock(h);
+    if s.resume.is_some() || !s.stop.as_ref().is_some_and(|st| st.on_error) {
+        return false;
+    }
+    s.resume = Some("c".into());
+    true
 }
 
 /// A resume command for the editor to return as input, if the debugger

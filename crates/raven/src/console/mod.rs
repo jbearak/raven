@@ -972,6 +972,9 @@ fn split_submission(text: &str) -> VecDeque<String> {
 }
 
 fn echo_line(prompt: &str, kind: PromptKind, line: &str) {
+    // What R printed is still buffered (e.g. a traceback written at this
+    // prompt); it comes before the echoed line.
+    output::get().flush();
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(echo_text(prompt, kind, line).as_bytes());
     let _ = out.flush();
@@ -1226,6 +1229,17 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
     // keeps the next waiting.
     let accepts_queue =
         kind != PromptKind::Other && with_state(|s| s.request.is_none()).unwrap_or(false);
+    // Stopped on an error with code sent: leave the stop first, so the code
+    // runs at the top level rather than waiting behind the stop (or, if the
+    // stop came from typed code, running in the failed frame).
+    if kind == PromptKind::Browser
+        && ipc_pending()
+        && dap::yield_error_stop()
+        && let Some(cmd) = dap::take_resume()
+    {
+        echo_line(prompt, kind, &cmd);
+        return Some(format!("{cmd}\n"));
+    }
     // Socket request waiting? Run it before showing the editor.
     if accepts_queue && let Some(line) = start_request(prompt, kind, cap) {
         return Some(line);
@@ -1277,6 +1291,11 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
             Ok(Signal::CtrlC) => continue,
             Ok(Signal::CtrlD) => return None,
             Ok(Signal::ExternalBreak(buf)) => {
+                // Code sent while stopped on an error ends the stop (see
+                // above); the resume below feeds the Continue.
+                if kind == PromptKind::Browser && ipc_pending() {
+                    dap::yield_error_stop();
+                }
                 // The debugger resumes R (Continue, Step…): feed its browser
                 // command, keeping whatever the user had typed for later.
                 if kind == PromptKind::Browser
@@ -1306,9 +1325,7 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
                     ed.run_edit_commands(&[EditCommand::InsertString(indent)]);
                     continue;
                 }
-                let queued = with_state(|s| s.ipc.as_ref().is_some_and(ipc::Server::has_pending))
-                    .unwrap_or(false);
-                if accepts_queue && queued {
+                if accepts_queue && ipc_pending() {
                     let pos = ed.current_insertion_point();
                     with_state(|s| s.stash = Some((buf, pos)));
                     ed.run_edit_commands(&[EditCommand::Clear]);
@@ -1325,6 +1342,11 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
             Err(_) => return plain_read(prompt),
         }
     }
+}
+
+/// Code sent from the editor is waiting in the console's queue.
+fn ipc_pending() -> bool {
+    with_state(|s| s.ipc.as_ref().is_some_and(ipc::Server::has_pending)).unwrap_or(false)
 }
 
 /// Pop a socket request (if any) and return its first line for R.
