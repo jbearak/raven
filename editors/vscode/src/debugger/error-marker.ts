@@ -44,18 +44,6 @@ const MAX_INLINE = 120;
 
 let marker: Marker | null = null;
 let decoration: vscode.TextEditorDecorationType | null = null;
-const listeners = new Set<() => void>();
-
-/** Test hook: the current marker, if any. */
-export function current_error_marker(): Readonly<Marker> | null {
-    return marker;
-}
-
-/** Test hook: be told whenever the marker changes. */
-export function on_error_marker_changed(listener: () => void): vscode.Disposable {
-    listeners.add(listener);
-    return new vscode.Disposable(() => listeners.delete(listener));
-}
 
 function same_file(a: vscode.Uri, b: vscode.Uri): boolean {
     if (a.toString() === b.toString()) return true;
@@ -102,7 +90,6 @@ function set(next: Marker | null): void {
     if (marker === null && next === null) return;
     marker = next;
     render();
-    for (const l of listeners) l();
 }
 
 /** An `error` event from console `ipc`. */

@@ -195,7 +195,8 @@ suite('Raven R debugger (end to end)', function () {
             await sleep(1000);
             const file = path.join(dir, 't.R');
             const out = path.join(dir, 't.out');
-            fs.writeFileSync(file, `prit(1)\nwriteLines("ran", ${JSON.stringify(out)})\n`);
+            // In a function, so a marker, if one were published, would offer the action.
+            fs.writeFileSync(file, `tt <- function() prit(1); tt()\nwriteLines("ran", ${JSON.stringify(out)})\n`);
             const mark = sent.length;
             await open_at(file, 0);
             await vscode.commands.executeCommand('raven.runLineOrSelection');
