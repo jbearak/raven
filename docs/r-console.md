@@ -56,13 +56,13 @@ A choice made for this session wins over the setting, so **Raven: Choose R Conso
 
 If the console `raven.rTerminal.program` names isn't on your PATH, Raven offers to switch to plain R. The switch lasts for the rest of the session. Raven also saves `R` in your user settings when the missing console came from there, but never changes a workspace setting.
 
-The terminals are named `R` for Raven's console, `R (plain)` for plain R, and `arf` and `radian` for those consoles. The [debugger](debugger.md) always uses Raven's console. It opens one if none is running, and doesn't change your choice.
+The terminals are named `R (Raven)` for Raven's console, `R (plain)` for plain R, and `arf` and `radian` for those consoles. The [debugger](debugger.md) always uses Raven's console. It opens one if none is running, and doesn't change your choice.
 
 ### Send to vscode-R
 
 When you choose vscode-R, Raven hands the code to vscode-R's own run command, which sends it to vscode-R's R terminal and opens one if needed. vscode-R's `r.bracketedPaste` setting decides how the code is typed in; Raven's `raven.sendToR.sendMethod` doesn't apply. From there vscode-R handles the code as if you'd sent it with its own commands: recent versions may ask where to run it (an Interactive session or an R terminal), and may wait for their session watcher to attach before sending.
 
-vscode-R sends to a terminal named `R` or `R Interactive`, and Raven's console is also named `R`. When vscode-R would pick one of Raven's terminals, Raven first brings vscode-R's own terminal forward, and has vscode-R open one if there is none. If that doesn't work, Raven sends nothing and says so. When vscode-R's `r.interactive.executionTarget` is `interactive`, vscode-R never sends to a terminal, so Raven leaves the terminals alone. If you cancel vscode-R's question about where to run the code, nothing is sent and Raven leaves the cursor where it is.
+vscode-R sends to a terminal named `R` or `R Interactive`, so it doesn't pick Raven's terminals by name. With vscode-R's `r.alwaysUseActiveTerminal` on, it sends to whichever terminal is active. When that is one of Raven's, Raven first brings vscode-R's own terminal forward, and has vscode-R open one if there is none. If that doesn't work, Raven sends nothing and says so. When vscode-R's `r.interactive.executionTarget` is `interactive`, vscode-R never sends to a terminal, so Raven leaves the terminals alone. If you cancel vscode-R's question about where to run the code, nothing is sent and Raven leaves the cursor where it is.
 
 Raven's plot viewer, data viewer, and debugger work only in terminals Raven opens. `plot()` and `View()` in vscode-R's terminal go to vscode-R's viewers. To have both extensions' `Cmd+Enter` behave the way you expect, see [Cmd+Enter next to vscode-R](coexistence.md#cmdenter-next-to-vscode-r).
 

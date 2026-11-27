@@ -172,7 +172,7 @@ interface TerminalStub {
  * module-level cache doesn't hold a real terminal created by an earlier
  * test suite (e.g. the data-viewer smoke tests).
  */
-const RAVEN_R_TERMINAL_NAMES = ['R', 'R (plain)'];
+const RAVEN_R_TERMINAL_NAMES = ['R (Raven)', 'R (plain)'];
 
 async function dispose_any_cached_r_terminal(): Promise<void> {
     const stale = vscode.window.terminals.filter(

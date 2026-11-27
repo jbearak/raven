@@ -117,10 +117,10 @@ suite('R console choice', () => {
         assert.strictEqual(_session_choice_for_test(), null);
     });
 
-    test("a pick for this session launches that console, named R for Raven's", async () => {
+    test("a pick for this session launches that console, named R (Raven) for Raven's", async () => {
         use_picker(async () => ({ target: 'raven', scope: 'session' }));
         assert.strictEqual(await send_to_r_console('x <- 1'), true);
-        assert.deepStrictEqual(created.map(t => t.name), ['R']);
+        assert.deepStrictEqual(created.map(t => t.name), ['R (Raven)']);
         assert.strictEqual(_session_choice_for_test(), 'raven');
         assert.strictEqual(config().inspect<string>('program')?.globalValue, 'ask');
         // The next send reuses the choice without asking.
@@ -212,7 +212,7 @@ suite('R console choice', () => {
         await resolve_send_target();
         const console_terminal = await get_or_create_raven_console();
         assert.strictEqual(terminal_program_of(console_terminal), 'raven');
-        assert.deepStrictEqual(created.map(t => t.name), ['R (plain)', 'R']);
+        assert.deepStrictEqual(created.map(t => t.name), ['R (plain)', 'R (Raven)']);
         assert.strictEqual(current_target(), 'R', 'the debugger does not change the choice');
     });
 
@@ -311,7 +311,7 @@ suite('R console choice: bundled commands', () => {
         ]);
         assert.ok(terminal, 'the R profile opened a terminal');
         try {
-            assert.strictEqual(terminal.name, 'R');
+            assert.strictEqual(terminal.name, 'R (Raven)');
             const env = (terminal.creationOptions as vscode.TerminalOptions).env;
             assert.strictEqual(typeof env?.[TERMINAL_ID_ENV], 'string');
         } finally {

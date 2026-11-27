@@ -99,10 +99,11 @@ export function vscode_r_restart_hint(): string {
 
 /**
  * Makes sure vscode-R's terminal selector (`vscode_r_terminal_pick`) won't
- * pick one of Raven's terminals, which are also named `R`. Does nothing
- * unless a Raven terminal would be picked; then activates vscode-R's own
- * terminal, opening one with `r.createRTerm` if it has none. Returns false
- * if a Raven terminal would still be picked: then nothing may be sent.
+ * pick one of Raven's terminals, as it does when `r.alwaysUseActiveTerminal`
+ * is on and a Raven terminal is active. Does nothing unless a Raven terminal
+ * would be picked; then activates vscode-R's own terminal, opening one with
+ * `r.createRTerm` if it has none. Returns false if a Raven terminal would
+ * still be picked: then nothing may be sent.
  */
 async function clear_way_for_vscode_r(): Promise<boolean> {
     const always_active = vscode.workspace.getConfiguration('r').get<boolean>('alwaysUseActiveTerminal', false);
