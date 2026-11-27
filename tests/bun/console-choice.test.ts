@@ -7,6 +7,7 @@ import {
     parse_detection_output,
     parse_program_setting,
     terminal_name_for,
+    vscode_r_terminal_pick,
 } from '../../editors/vscode/src/send-to-r/console-choice';
 import { take_pending_profile, type PendingProfile } from '../../editors/vscode/src/send-to-r/pending-profiles';
 
@@ -56,11 +57,19 @@ describe('keep_session_choice_after_setting_change', () => {
 });
 
 describe('terminal_name_for', () => {
-    test("Raven's console is just R", () => {
-        expect(terminal_name_for('raven')).toBe('R');
+    test("Raven's console is R (Raven)", () => {
+        expect(terminal_name_for('raven')).toBe('R (Raven)');
         expect(terminal_name_for('R')).toBe('R (plain)');
         expect(terminal_name_for('arf')).toBe('arf');
         expect(terminal_name_for('radian')).toBe('radian');
+    });
+
+    // vscode-R sends to terminals named `R`; Raven's must not look like one.
+    test("no Raven terminal name is one vscode-R picks by name", () => {
+        for (const program of ['raven', 'R', 'arf', 'radian'] as const) {
+            const ours = { name: terminal_name_for(program) };
+            expect(vscode_r_terminal_pick([ours], ours, false)).toBeUndefined();
+        }
     });
 });
 

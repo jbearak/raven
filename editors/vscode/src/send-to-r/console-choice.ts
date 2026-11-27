@@ -62,10 +62,14 @@ export function keep_session_choice_after_setting_change(
     return session_choice === global_value || session_choice === effective_value;
 }
 
-/** Terminal tab name for a program. Raven's console is just `R`. */
+/**
+ * Terminal tab name for a program. Raven's console is `R (Raven)`, not `R`:
+ * vscode-R sends to terminals named `R` (`VSCODE_R_TERMINAL_NAMES`), and a
+ * tab named `R` can't be told apart from vscode-R's own.
+ */
 export function terminal_name_for(program: TerminalProgram): string {
     switch (program) {
-        case 'raven': return 'R';
+        case 'raven': return 'R (Raven)';
         case 'R': return 'R (plain)';
         case 'arf': return 'arf';
         case 'radian': return 'radian';
@@ -81,8 +85,8 @@ export const VSCODE_R_TERMINAL_NAMES: readonly string[] = ['R', 'R Interactive']
  * doesn't contain "deactivate", the active terminal if
  * `r.alwaysUseActiveTerminal` is on; otherwise those named `R` or
  * `R Interactive`, preferring the active one, else the newest. Undefined
- * means vscode-R would open its own. Raven's console is also named `R`, so
- * this can be a Raven terminal.
+ * means vscode-R would open its own. Raven's terminals have other names, but
+ * with `r.alwaysUseActiveTerminal` on this can still be a Raven terminal.
  */
 export function vscode_r_terminal_pick<T extends { name: string; exitStatus?: unknown }>(
     terminals: readonly T[],
