@@ -129,6 +129,7 @@ You can also run these commands from the editor toolbar menu (the `▶` button) 
 | Run Downward Lines | Sends all lines from the current line to the end of the file, extending upward to include the full statement start. |
 | Source File | Runs `source("filepath", echo = TRUE)` in the R console. |
 | Choose R Console | Asks which console to send code to; see [Choose a console](#choosing-the-r-program). |
+| Use Raven's Keyboard Shortcuts Instead of vscode-R's | Adds user keybindings so `Cmd+Enter` and Raven's other shortcuts run Raven's commands when vscode-R is installed; see [Cmd+Enter next to vscode-R](coexistence.md#cmdenter-next-to-vscode-r). |
 
 ### Quick inspection commands
 
