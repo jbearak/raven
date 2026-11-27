@@ -20,8 +20,12 @@ export const ADD_KEYBINDINGS_COMMAND = 'raven.useRavenKeybindingsOverVscodeR';
 const OFFER_SHOWN_KEY = 'raven.vscodeRKeybindingsOfferShown';
 const COEXISTENCE_URL = 'https://github.com/jbearak/raven/blob/main/docs/coexistence.md#cmdenter-next-to-vscode-r';
 
-/** keybindings.json that holds Raven's entries but failed to save, to save on the next run. */
-let unsaved_write: string | undefined;
+/**
+ * The keybindings.json version Raven's edit produced when its save failed,
+ * to save on the next run. Any later edit, save, or revert changes the
+ * version, and then the buffer is the user's to save.
+ */
+let unsaved_write: { uri: string; version: number } | undefined;
 
 /** How long the keybindings editor has to become the active editor. */
 const OPEN_TIMEOUT_MS = 2000;
@@ -81,7 +85,7 @@ export async function add_raven_keybindings(extension: vscode.Extension<unknown>
     if (updated.added === 0) {
         // An earlier run's save failed, leaving its entries unsaved. Other
         // unsaved edits are the user's, and stay unsaved.
-        if (doc.isDirty && unsaved_write === doc.uri.toString()) {
+        if (doc.isDirty && unsaved_write?.uri === doc.uri.toString() && unsaved_write.version === doc.version) {
             if (!(await doc.save())) {
                 void vscode.window.showErrorMessage("Raven couldn't save your keybindings.json.");
                 return undefined;
@@ -98,7 +102,7 @@ export async function add_raven_keybindings(extension: vscode.Extension<unknown>
         return undefined;
     }
     if (!(await doc.save())) {
-        unsaved_write = doc.uri.toString();
+        unsaved_write = { uri: doc.uri.toString(), version: doc.version };
         void vscode.window.showErrorMessage("Raven couldn't save your keybindings.json.");
         return undefined;
     }
