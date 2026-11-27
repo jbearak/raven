@@ -727,6 +727,26 @@ fn history_survives_quit_and_restart() {
 }
 
 #[test]
+fn history_suggestion_is_underlined_in_the_text_color() {
+    if !r_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let hist = dir.path().join("history");
+    std::fs::write(&hist, "summary(x)  # seeded\n").unwrap();
+    let mut c = Console::spawn_with(&["--history-file", hist.to_str().unwrap()], false);
+    c.expect("> ");
+    c.send("summ");
+    c.expect("ary(x)  # seeded");
+    c.settle();
+    // The suggestion is drawn underlined; it was bright black (`90`), the
+    // background color in Solarized.
+    let raw = String::from_utf8_lossy(&c.out[c.mark..]).into_owned();
+    assert!(raw.contains("\x1b[4mary(x)  # seeded"), "{raw:?}");
+    assert!(!raw.contains("\x1b[90m"), "{raw:?}");
+}
+
+#[test]
 fn a_request_can_finish_an_expression_an_earlier_one_started() {
     if !r_available() {
         return;

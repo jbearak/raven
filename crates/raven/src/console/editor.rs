@@ -96,8 +96,11 @@ pub fn build(cfg: EditorConfig) -> Reedline {
 
     Reedline::create()
         .with_history(history)
+        // Underlined in the terminal's own text color: a grey can equal the
+        // background (bright black is the background in Solarized), and dim is
+        // not fainter on a light background in xterm or VTE.
         .with_hinter(Box::new(
-            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+            DefaultHinter::default().with_style(Style::new().underline()),
         ))
         .with_highlighter(Box::new(RHighlighter::new()))
         .with_validator(Box::new(RValidator {
@@ -167,11 +170,10 @@ fn st_constant() -> Style {
 fn st_string() -> Style {
     Style::new().fg(Color::Green)
 }
-fn st_number() -> Style {
-    Style::new().fg(Color::Blue)
-}
+/// Italic in the terminal's own text color: bright black, the usual comment
+/// grey, is the background color in Solarized.
 fn st_comment() -> Style {
-    Style::new().fg(Color::DarkGray).italic()
+    Style::new().italic()
 }
 
 struct RHighlighter {
@@ -206,12 +208,14 @@ impl RHighlighter {
                 match node.kind() {
                     "comment" => Some(st_comment()),
                     "string" => Some(st_string()),
-                    "integer" | "float" | "complex" => Some(st_number()),
                     "true" | "false" | "null" | "na" | "inf" | "nan" | "dots" | "dot_dot_i" => {
                         Some(st_constant())
                     }
                     "function" | "if" | "else" | "for" | "while" | "repeat" | "in" | "break"
                     | "next" | "\\" => Some(st_keyword()),
+                    // Numbers (`integer`, `float`, `complex`) stay in the
+                    // terminal's text color: blue is below 3:1 on several
+                    // stock dark palettes.
                     _ => None,
                 }
             } else {
@@ -533,6 +537,16 @@ pub enum PromptKind {
     Other,
 }
 
+/// The color of a prompt of this kind, as the editor draws it and as an
+/// echoed line repeats it: the terminal's own text color, except yellow for
+/// `Browse[n]> ` so the debugger's prompt stands out.
+pub fn prompt_color(kind: PromptKind) -> Color {
+    match kind {
+        PromptKind::Browser => Color::Yellow,
+        PromptKind::TopLevel | PromptKind::Continuation | PromptKind::Other => Color::Default,
+    }
+}
+
 pub struct RPrompt {
     pub text: String,
     pub kind: PromptKind,
@@ -558,15 +572,11 @@ impl Prompt for RPrompt {
         };
         Cow::Owned(format!("({prefix}search: {}) ", search.term))
     }
-    fn get_prompt_color(&self) -> reedline::Color {
-        match self.kind {
-            PromptKind::Browser => reedline::Color::Yellow,
-            PromptKind::Other => reedline::Color::Default,
-            _ => reedline::Color::Blue,
-        }
+    fn get_prompt_color(&self) -> Color {
+        prompt_color(self.kind)
     }
-    fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
-        nu_ansi_term::Color::DarkGray
+    fn get_prompt_multiline_color(&self) -> Color {
+        Color::Default
     }
 }
 
@@ -629,6 +639,36 @@ mod tests {
         assert!(!is_blank_line_head("su"));
         assert!(!is_blank_line_head("f(x,\n  y"));
         assert!(!is_blank_line_head("f("));
+    }
+
+    #[test]
+    fn numbers_are_unstyled_and_comments_italic() {
+        assert_eq!(highlight_ansi("x <- 1 # c"), "x <- 1 \x1b[3m# c\x1b[0m");
+        assert_eq!(highlight_ansi("2.5e3 + 1L + 3i"), "2.5e3 + 1L + 3i");
+    }
+
+    #[test]
+    fn prompts_use_the_terminal_text_color_except_the_browser() {
+        let prompt = |kind| RPrompt {
+            text: String::new(),
+            kind,
+        };
+        for kind in [
+            PromptKind::TopLevel,
+            PromptKind::Continuation,
+            PromptKind::Other,
+        ] {
+            assert_eq!(prompt(kind).get_prompt_color(), Color::Default, "{kind:?}");
+            assert_eq!(prompt(kind).get_prompt_multiline_color(), Color::Default);
+        }
+        assert_eq!(
+            prompt(PromptKind::Browser).get_prompt_color(),
+            Color::Yellow
+        );
+        assert_eq!(
+            prompt(PromptKind::Browser).get_prompt_multiline_color(),
+            Color::Default
+        );
     }
 
     #[test]

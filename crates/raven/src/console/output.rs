@@ -55,8 +55,6 @@ const RESET: &str = "\x1b[0m";
 const ERROR: &str = "\x1b[31m";
 const WARNING: &str = "\x1b[33m";
 const MESSAGE: &str = "\x1b[36m";
-const V_INDEX: &str = "\x1b[90m";
-const V_NUMBER: &str = "\x1b[34m";
 const V_STRING: &str = "\x1b[32m";
 const V_CONST: &str = "\x1b[35m";
 
@@ -66,7 +64,8 @@ pub enum ColorMode {
     Off,
     /// Style stderr by condition kind (error / warning / message).
     Streams,
-    /// `Streams`, plus colorout-style styling of printed values on stdout.
+    /// `Streams`, plus colorout-style styling of printed strings and
+    /// constants on stdout.
     Values,
 }
 
@@ -295,25 +294,27 @@ fn push_styled(out: &mut Vec<u8>, color: &str, text: &str) {
 
 /// colorout-style value styling for stdout (opt-in, [`ColorMode::Values`]).
 ///
-/// Styles `[n]` index prefixes, numbers, quoted strings, and the constants
-/// `NA`, `NULL`, `NaN`, `Inf`, `TRUE`, `FALSE`. Unlike colorout, a token only
-/// counts when it stands alone between delimiters, so `a1b2`, `3f2a9c`, and
-/// `192.168.0.1` stay plain. Text containing escapes passes through. String
-/// state never carries past a newline, so an apostrophe in prose cannot
-/// colour the rest of the output.
+/// Styles quoted strings and the constants `NA`, `NULL`, `NaN`, `Inf`,
+/// `TRUE`, `FALSE`. Numbers and `[1]`-style index labels stay in the
+/// terminal's text color: blue and bright black are unreadable on some stock
+/// palettes. Unlike colorout, a token only counts
+/// when it stands alone between delimiters, so `NA_character_` and `xTRUE`
+/// stay plain. Text containing escapes passes through. String state never
+/// carries past a newline, so an apostrophe in prose cannot colour the rest
+/// of the output.
 #[derive(Debug, Default)]
 pub struct ValueLexer {
     /// Last byte of the previous chunk on this line (for token boundaries).
     prev: Option<u8>,
-    at_line_start: bool,
     /// See `StderrClassifier::line_raw`.
     line_raw: bool,
     /// See `StderrClassifier::sgr_active`.
     sgr_active: bool,
     /// The colour span currently open. Consecutive tokens of one colour
-    /// separated only by spaces share a span — R prints `print(1:1e6)` one
-    /// element per write, and a colour/reset pair per number would more than
-    /// double the bytes the terminal has to parse.
+    /// separated only by spaces share a span — R prints `print(rep(NA,
+    /// 1e6))` one element per write, and a colour/reset pair per element
+    /// would more than double the bytes the terminal has to parse. Any other
+    /// text, a bare number included, closes the span before it is written.
     open: Option<&'static str>,
 }
 
@@ -321,7 +322,6 @@ impl ValueLexer {
     pub fn new() -> Self {
         Self {
             prev: None,
-            at_line_start: true,
             line_raw: false,
             sgr_active: false,
             open: None,
@@ -330,7 +330,6 @@ impl ValueLexer {
 
     pub fn reset(&mut self) {
         self.prev = None;
-        self.at_line_start = true;
         self.line_raw = false;
         self.sgr_active = false;
     }
@@ -385,11 +384,9 @@ impl ValueLexer {
             }
             if line.ends_with('\n') {
                 self.prev = None;
-                self.at_line_start = true;
                 self.line_raw = self.sgr_active;
             } else {
                 self.prev = line.as_bytes().last().copied();
-                self.at_line_start = false;
             }
         }
     }
@@ -397,16 +394,8 @@ impl ValueLexer {
     fn style_line(&mut self, line: &str, out: &mut Vec<u8>) {
         let b = line.as_bytes();
         let mut i = 0;
-        // `[123]` / `[1,]` / `[,1]` row/column index labels at line start.
-        if self.at_line_start {
-            let ws = b.iter().take_while(|c| **c == b' ').count();
-            if let Some(len) = index_label_len(&b[ws..]) {
-                self.emit(out, &b[..ws], V_INDEX, &b[ws..ws + len]);
-                i = ws + len;
-            }
-        }
-        let mut prev = if i > 0 { Some(b[i - 1]) } else { self.prev };
-        let mut plain_start = i;
+        let mut prev = self.prev;
+        let mut plain_start = 0;
         while i < b.len() {
             let c = b[i];
             let boundary_before = prev.is_none_or(is_delim);
@@ -415,18 +404,8 @@ impl ValueLexer {
             } else if boundary_before {
                 let n = word_len(&b[i..]);
                 let next = b.get(i + n).copied();
-                if n > 0 && next.is_none_or(is_delim) {
-                    let w = &line[i..i + n];
-                    if is_constant(w) {
-                        Some((n, V_CONST))
-                    } else if is_number(w) {
-                        Some((n, V_NUMBER))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                (n > 0 && next.is_none_or(is_delim) && is_constant(&line[i..i + n]))
+                    .then_some((n, V_CONST))
             } else {
                 None
             };
@@ -483,18 +462,6 @@ fn word_len(b: &[u8]) -> usize {
         .count()
 }
 
-fn index_label_len(b: &[u8]) -> Option<usize> {
-    if b.first() != Some(&b'[') {
-        return None;
-    }
-    let close = b.iter().position(|c| *c == b']')?;
-    let inner = &b[1..close];
-    let ok = !inner.is_empty()
-        && inner.iter().all(|c| c.is_ascii_digit() || *c == b',')
-        && inner.iter().any(u8::is_ascii_digit);
-    ok.then_some(close + 1)
-}
-
 /// A complete quoted string on this line, honouring backslash escapes.
 fn string_len(b: &[u8]) -> Option<usize> {
     let q = b[0];
@@ -515,37 +482,6 @@ fn is_constant(w: &str) -> bool {
         w,
         "NA" | "NULL" | "NaN" | "Inf" | "-Inf" | "TRUE" | "FALSE" | "<NA>"
     )
-}
-
-/// R's printed numeric forms: `-1`, `1.5`, `1e-10`, `1.2e+03`, `3L`, `1i`,
-/// a trailing `%` (percentages). Rejects things with more than one dot.
-fn is_number(w: &str) -> bool {
-    let w = w.strip_suffix('%').unwrap_or(w);
-    let w = w.strip_prefix(['-', '+']).unwrap_or(w);
-    let w = w.strip_suffix(['L', 'i']).unwrap_or(w);
-    let (mantissa, exp) = match w.find(['e', 'E']) {
-        Some(p) => (&w[..p], Some(&w[p + 1..])),
-        None => (w, None),
-    };
-    let mut dots = 0;
-    let mut digits = 0;
-    for c in mantissa.bytes() {
-        match c {
-            b'0'..=b'9' => digits += 1,
-            b'.' => dots += 1,
-            _ => return false,
-        }
-    }
-    if digits == 0 || dots > 1 {
-        return false;
-    }
-    match exp {
-        None => true,
-        Some(e) => {
-            let e = e.strip_prefix(['-', '+']).unwrap_or(e);
-            !e.is_empty() && e.bytes().all(|c| c.is_ascii_digit())
-        }
-    }
 }
 
 /// The process-wide writer. R calls [`Output::write`] from `WriteConsoleEx`
@@ -932,33 +868,48 @@ mod tests {
     }
 
     #[test]
-    fn numbers_and_index_are_styled() {
+    fn numbers_and_index_labels_are_plain() {
+        // Blue numbers are unreadable on several stock dark palettes, and
+        // bright-black labels on Solarized, where it is the background.
         assert_eq!(
             values("[1] 1 2.5 NA\n"),
-            format!("{V_INDEX}[1]{RESET} {V_NUMBER}1 2.5{RESET} {V_CONST}NA{RESET}\n")
+            format!("[1] 1 2.5 {V_CONST}NA{RESET}\n")
+        );
+        assert_eq!(
+            values("     [,1] [,2]\n[1,]    1   NA\n"),
+            format!("     [,1] [,2]\n[1,]    1   {V_CONST}NA{RESET}\n")
         );
     }
 
     #[test]
-    fn numbers_inside_words_stay_plain() {
-        // colorout #37: hashes, hostnames, versions inside words.
-        for s in [
-            "a1b2\n",
-            "3f2a9c\n",
-            "192.168.0.1\n",
-            "x86_64\n",
-            "R-4.6.1\n",
-        ] {
+    fn constants_inside_words_stay_plain() {
+        for s in ["NA_character_\n", "xTRUE\n", "Inf2\n", "NULLs\n"] {
             assert_eq!(values(s), s, "{s:?}");
         }
     }
 
     #[test]
+    fn a_number_closes_an_open_span() {
+        // `NA 1 NA`, written one element at a time as R prints a vector. A
+        // space-only write keeps the span open (the next element may share
+        // it); the number closes it before its digits.
+        let mut lx = ValueLexer::new();
+        let mut out = Vec::new();
+        for w in ["NA", " ", "1", " NA", "\n"] {
+            lx.style(w, &mut out);
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{V_CONST}NA {RESET}1 {V_CONST}NA{RESET}\n")
+        );
+    }
+
+    #[test]
     fn strings_do_not_leak_past_newline() {
-        let out = values("don't stop\nnext 1\n");
+        let out = values("don't stop\nnext NA\n");
         assert!(out.starts_with("don't stop\n"), "{out:?}");
         assert!(
-            out.ends_with(&format!("next {V_NUMBER}1{RESET}\n")),
+            out.ends_with(&format!("next {V_CONST}NA{RESET}\n")),
             "{out:?}"
         );
     }
@@ -967,7 +918,7 @@ mod tests {
     fn quoted_strings_are_styled() {
         assert_eq!(
             values("[1] \"a b\" \"c\"\n"),
-            format!("{V_INDEX}[1]{RESET} {V_STRING}\"a b\" \"c\"{RESET}\n")
+            format!("[1] {V_STRING}\"a b\" \"c\"{RESET}\n")
         );
     }
 
@@ -979,24 +930,24 @@ mod tests {
 
     #[test]
     fn data_frame_rows() {
-        let out = values("  x  y\n1 1 NA\n");
+        let out = values("  x  y\n1 \"a\" NA\n");
         assert!(
-            out.contains(&format!("{V_NUMBER}1 1{RESET} {V_CONST}NA{RESET}")),
+            out.ends_with(&format!("1 {V_STRING}\"a\"{RESET} {V_CONST}NA{RESET}\n")),
             "{out:?}"
         );
     }
 
     #[test]
     fn one_span_per_run_across_writes() {
-        // R writes `print(1:3)` element by element.
+        // R writes `print(rep(NA, 3))` element by element.
         let mut lx = ValueLexer::new();
         let mut out = Vec::new();
-        for w in ["[1]", " 1", " 2", " 3", "\n"] {
+        for w in ["[1]", " NA", " NA", " NA", "\n"] {
             lx.style(w, &mut out);
         }
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("{V_INDEX}[1]{RESET} {V_NUMBER}1 2 3{RESET}\n")
+            format!("[1] {V_CONST}NA NA NA{RESET}\n")
         );
     }
 
@@ -1090,15 +1041,15 @@ mod tests {
         // e.g. crayon/cli styling a multi-line block with one escape pair.
         let mut lx = ValueLexer::new();
         let mut out = Vec::new();
-        for w in ["\x1b[31mA 1\n", "B 2\n", "C 3\x1b[39m\n", "D 4\n"] {
+        for w in ["\x1b[31mA NA\n", "B NA\n", "C NA\x1b[39m\n", "D NA\n"] {
             lx.style(w, &mut out);
         }
         let out = String::from_utf8(out).unwrap();
         assert!(
-            out.starts_with("\x1b[31mA 1\nB 2\nC 3\x1b[39m\n"),
+            out.starts_with("\x1b[31mA NA\nB NA\nC NA\x1b[39m\n"),
             "{out:?}"
         );
-        assert!(out.ends_with(&format!("D {V_NUMBER}4{RESET}\n")), "{out:?}");
+        assert!(out.ends_with(&format!("D {V_CONST}NA{RESET}\n")), "{out:?}");
 
         let mut c = StderrClassifier::new(Headers::default());
         let mut out = Vec::new();
@@ -1116,14 +1067,12 @@ mod tests {
         // call; the next result must still be styled.
         let mut lx = ValueLexer::new();
         let mut out = Vec::new();
-        for w in ["[1]", " 1", "\n", "\x1b[?25h", "[1]", " 2", "\n"] {
+        for w in ["[1]", " NA", "\n", "\x1b[?25h", "[1]", " TRUE", "\n"] {
             lx.style(w, &mut out);
         }
         let out = String::from_utf8(out).unwrap();
         assert!(
-            out.ends_with(&format!(
-                "\x1b[?25h{V_INDEX}[1]{RESET} {V_NUMBER}2{RESET}\n"
-            )),
+            out.ends_with(&format!("\x1b[?25h[1] {V_CONST}TRUE{RESET}\n")),
             "{out:?}"
         );
 
@@ -1135,17 +1084,5 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!("\x1b[?25l{MESSAGE}note{RESET}\n")
         );
-    }
-
-    #[test]
-    fn number_forms() {
-        for n in [
-            "1", "-1", "1.5", "1e-10", "2.5E+03", "3L", "1i", "50%", ".5",
-        ] {
-            assert!(is_number(n), "{n}");
-        }
-        for n in ["1.2.3", "e5", "-", "1e", "0x1F", "abc"] {
-            assert!(!is_number(n), "{n}");
-        }
     }
 }

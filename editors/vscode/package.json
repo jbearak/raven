@@ -1106,7 +1106,7 @@
           ],
           "enumDescriptions": [
             "Color errors, warnings, and messages differently.",
-            "Also color printed values: numbers, strings, NA/TRUE/FALSE, and [1]-style indices (like the colorout package).",
+            "Also color strings and NA/TRUE/FALSE in printed values.",
             "No colors added (output that is already colored, e.g. by the cli package, keeps its colors)."
           ],
           "default": "streams",
