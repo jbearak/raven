@@ -104,10 +104,17 @@ impl Console {
     }
 
     fn spawn_with(extra: &[&str], no_history: bool) -> Console {
-        Self::spawn_env(extra, no_history, &[])
+        Self::spawn_env(extra, no_history, &[], None)
     }
 
-    fn spawn_env(extra: &[&str], no_history: bool, env: &[(&str, &str)]) -> Console {
+    /// Spawn a console with `env` added, in the working directory `cwd`
+    /// (this process's when `None`).
+    fn spawn_env(
+        extra: &[&str],
+        no_history: bool,
+        env: &[(&str, &str)],
+        cwd: Option<&std::path::Path>,
+    ) -> Console {
         let (spawning, master, slave) = open_pty(&libc::winsize {
             ws_row: 30,
             ws_col: 100,
@@ -134,6 +141,9 @@ impl Console {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
@@ -631,7 +641,12 @@ fn r_output_and_child_process_output_stay_in_order() {
     // The background flusher is slowed down so that only the synchronous
     // flush before a child starts (R_Busy on macOS, the system() wrapper on
     // Linux) can keep the order; a timing-based pass would prove nothing.
-    let mut c = Console::spawn_env(&[], true, &[("RAVEN_CONSOLE_TEST_FLUSH_DELAY_MS", "500")]);
+    let mut c = Console::spawn_env(
+        &[],
+        true,
+        &[("RAVEN_CONSOLE_TEST_FLUSH_DELAY_MS", "500")],
+        None,
+    );
     c.expect("> ");
     c.line("cat('BEFORE\\n'); system(\"printf 'CHILD\\\\n'\"); cat('AFTER\\n')");
     let out = c.expect("AFTER");
@@ -733,8 +748,11 @@ fn history_suggestion_is_dim_and_underlined_in_the_text_color() {
     }
     let dir = tempfile::tempdir().unwrap();
     let hist = dir.path().join("history");
-    std::fs::write(&hist, "summary(x)  # seeded\n").unwrap();
     let mut c = Console::spawn_with(&["--history-file", hist.to_str().unwrap()], false);
+    c.expect("> ");
+    // Typed here, so it is this folder's entry (a line seeded into the
+    // history file has no folder and is suggested nowhere).
+    c.line("summary(x)  # seeded");
     c.expect("> ");
     c.send("summ");
     c.expect("ary(x)  # seeded");
@@ -753,10 +771,14 @@ fn history_suggestion_stops_at_the_end_of_the_line() {
     }
     let dir = tempfile::tempdir().unwrap();
     let hist = dir.path().join("history");
-    // One two-line entry, as the history file stores it.
-    std::fs::write(&hist, "print(a(<\\n>    ))\n").unwrap();
     let mut c = Console::spawn_with(&["--history-file", hist.to_str().unwrap()], false);
     c.expect("> ");
+    c.line("a <- function() 42");
+    // One two-line entry, typed in this folder: `print(a(` then `))`.
+    c.line("print(a(");
+    c.expect("+ ");
+    c.line("))");
+    c.expect("[1] 42");
     c.send("p");
     let drawn = c.expect("rint(a(");
     c.settle();
@@ -771,6 +793,103 @@ fn history_suggestion_stops_at_the_end_of_the_line() {
     c.send("\r");
     c.expect("))");
     assert_eq!(style_of(&c, "))"), ["2;4"]);
+}
+
+/// Type `prefix` and check that no suggestion containing `absent` is drawn
+/// once the editor settles; then clear the line.
+fn assert_no_suggestion(c: &mut Console, prefix: &str, absent: &str) {
+    c.send(prefix);
+    c.expect(prefix);
+    c.settle();
+    assert!(!c.since_mark().contains(absent), "{:?}", c.since_mark());
+    c.send("\x15");
+}
+
+/// Type `prefix`, wait for `rest` to be suggested, then clear the line.
+fn assert_suggests(c: &mut Console, prefix: &str, rest: &str) {
+    c.send(prefix);
+    c.expect(rest);
+    c.send("\x15");
+}
+
+fn quit(mut c: Console) {
+    c.line("q()");
+    let deadline = Instant::now() + TIMEOUT;
+    while c.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        c.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn history_suggestion_comes_from_the_current_folder() {
+    if !r_available() {
+        return;
+    }
+    let (a, b, h) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    // The paths R reports, with symlinks resolved (`/var` is `/private/var`
+    // on macOS).
+    let a_path = a.path().canonicalize().unwrap();
+    let b_path = b.path().canonicalize().unwrap();
+    let (a_str, b_str) = (a_path.to_str().unwrap(), b_path.to_str().unwrap());
+    let hist = h.path().join("history");
+    let hist_arg = hist.to_str().unwrap();
+    // An entry from before folders were recorded.
+    std::fs::write(&hist, "legacy_entry <- 0\n").unwrap();
+    let spawn_in = |dir: &std::path::Path| {
+        let mut c = Console::spawn_env(&["--history-file", hist_arg], false, &[], Some(dir));
+        c.expect("> ");
+        c
+    };
+
+    let mut c = spawn_in(&a_path);
+    // An entry with no folder is suggested nowhere, but Up recalls it.
+    assert_no_suggestion(&mut c, "legacy_e", "ntry");
+    c.send("legacy_e");
+    c.send("\x1b[A");
+    c.expect("legacy_entry <- 0");
+    // Submitted again here, it is this folder's, though the history file
+    // already ends with it.
+    c.send("\r");
+    assert_suggests(&mut c, "legacy_e", "ntry <- 0");
+    c.line("folder_a_only <- 1");
+    quit(c);
+    // The history file keeps bare entries; the folders are in a file beside it.
+    let saved = std::fs::read_to_string(&hist).unwrap_or_default();
+    assert!(
+        saved.lines().any(|l| l == "folder_a_only <- 1"),
+        "history file: {saved:?}"
+    );
+    assert!(
+        h.path().join("history.folders").exists(),
+        "no folder record"
+    );
+
+    let mut c = spawn_in(&b_path);
+    // Another folder: no suggestion from folder A, but Up searches every folder.
+    assert_no_suggestion(&mut c, "folder_a", "_only");
+    c.send("folder_a");
+    c.send("\x1b[A");
+    c.expect("folder_a_only <- 1");
+    c.send("\x15");
+    // The suggestion follows `setwd()`.
+    c.line(&format!("setwd({a_str:?})"));
+    assert_suggests(&mut c, "folder_a", "_only <- 1");
+    // So does recording: this entry is folder A's.
+    c.line("folder_a_second <- 2");
+    quit(c);
+
+    let mut c = spawn_in(&a_path);
+    assert_suggests(&mut c, "folder_a_sec", "ond <- 2");
+    // The `setwd()` that moved the last console here was typed in B.
+    assert_no_suggestion(&mut c, "setwd(", a_str);
+    c.line(&format!("setwd({b_str:?})"));
+    assert_no_suggestion(&mut c, "folder_a_sec", "ond");
+    assert_suggests(&mut c, "setwd(", &format!("{a_str:?})")[1..]);
 }
 
 #[test]

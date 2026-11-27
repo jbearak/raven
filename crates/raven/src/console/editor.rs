@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::CString;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,7 @@ use reedline::{
     default_vi_visual_keybindings,
 };
 
+use super::folder_history::{self, FolderStore, KeyCache, RecordingHistory};
 use super::lexer::{self, Scan};
 use super::libr::{self, Sexp};
 
@@ -89,17 +91,19 @@ pub fn build(cfg: EditorConfig) -> Reedline {
         }
     };
 
-    let history: Box<dyn reedline::History> = match cfg
-        .history_file
-        .and_then(|p| FileBackedHistory::with_file(10_000, p).ok())
-    {
-        Some(h) => Box::new(h),
-        None => Box::new(FileBackedHistory::new(10_000).expect("in-memory history")),
+    let in_memory = || FileBackedHistory::new(folder_history::MAIN_CAPACITY).expect("in-memory");
+    let (main, folders) = match cfg.history_file.and_then(|p| {
+        FileBackedHistory::with_file(folder_history::MAIN_CAPACITY, p.clone())
+            .ok()
+            .map(|h| (h, p))
+    }) {
+        Some((h, p)) => (h, FolderStore::beside(&p)),
+        None => (in_memory(), FolderStore::in_memory()),
     };
 
     Reedline::create()
-        .with_history(history)
-        .with_hinter(Box::new(LineHinter::new()))
+        .with_history(Box::new(RecordingHistory::new(main, folders.clone())))
+        .with_hinter(Box::new(LineHinter::new(folders)))
         .with_highlighter(Box::new(RHighlighter::new()))
         .with_validator(Box::new(RValidator {
             indent: cfg.indent,
@@ -183,10 +187,12 @@ fn st_suggestion() -> Style {
     Style::new().dimmed().underline()
 }
 
-/// The history suggestion, one line at a time.
+/// The history suggestion, one line at a time, from the current folder's
+/// entries only (see `folder_history`).
 ///
 /// reedline's [`DefaultHinter`] suggests the rest of the newest history entry
-/// that starts with the input. For a multi-line entry reedline draws the later
+/// that starts with the input; here it searches the folder store for the
+/// input behind the folder's key. For a multi-line entry reedline draws the later
 /// lines from column 0, without the `+ ` prompt, where they read as text the
 /// console inserted. This hinter shows and accepts only the rest of the
 /// current line. After Enter the entry's next line is suggested in turn, as
@@ -195,33 +201,58 @@ struct LineHinter {
     inner: DefaultHinter,
     /// The suggestion on screen, unstyled: what accepting it inserts.
     shown: String,
+    folders: FolderStore,
+    keys: KeyCache,
 }
 
 impl LineHinter {
-    fn new() -> Self {
+    fn new(folders: FolderStore) -> Self {
         Self {
             inner: DefaultHinter::default(),
             shown: String::new(),
+            folders,
+            keys: KeyCache::default(),
         }
     }
-}
 
-impl Hinter for LineHinter {
-    fn handle(
-        &mut self,
-        line: &str,
-        pos: usize,
-        history: &dyn History,
-        use_ansi_coloring: bool,
-        cwd: &str,
-    ) -> String {
-        let rest = self.inner.handle(line, pos, history, false, cwd);
+    /// The suggestion for `line` typed in folder `dir` (`None`: unknown).
+    fn hint_in(&mut self, line: &str, dir: Option<&Path>, use_ansi_coloring: bool) -> String {
+        let rest = match self.keys.key(dir) {
+            Some(key) if !line.is_empty() => {
+                let keyed = format!("{key}{line}");
+                let inner = &mut self.inner;
+                self.folders
+                    .with_rows(|rows| inner.handle(&keyed, keyed.len(), rows, false, ""))
+            }
+            _ => {
+                // Forget the last suggestion, or accepting a word would
+                // still insert its first word.
+                self.inner = DefaultHinter::default();
+                String::new()
+            }
+        };
         self.shown = first_line(&rest).to_string();
         if use_ansi_coloring && !self.shown.is_empty() {
             st_suggestion().paint(&self.shown).to_string()
         } else {
             self.shown.clone()
         }
+    }
+}
+
+impl Hinter for LineHinter {
+    /// The suggestion comes from the folder store, not reedline's `history`,
+    /// for the working directory now, not reedline's lossy `cwd` string.
+    fn handle(
+        &mut self,
+        line: &str,
+        _pos: usize,
+        _history: &dyn History,
+        use_ansi_coloring: bool,
+        _cwd: &str,
+    ) -> String {
+        let dir = folder_history::current_folder();
+        self.hint_in(line, dir.as_deref(), use_ansi_coloring)
     }
 
     fn complete_hint(&self) -> String {
@@ -667,6 +698,7 @@ impl Prompt for RPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console::folder_history::tests::{Dirs, dirs};
 
     #[test]
     fn indent_follows_open_brackets_and_operators() {
@@ -755,16 +787,38 @@ mod tests {
         );
     }
 
+    /// A hinter whose folder `a` holds `entries`, oldest first.
+    fn hinter_with(entries: &[&str]) -> (LineHinter, Dirs) {
+        let d = dirs();
+        let folders = FolderStore::in_memory();
+        for entry in entries {
+            folders.record(Some(&d.a), entry);
+        }
+        (LineHinter::new(folders), d)
+    }
+
     /// What the hinter shows and what accepting it inserts, for `input`
-    /// typed against a history holding `entry`.
+    /// typed in a folder whose history holds `entry`.
     fn suggest(entry: &str, input: &str) -> (String, String, String) {
-        let mut history = FileBackedHistory::new(10).expect("in-memory history");
-        history
-            .save(reedline::HistoryItem::from_command_line(entry))
-            .expect("save");
-        let mut hinter = LineHinter::new();
-        let drawn = hinter.handle(input, input.len(), &history, false, "");
+        let (mut hinter, d) = hinter_with(&[entry]);
+        let drawn = hinter.hint_in(input, Some(&d.a), false);
         (drawn, hinter.complete_hint(), hinter.next_hint_token())
+    }
+
+    #[test]
+    fn suggestion_comes_from_the_current_folder_only() {
+        let (mut hinter, d) = hinter_with(&["summary(x)"]);
+        let a = Some(d.a.as_path());
+        assert_eq!(hinter.hint_in("summ", a, false), "ary(x)");
+        assert_eq!(hinter.next_hint_token(), "ary");
+        // Elsewhere, with no folder, or with nothing typed: no suggestion,
+        // and nothing left over for accepting a word.
+        for (input, dir) in [("summ", Some(d.b.as_path())), ("summ", None), ("", a)] {
+            assert_eq!(hinter.hint_in(input, dir, false), "", "{input:?} {dir:?}");
+            assert_eq!(hinter.complete_hint(), "");
+            assert_eq!(hinter.next_hint_token(), "");
+            assert_eq!(hinter.hint_in("summ", a, false), "ary(x)");
+        }
     }
 
     #[test]
@@ -790,13 +844,9 @@ mod tests {
 
     #[test]
     fn suggestion_is_styled_only_when_colors_are_on() {
-        let mut history = FileBackedHistory::new(10).expect("in-memory history");
-        history
-            .save(reedline::HistoryItem::from_command_line("summary(x)"))
-            .expect("save");
-        let mut hinter = LineHinter::new();
+        let (mut hinter, d) = hinter_with(&["summary(x)"]);
         assert_eq!(
-            hinter.handle("summ", 4, &history, true, ""),
+            hinter.hint_in("summ", Some(&d.a), true),
             st_suggestion().paint("ary(x)").to_string()
         );
         assert_eq!(hinter.complete_hint(), "ary(x)");
