@@ -217,6 +217,7 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
 
     test("sends to vscode-R's Interactive target without opening a terminal", async () => {
         const created = install_vscode_r();
+        fake.set_setting('r.alwaysUseActiveTerminal', 'global', true);
         const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
         await make_active(ours);
         fake.set_setting('raven.rTerminal.program', 'global', 'vscode-R');
@@ -230,6 +231,7 @@ describe('vscode-R sends never reach Raven\'s terminal', () => {
 
     test('an Interactive target needs no terminal even when none can be opened', async () => {
         install_vscode_r();
+        fake.set_setting('r.alwaysUseActiveTerminal', 'global', true);
         fake.commands.set('r.createRTerm', async () => undefined);
         const ours = await rtm.get_or_create_terminal_for('raven') as unknown as FakeTerminal;
         await make_active(ours);
