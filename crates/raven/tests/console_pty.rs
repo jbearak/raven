@@ -747,6 +747,33 @@ fn history_suggestion_is_underlined_in_the_text_color() {
 }
 
 #[test]
+fn history_suggestion_stops_at_the_end_of_the_line() {
+    if !r_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let hist = dir.path().join("history");
+    // One two-line entry, as the history file stores it.
+    std::fs::write(&hist, "print(a(<\\n>    ))\n").unwrap();
+    let mut c = Console::spawn_with(&["--history-file", hist.to_str().unwrap()], false);
+    c.expect("> ");
+    c.send("p");
+    let drawn = c.expect("rint(a(");
+    c.settle();
+    // The entry's second line is not drawn under the input, where it read as
+    // text the console had inserted.
+    assert!(!c.since_mark().contains("))"), "{drawn:?}");
+    // Right accepts what was shown, and no more.
+    c.send("\x1b[C");
+    c.settle();
+    assert!(!c.since_mark().contains("))"), "{:?}", c.since_mark());
+    // On the continuation line, the entry's next line is suggested.
+    c.send("\r");
+    c.expect("))");
+    assert_eq!(style_of(&c, "))"), ["4"]);
+}
+
+#[test]
 fn a_request_can_finish_an_expression_an_earlier_one_started() {
     if !r_available() {
         return;
