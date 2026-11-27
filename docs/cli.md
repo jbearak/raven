@@ -1074,7 +1074,7 @@ The suggestion is **not** repeated on each finding and does **not** appear in an
 
 ## Color output
 
-`check` and `lint` color the **severity word** (`error`, `warning`, `info`, `hint`) in `text` output. The rest of the line stays plain so it is easy to grep. The `json` and `sarif` formats are **never** colored, whatever the flag or environment.
+`check` and `lint` color the **severity word** in `text` output: `error` red, `warning` yellow, `hint` cyan, and `info` bold in your terminal's text color. The rest of the line stays plain so it is easy to grep. The `json` and `sarif` formats are **never** colored, whatever the flag or environment.
 
 `--color auto|always|never` controls it (default `auto`), and `--no-color` is an alias for `--color never`. Precedence, highest first:
 

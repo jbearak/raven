@@ -339,13 +339,13 @@ pub fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     }
 }
 
-/// Wrap a severity word in a minimal ANSI color span when `use_color` is set,
+/// Wrap a severity word in a minimal ANSI style span when `use_color` is set,
 /// returning it unchanged otherwise. Only the severity word is colorized (per
 /// the design); the path, location, message, and `[rule]` stay uncolored so the
 /// output remains easy to grep. `note` (severity-less / unrecognized) is left
 /// uncolored intentionally.
 ///
-/// The colored forms are a closed set of `&'static str` literals (color code +
+/// The colored forms are a closed set of `&'static str` literals (style code +
 /// word + `\x1b[0m` reset), so this allocates nothing and returns a borrow — the
 /// uncolored cases return the input `level` unchanged.
 fn colorize_level(level: &str, use_color: bool) -> &str {
@@ -355,8 +355,10 @@ fn colorize_level(level: &str, use_color: bool) -> &str {
     match level {
         "error" => "\x1b[31merror\x1b[0m",     // red
         "warning" => "\x1b[33mwarning\x1b[0m", // yellow
-        "info" => "\x1b[34minfo\x1b[0m",       // blue
-        "hint" => "\x1b[36mhint\x1b[0m",       // cyan
+        // Bold in the terminal's own text color. It was blue, which is below
+        // 3:1 against the background on several stock dark palettes.
+        "info" => "\x1b[1minfo\x1b[0m",
+        "hint" => "\x1b[36mhint\x1b[0m", // cyan
         _ => level,
     }
 }
@@ -663,6 +665,12 @@ mod tests {
         assert!(colored.contains("error"), "{colored}");
         // `note` is intentionally left uncolored even when enabled.
         assert_eq!(colorize_level("note", true), "note");
+    }
+
+    #[test]
+    fn info_is_bold_in_the_terminal_text_color() {
+        // Not blue (`34`): that is unreadable on several stock dark palettes.
+        assert_eq!(colorize_level("info", true), "\x1b[1minfo\x1b[0m");
     }
 
     #[test]
