@@ -12,9 +12,8 @@ import {
  * instead of Raven's, so code skips the console the user chose and vscode-R
  * may show its own "Run R code" menu. The command adds user keybindings,
  * which rank above both extensions; see `raven-keybinding-entries.ts` for
- * why and for what is written. Raven never offers to run it: rewriting a
- * vscode-R user's shortcuts unasked is intrusive, so it runs only from the
- * Command Palette.
+ * why and for what is written. Raven never prompts the user to run it:
+ * rewriting a vscode-R user's shortcuts unasked is intrusive.
  */
 
 export const ADD_KEYBINDINGS_COMMAND = 'raven.useRavenKeybindingsOverVscodeR';
